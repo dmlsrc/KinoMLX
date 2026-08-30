@@ -1,0 +1,41 @@
+{
+  "schema_version": 1,
+  "duration": {
+    "artifact_sha256": "2ec71e4206ed365d015f00c05a48caccfb0ee862986809d06ae376c09f5d9190",
+    "video_shape": [1, 7, 4096],
+    "video_values": "sin(arange * 0.007)",
+    "audio_shape": [1, 5, 2048],
+    "audio_values": "cos(arange * 0.011)",
+    "torch_bfloat16_seconds": 3.078125,
+    "frames_at_24_fps": 73
+  },
+  "temporal_upscaler": {
+    "artifact_sha256": "2bc3300f2b3c3c1834d72164fbf13a3b9fd73e5a741e8a2c3f4035f89a75c3fe",
+    "input_shape": [1, 128, 2, 1, 1],
+    "input_values": "sin(arange * 0.017)",
+    "output_shape": [1, 128, 3, 1, 1],
+    "torch_bfloat16_mean": -0.0813513994216919,
+    "torch_bfloat16_peak": 1.953125,
+    "torch_bfloat16_rms": 0.753241777420044,
+    "anchor_indices": [0, 1, 2, 15, 31, 47, 63, 95, 127, 128, 159, 191, 223, 255, 319, 383],
+    "torch_bfloat16_anchors": [
+      1.140625,
+      1.0078125,
+      0.3046875,
+      -0.75390625,
+      -0.90625,
+      0.349609375,
+      0.71484375,
+      -0.177734375,
+      0.8203125,
+      0.59765625,
+      1.2890625,
+      -1.5703125,
+      -0.0625,
+      -0.4765625,
+      -1.6875,
+      -0.68359375
+    ],
+    "anchor_atol": 0.08
+  }
+}

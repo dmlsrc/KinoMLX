@@ -1,0 +1,190 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "kinomlx"
+version = "0.0.1"
+description = "Native multimodal MLX inference for video generation and HDR still expansion"
+readme = "README.md"
+requires-python = ">=3.14"
+license = "MIT"
+license-files = ["LICENSE", "THIRD_PARTY_LICENSES.md"]
+authors = [
+    {name = "dmlsrc"},
+]
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "Intended Audience :: Developers",
+    "Operating System :: MacOS",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Multimedia :: Graphics",
+    "Topic :: Multimedia :: Video",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    # MLX runtime - Apple Silicon array framework + Metal backend.
+    "mlx>=0.32.2",
+
+    # Tokenizer - SentencePiece backs the native Gemma tokenizer.
+    "sentencepiece>=0.2.2",
+    # Derived tokenizer caches serialize SentencePiece ModelProto directly.
+    "protobuf>=7.36.0",
+
+    # UX (terminal output, progress).
+    "rich>=15.0.0",
+
+    # Apple frameworks bridge (VideoToolbox encode, AVAssetWriter,
+    # CoreVideo pixel buffers, CoreMedia sample buffers, etc.).
+    "pyobjc-core>=12.2.2",
+    "pyobjc-framework-avfoundation>=12.2.2",
+    "pyobjc-framework-coreaudio>=12.2.2",
+    "pyobjc-framework-coremedia>=12.2.2",
+    "pyobjc-framework-libdispatch>=12.2.2",
+    "pyobjc-framework-quartz>=12.2.2",
+    "pyobjc-framework-videotoolbox>=12.2.2",
+    "pyobjc-framework-cocoa>=12.2.2",
+]
+
+[project.optional-dependencies]
+dev = [
+    "mypy>=2.3.1",
+    "pytest>=9.1.1",
+    "ruff>=0.16.4",
+    # Differential oracle for derived SentencePiece caches; never imported by kinomlx/.
+    "tokenizers>=0.22.2",
+    # numpy is a test-only oracle (test files build reference arrays with it),
+    # not a runtime dependency - the package runs MLX-native without it.
+    "numpy>=2.5.2",
+]
+
+[project.urls]
+Homepage = "https://github.com/dmlsrc/KinoMLX"
+
+[project.scripts]
+kinomlx = "kinomlx.cli.main:main"
+
+[tool.hatch.build.targets.sdist]
+exclude = [
+    "**/.*",
+    "/weights-src/*",
+    "!/weights-src/README.md",
+    "**/*.safetensors",
+    "**/*.gguf",
+    "**/*.bin",
+    "**/*.mlx",
+    "**/*.pt",
+    "**/*.pth",
+    "**/*.ckpt",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["kinomlx"]
+exclude = [
+    "**/*.safetensors",
+    "**/*.gguf",
+    "**/*.bin",
+    "**/*.mlx",
+    "**/*.pt",
+    "**/*.pth",
+    "**/*.ckpt",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py314"
+
+[tool.ruff.lint]
+# E/W/F: pycodestyle + pyflakes. I: import sorting. B: bugbear (likely bugs).
+# UP: pyupgrade (modern syntax). C4: comprehension lints. SIM: simplifications
+# (collapsible ifs, redundant bool logic). PTH: prefer pathlib over os.path /
+# open(). RET: return-statement cleanups. PIE: misc anti-patterns. PT: pytest
+# style (no composite asserts, marker hygiene). T20: no bare print - all output
+# goes through kinomlx.ui.console so progress bars and the quiet/theme toggles
+# stay coordinated. RUF001-003 + PLC2401/PLC2403: the workspace plain-ASCII
+# rule (no em-dash, smart quotes, non-ASCII identifiers), enforced at lint time.
+select = [
+    "E", "W", "F", "I", "B", "C4", "UP", "SIM", "PTH", "RET", "PIE", "PT", "T20",
+    "RUF001", "RUF002", "RUF003", "PLC2401", "PLC2403",
+]
+# E501 (line length) is off: the formatter wraps where it matters, and forcing
+# a wrap sometimes hurts readability.
+ignore = ["E501"]
+
+[tool.ruff.lint.per-file-ignores]
+# Re-export __init__ files pull names into the public surface that they do not
+# use locally, so F401 (unused import) is expected there.
+"__init__.py" = ["F401"]
+# Dev/demo scripts are CLI entry points - print() is their legitimate output,
+# not the bare-print-clobbers-bars footgun that T20 guards against in the package.
+"scripts/**" = ["T20"]
+
+[tool.pytest.ini_options]
+minversion = "9.1.1"
+# -ra: summarize all non-pass outcomes; --strict-markers: an unregistered
+# marker is an error (catches typos); --strict-config: an unknown ini key is an
+# error.
+addopts = "-ra -q --strict-markers --strict-config"
+testpaths = ["tests"]
+# Lets the suite run from a source checkout without an editable install.
+pythonpath = "."
+markers = [
+    # Registered ahead of the model-lift test tiers; --strict-markers requires
+    # a marker to be declared here before a test may use it.
+    "slow: long-running test (deselect with -m 'not slow')",
+    "requires_metal: executes a Metal GPU kernel (deselect with -m 'not requires_metal')",
+    "requires_weights: needs model weights on disk",
+    "requires_avfoundation: needs the required real AVFoundation/CoreMedia stack via PyObjC",
+]
+
+[tool.mypy]
+python_version = "3.14"
+files = [
+    "kinomlx",
+    "tests/typecheck/assembly_line_contracts.py",
+    "tests/typecheck/config_contracts.py",
+    "examples/ltx2_distilled.py",
+    "examples/gmnet_expand.py",
+]
+strict = true
+disallow_any_explicit = true
+follow_imports = "normal"
+show_error_codes = true
+pretty = true
+
+[[tool.mypy.overrides]]
+# PyObjC exposes Apple framework symbols dynamically from Objective-C runtime
+# metadata. These installed modules do not ship complete PEP 561 stubs, so
+# mypy cannot analyze the imports even though they are required dependencies.
+# Keep the exception at that foreign boundary; KinoMLX modules remain strict.
+module = [
+    "AppKit",
+    "AVFoundation",
+    "CoreAudio",
+    "CoreMedia",
+    "Foundation",
+    "Quartz",
+    "VideoToolbox",
+    "libdispatch",
+    "objc",
+]
+ignore_missing_imports = true
+
+[tool.rumdl]
+line-length = 100
+respect-gitignore = true
+# Workspace plain-ASCII convention: MD084 (invisible Unicode) and MD088
+# (Unicode quotes/dashes) are opt-in rules; extend-enable adds them without
+# replacing the default rule set.
+extend-enable = ["MD084", "MD088"]
+
+[tool.rumdl.MD013]
+code-blocks = false
+tables = false
+
+[tool.rumdl.MD084]
+strict = true
+
+[tool.rumdl.MD088]
+normalize-dashes = true

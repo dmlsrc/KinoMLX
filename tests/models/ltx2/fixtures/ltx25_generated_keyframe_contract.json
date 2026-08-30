@@ -1,0 +1,36 @@
+{
+  "schema_version": 1,
+  "selection_cases": [
+    {
+      "frames": 9,
+      "count": 1,
+      "indices": [4]
+    },
+    {
+      "frames": 17,
+      "count": 2,
+      "indices": [5, 11]
+    },
+    {
+      "frames": 121,
+      "count": 3,
+      "indices": [30, 60, 90]
+    }
+  ],
+  "slot_case": {
+    "pixel_frames": 17,
+    "pixel_height": 64,
+    "pixel_width": 64,
+    "fps": 24.0,
+    "count": 2,
+    "latent_shape": [1, 128, 3, 2, 2],
+    "base_tokens": 12,
+    "tokens_per_slot": 4,
+    "first_slot_token": 12,
+    "total_tokens": 20,
+    "slot_time_bounds": [
+      [0.20833333333333334, 0.25],
+      [0.4583333333333333, 0.5]
+    ]
+  }
+}
