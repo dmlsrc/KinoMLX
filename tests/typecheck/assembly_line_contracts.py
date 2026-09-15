@@ -4,27 +4,23 @@ The native component provider, recipe, signal, and delivery surfaces are
 checked without widening this into a whole-repository strict-typing migration.
 """
 
-from __future__ import annotations
-
 from pathlib import Path
 from typing import Protocol
 
 import mlx.core as mx
 
+from kinomlx.adapters.lora import LoRAProfile
 from kinomlx.components import ComponentLease
-from kinomlx.lora.loading import LoRAProfile
 from kinomlx.media.signals import (
     BT709_SDR_DELIVERY,
     OutputColorPlan,
     validate_sdr_output_plan,
 )
-from kinomlx.models.ltx2.cache import LoRAAdapterReceipt
+from kinomlx.models.ltx2.adapters.receipt import LTX2AdapterReceipt
 from kinomlx.models.ltx2.components import (
     AudioDecoderPort,
     DurationPredictorPort,
-    LatentStatisticsPort,
     NativeLTX2Components,
-    SpatialUpscalerPort,
     TransformerPort,
     VideoDecoderPort,
     VideoEncoderPort,
@@ -35,16 +31,15 @@ from kinomlx.models.ltx2.components import (
 )
 from kinomlx.models.ltx2.conditioning import EncodedCondition
 from kinomlx.models.ltx2.conditioning.tools import VideoLatentTools
-from kinomlx.models.ltx2.pipelines.distilled import (
-    DistilledRequest as ProductDistilledRequest,
-)
 from kinomlx.models.ltx2.pipelines.distilled import generate_distilled
 from kinomlx.models.ltx2.resources import LTX2Resources
 from kinomlx.models.ltx2.runner import Recipe
 from kinomlx.models.ltx2.signals import LTX23_SDR_SIGNAL
+from kinomlx.models.ltx2.types import DistilledRequest as ProductDistilledRequest
+from kinomlx.models.ltx2.types import LatentState
+from kinomlx.models.ltx2.upscaler.ports import LatentStatisticsPort, SpatialUpscalerPort
 from kinomlx.output import ArtifactSet, Generation, GenerationSink, VideoToolboxGenerationSink
 from kinomlx.reporting import Reporter
-from kinomlx.types import LatentState
 from tests.models.ltx2.assembly_line._contracts import (
     ContractOutput,
     ContractResources,
@@ -107,7 +102,7 @@ class SyntheticStatistics:
 
 
 class SyntheticTransformer:
-    lora_receipts: tuple[LoRAAdapterReceipt, ...] = ()
+    adapter_receipts: tuple[LTX2AdapterReceipt, ...] = ()
 
     def __call__(
         self,

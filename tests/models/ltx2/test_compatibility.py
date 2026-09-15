@@ -1,7 +1,5 @@
 """Central, generation-labeled LTX-2 compatibility orchestration."""
 
-from __future__ import annotations
-
 from pathlib import Path
 
 import pytest
@@ -16,8 +14,8 @@ from kinomlx.models.ltx2.metadata import (
     LTX2CheckpointConfig,
     TextEncoderHeaderConfig,
     TextProjectionHeaderConfig,
-    TransformerConstructorConfig,
 )
+from kinomlx.models.ltx2.transformer_config import TransformerConstructorConfig
 from kinomlx.models.ltx2.video_vae.config import LTX23_VIDEO_VAE_CONFIG
 
 

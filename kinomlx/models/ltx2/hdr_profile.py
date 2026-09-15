@@ -1,20 +1,16 @@
 """Resolve explicit HDR producer facts without checkpoint allowlists."""
 
-from __future__ import annotations
-
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING
 
 from kinomlx.io.safetensors import read_metadata
 from kinomlx.media.signals import ColorTransfer
 
+from .adapters.receipt import LTX2AdapterReceipt
+from .adapters.selection import LTX2AdapterSelection
 from .resources import LTX2Resources
-from .types import DistilledRequest, LoRASelection
-
-if TYPE_CHECKING:
-    from .cache import LoRAAdapterReceipt
+from .types import DistilledRequest
 
 
 @dataclass(frozen=True)
@@ -42,19 +38,13 @@ class HDRRecipeFacts:
         }
 
 
-def _effective_stage_strength(selection: LoRASelection, stage: int) -> float:
-    if stage == 1:
-        override = selection.stage_1_strength
-    elif stage == 2:
-        override = selection.stage_2_strength
-    else:
-        raise ValueError(f"LoRA stage must be 1 or 2, got {stage}")
-    return selection.strength if override is None else override
+def _effective_stage_strength(selection: LTX2AdapterSelection, stage: int) -> float:
+    return selection.strength_for_stage(stage)
 
 
 def _resolve_ltx23_hdr_adapter(request: DistilledRequest) -> HDRRecipeFacts:
-    matches: list[tuple[LoRASelection, int]] = []
-    for selection in request.resolved_loras():
+    matches: list[tuple[LTX2AdapterSelection, int]] = []
+    for selection in request.resolved_adapters():
         metadata = read_metadata(selection.path)
         transform = metadata.get("hdr_transform", "").strip().lower()
         if not transform:
@@ -80,7 +70,7 @@ def _resolve_ltx23_hdr_adapter(request: DistilledRequest) -> HDRRecipeFacts:
     if factor != 1:
         raise ValueError("the supported LTX-2.3 HDR profile requires reference_downscale_factor=1")
     if selection.exclude:
-        raise ValueError("the HDR adapter cannot use LoRA target exclusions")
+        raise ValueError("the HDR adapter cannot use adapter target exclusions")
     stage_1 = _effective_stage_strength(selection, 1)
     stage_2 = _effective_stage_strength(selection, 2)
     if stage_1 <= 0.0 or stage_2 <= 0.0:
@@ -137,7 +127,7 @@ def resolve_hdr_recipe(
 
 def validate_hdr_adapter_placement(
     recipe: HDRRecipeFacts | None,
-    receipts: Sequence[LoRAAdapterReceipt],
+    receipts: Sequence[LTX2AdapterReceipt],
     *,
     stage: int,
 ) -> None:

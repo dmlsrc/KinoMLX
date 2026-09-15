@@ -18,8 +18,6 @@ sanity check after touching ``kinomlx.ui`` internals (theme, levels, columns,
 throttle, completion summaries).
 """
 
-from __future__ import annotations
-
 import argparse
 import logging
 import sys

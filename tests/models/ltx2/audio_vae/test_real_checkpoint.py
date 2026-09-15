@@ -1,7 +1,5 @@
 """Opt-in canaries for the official LTX-2.3 audio stack."""
 
-from __future__ import annotations
-
 import gc
 import math
 
@@ -17,23 +15,13 @@ from kinomlx.models.ltx2.audio_vae import (
     load_audio_vae_weights,
     load_vocoder_weights,
 )
-from kinomlx.models.ltx2.cache import ensure_weight_family_caches
-from kinomlx.models.ltx2.settings import LTX2Settings
-from kinomlx.settings import Settings
+from tests.models.ltx2._source_weights import NO_LTX23_CHECKPOINT, family_weights, ltx23_checkpoint
 
 
-@pytest.mark.requires_weights
 def test_real_ltx23_audio_encode_decode_and_vocode() -> None:
-    settings = Settings.from_env()
-    checkpoint = LTX2Settings.from_env().weights_path
-    if checkpoint is None or not checkpoint.is_file():
-        pytest.skip("KINO_WEIGHTS_PATH is not configured")
-    caches = ensure_weight_family_caches(
-        checkpoint,
-        families=("audio_vae", "vocoder"),
-        cache_mode="auto",
-        cache_root=settings.cache_dir,
-    )
+    checkpoint = ltx23_checkpoint()
+    if checkpoint is None:
+        pytest.skip(NO_LTX23_CHECKPOINT)
 
     encoder = decoder = latent = mel = None
     vocoder = waveform = None
@@ -45,7 +33,7 @@ def test_real_ltx23_audio_encode_decode_and_vocode() -> None:
             load_audio_vae_weights(
                 encoder,
                 decoder,
-                caches.cache_paths["audio_vae"],
+                family_weights(checkpoint, "audio_vae"),
             )
             == 102
         )
@@ -70,7 +58,7 @@ def test_real_ltx23_audio_encode_decode_and_vocode() -> None:
 
         vocoder_config = BWEVocoderConfig.from_checkpoint(checkpoint)
         vocoder = VocoderWithBWE(vocoder_config)
-        assert load_vocoder_weights(vocoder, caches.cache_paths["vocoder"]) == 1227
+        assert load_vocoder_weights(vocoder, family_weights(checkpoint, "vocoder")) == 1227
         waveform = vocoder(mel)
         mx.eval(waveform)
         expected_length = (

@@ -1,7 +1,6 @@
 """Strict audio VAE family loading with idempotent Conv2d layouts."""
 
-from __future__ import annotations
-
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -139,8 +138,17 @@ def _merge(*groups: dict[str, _Target]) -> dict[str, _Target]:
     return merged
 
 
+WeightSource = Mapping[str, mx.array] | Path | str
+
+
+def _weights_from_source(source: WeightSource) -> dict[str, mx.array]:
+    if isinstance(source, Mapping):
+        return dict(source)
+    return load_weights(Path(source))
+
+
 def _load(
-    path: Path | str,
+    source: WeightSource,
     targets: dict[str, _Target],
     *,
     reporter: Reporter | None,
@@ -151,7 +159,7 @@ def _load(
     weights: dict[str, mx.array] = {}
     prepared: dict[str, mx.array] = {}
     try:
-        weights = load_weights(path)
+        weights = _weights_from_source(source)
         bindings: dict[str, str] = {}
         for logical_key in targets:
             aliases = [logical_key]
@@ -199,13 +207,13 @@ def _load(
 
 def load_audio_decoder_weights(
     model: AudioDecoder,
-    path: Path | str,
+    source: WeightSource,
     *,
     reporter: Reporter | None = None,
 ) -> int:
-    """Load decoder and statistics from a full audio-family cache."""
+    """Load decoder and statistics from a prepared source tensors."""
     return _load(
-        path,
+        source,
         _decoder_targets(model),
         reporter=reporter,
         phase="load audio VAE decoder",
@@ -214,13 +222,13 @@ def load_audio_decoder_weights(
 
 def load_audio_encoder_weights(
     model: AudioEncoder,
-    path: Path | str,
+    source: WeightSource,
     *,
     reporter: Reporter | None = None,
 ) -> int:
-    """Load encoder and statistics from a full audio-family cache."""
+    """Load encoder and statistics from a prepared source tensors."""
     return _load(
-        path,
+        source,
         _encoder_targets(model),
         reporter=reporter,
         phase="load audio VAE encoder",
@@ -230,7 +238,7 @@ def load_audio_encoder_weights(
 def load_audio_vae_weights(
     encoder: AudioEncoder,
     decoder: AudioDecoder,
-    path: Path | str,
+    source: WeightSource,
     *,
     reporter: Reporter | None = None,
 ) -> int:
@@ -238,7 +246,7 @@ def load_audio_vae_weights(
     if encoder.config != decoder.config:
         raise ValueError("audio encoder and decoder configurations must match")
     return _load(
-        path,
+        source,
         _merge(_encoder_targets(encoder), _decoder_targets(decoder)),
         reporter=reporter,
         phase="load audio VAE",

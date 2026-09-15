@@ -10,8 +10,6 @@ the documented output geometry (2 * pre_W * scale, pre_H * scale).
 Tagged ``requires_avfoundation`` for explicit native-test selection.
 """
 
-from __future__ import annotations
-
 import mlx.core as mx
 import pytest
 import Quartz

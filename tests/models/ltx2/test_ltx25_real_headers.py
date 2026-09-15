@@ -1,7 +1,6 @@
 """Opt-in header-only gates for the pinned LTX-2.5 split pack."""
 
-from __future__ import annotations
-
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -17,16 +16,15 @@ from kinomlx.models.ltx2.metadata import (
     inspect_video_vae,
     validate_transformer_header,
 )
-from kinomlx.models.ltx2.settings import LTX2Settings
-from kinomlx.settings import Settings
+from tests._snapshots import pinned_snapshot
+from tests.models.ltx2._source_weights import NO_LTX23_CHECKPOINT, ltx23_checkpoint
 
+_LTX25_REPO_ID = "Lightricks/LTX-2.5"
 _LTX25_REVISION = "6c7e5e573ac1667efc83407806fe9b0b93730e60"
 
 
 def _ltx25_snapshot() -> Path:
-    return (
-        Settings.from_env().hf_home / "hub/models--Lightricks--LTX-2.5/snapshots" / _LTX25_REVISION
-    )
+    return pinned_snapshot(_LTX25_REPO_ID, _LTX25_REVISION)
 
 
 def _require_files(*paths: Path) -> None:
@@ -35,7 +33,6 @@ def _require_files(*paths: Path) -> None:
         pytest.skip("pinned LTX-2.5 files are not cached: " + ", ".join(missing))
 
 
-@pytest.mark.requires_weights
 def test_real_ltx25_pack_matches_every_consumed_compatibility_anchor() -> None:
     root = _ltx25_snapshot()
     transformer = root / "diffusion_models/ltx-2.5-22b-distilled-transformer-bf16.safetensors"
@@ -101,7 +98,6 @@ def test_real_ltx25_pack_matches_every_consumed_compatibility_anchor() -> None:
     assert duration_config.audio_context_dim == 2048
 
 
-@pytest.mark.requires_weights
 def test_real_dev_distilled_filename_alias_and_cross_generation_upscalers(
     tmp_path: Path,
 ) -> None:
@@ -114,9 +110,9 @@ def test_real_dev_distilled_filename_alias_and_cross_generation_upscalers(
     temporal_25 = (
         root / "latent_upscale_models/ltx-2.5-latent-temporal-upscaler-x2-bf16-1.0.safetensors"
     )
-    checkpoint_23 = LTX2Settings.from_env().weights_path
+    checkpoint_23 = ltx23_checkpoint()
     if checkpoint_23 is None:
-        pytest.skip("KINO_WEIGHTS_PATH is not configured")
+        pytest.skip(NO_LTX23_CHECKPOINT)
     spatial_23 = checkpoint_23.parent / "ltx-2.3-spatial-upscaler-x2-1.1.safetensors"
     temporal_23 = checkpoint_23.parent / "ltx-2.3-temporal-upscaler-x2-1.0.safetensors"
     _require_files(dev, distilled, spatial_25, temporal_25, spatial_23, temporal_23)
@@ -125,14 +121,17 @@ def test_real_dev_distilled_filename_alias_and_cross_generation_upscalers(
     distilled_config = checkpoint_config(distilled).transformer
     validate_transformer_header(dev, dev_config)
     validate_transformer_header(distilled, distilled_config)
-    assert dev_config.cache_identity() == distilled_config.cache_identity()
+    # Release labels are provenance; both checkpoints must construct the same graph.
+    assert replace(dev_config, declared_model_version=None, inferred_fields=()) == replace(
+        distilled_config, declared_model_version=None, inferred_fields=()
+    )
     assert dev.resolve() != distilled.resolve()
 
     renamed = tmp_path / "renamed-transformer.safetensors"
     renamed.symlink_to(distilled)
     renamed_config = checkpoint_config(renamed).transformer
     validate_transformer_header(renamed, renamed_config)
-    assert renamed_config.cache_identity() == distilled_config.cache_identity()
+    assert renamed_config == distilled_config
 
     spatial_config_23 = inspect_latent_upscaler(
         spatial_23,

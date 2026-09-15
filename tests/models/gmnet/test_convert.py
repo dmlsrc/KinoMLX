@@ -5,8 +5,6 @@ fixture checkpoints (pickle resolves globals at dump time); the converter
 under test never sees it and stays torch-free.
 """
 
-from __future__ import annotations
-
 import io
 import pickle
 import sys
@@ -23,10 +21,9 @@ from kinomlx.models.gmnet.convert import (
     CheckpointConversionError,
     _state_dict_from_tree,
     convert_checkpoint,
-    scan_pickle_globals,
-    suspicious_globals,
 )
 from kinomlx.models.gmnet.net import load_gmnet_weights
+from kinomlx.weights.pickle_scan import scan_pickle_globals, suspicious_globals
 
 from .test_net import _upstream_layout_state_dict
 
@@ -155,7 +152,7 @@ def test_default_conversion_output_lives_under_the_configured_cache(
     receipt = convert_checkpoint(
         source,
         declared_variant=GMNetVariant.SYNTHETIC,
-        cache_dir=tmp_path / "cache",
+        app_cache_dir=tmp_path / "cache",
     )
 
     assert receipt.output == (

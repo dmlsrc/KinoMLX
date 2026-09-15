@@ -1,7 +1,5 @@
 """Typed, transactional EXR/HEIC/gain-map output for GMNet expansion."""
 
-from __future__ import annotations
-
 import logging
 import shutil
 import stat
@@ -10,17 +8,27 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
-from kinomlx.debug.metadata import selected_execution_sidecar_paths, sidecar_selected
+from kinomlx.config_rules import validate_record
+from kinomlx.debug.metadata import selected_execution_sidecar_paths
 from kinomlx.errors import KinoMLXError
+from kinomlx.io.output_paths import OutputCollisionError, timestamped_output_base
 from kinomlx.io.reservation import PathReservation, PathReservationError
+from kinomlx.media.signals import ColorPrimaries, ColorTransfer, ExrDeliverySpec, ExrSampleType
 from kinomlx.reporting import NullReporter, Reporter
+from kinomlx.videotoolbox.exr import save_exr_frame
+from kinomlx.videotoolbox.heic import save_pq_heic_frame
 
-from .expand import GAIN_MAP_SIDECAR_SUFFIX, ExpansionResult
+from .expand import GAIN_MAP_SIDECAR_SUFFIX, ExpansionResult, write_gain_map_sidecar
+from .output_rules import selected_output_formats
 from .types import GMNetOutputConfig, GMNetRequest
 
 
 class GMNetOutputError(KinoMLXError, RuntimeError):
     """A typed refusal or failure while publishing GMNet artifacts."""
+
+
+class _OutputCollisionError(GMNetOutputError, OutputCollisionError):
+    """An occupied bundle can be retried with another generated run stem."""
 
 
 class _RetainedTransactionError(GMNetOutputError):
@@ -58,6 +66,7 @@ class GMNetOutputPlan:
     """Resolved target names that can be reserved before model inference."""
 
     source: Path
+    base: Path
     artifacts: GMNetArtifactSet
     execution_sidecars: tuple[tuple[str, Path], ...]
     force: bool
@@ -110,7 +119,7 @@ class GMNetOutputReservation:
                 try:
                     reservation = PathReservation.acquire(target)
                 except PathReservationError as exc:
-                    raise GMNetOutputError(f"cannot reserve output target: {exc}") from exc
+                    raise _OutputCollisionError(f"cannot reserve output target: {exc}") from exc
                 self._reservations[target] = reservation
                 try:
                     status = target.lstat()
@@ -118,12 +127,12 @@ class GMNetOutputReservation:
                     self.modes[target] = reservation.creation_mode
                     continue
                 if not stat.S_ISREG(status.st_mode):
-                    raise GMNetOutputError(
+                    raise _OutputCollisionError(
                         f"output target {target} is not a regular file; symbolic links "
                         "and other special files are unsupported"
                     )
                 if not self.plan.force:
-                    raise GMNetOutputError(
+                    raise _OutputCollisionError(
                         f"output target {target} exists; enable replacement to replace it"
                     )
                 self.modes[target] = status.st_mode & 0o777
@@ -159,38 +168,27 @@ class GMNetOutputReservation:
 def plan_gmnet_output(
     request: GMNetRequest,
     config: GMNetOutputConfig,
+    *,
+    base: Path | None = None,
 ) -> GMNetOutputPlan:
-    """Resolve exact artifact paths without touching the filesystem."""
+    """Resolve a bundle, optionally using an app-selected generated run stem."""
+    try:
+        validate_record(config, location="[output]")
+    except ValueError as exc:
+        raise GMNetOutputError(str(exc)) from exc
+    write_exr, write_heic, save_gain_map = selected_output_formats(
+        config.path, config.exr, config.heic, config.save_gain_map, config.save_all_sidecars
+    )
     source = request.image.expanduser()
     exact = None if config.path is None else Path(config.path).expanduser()
     if exact is not None:
         suffix = exact.suffix.lower()
-        if suffix not in {".exr", ".heic"}:
-            raise GMNetOutputError("exact GMNet output path must end in .exr or .heic")
-        default_exr = suffix == ".exr"
-        default_heic = suffix == ".heic"
-        write_exr = default_exr if config.exr is None else config.exr
-        write_heic = default_heic if config.heic is None else config.heic
-        if suffix == ".exr" and not write_exr:
-            raise GMNetOutputError("an exact .exr path requires EXR output")
-        if suffix == ".heic" and not write_heic:
-            raise GMNetOutputError("an exact .heic path requires HEIC output")
         base = exact.with_suffix("")
     else:
-        write_exr = True if config.exr is None else config.exr
-        write_heic = True if config.heic is None else config.heic
         prefix = source.stem if config.prefix is None else config.prefix
-        if not prefix or Path(prefix).name != prefix:
-            raise GMNetOutputError("GMNet output prefix must be one filename component")
-        base = Path(config.directory).expanduser() / prefix
+        if base is None:
+            base = timestamped_output_base(config.directory, prefix)
         suffix = ""
-    save_gain_map = sidecar_selected(
-        config.save_gain_map,
-        save_all=config.save_all_sidecars,
-    )
-    if not (write_exr or write_heic or save_gain_map):
-        raise GMNetOutputError("nothing to write: EXR, HEIC, and gain-map outputs are disabled")
-
     exr = None
     if write_exr:
         exr = exact if exact is not None and suffix == ".exr" else base.parent / f"{base.name}.exr"
@@ -202,6 +200,7 @@ def plan_gmnet_output(
     gain_map = base.parent / f"{base.name}{GAIN_MAP_SIDECAR_SUFFIX}" if save_gain_map else None
     return GMNetOutputPlan(
         source=source,
+        base=base,
         artifacts=GMNetArtifactSet(exr=exr, heic=heic, gain_map=gain_map),
         execution_sidecars=tuple(selected_execution_sidecar_paths(base, config).items()),
         force=config.force,
@@ -209,14 +208,6 @@ def plan_gmnet_output(
 
 
 def _default_exr_writer(result: ExpansionResult, path: Path) -> object:
-    from kinomlx.media.signals import (
-        ColorPrimaries,
-        ColorTransfer,
-        ExrDeliverySpec,
-        ExrSampleType,
-    )
-    from kinomlx.videotoolbox.exr import save_exr_frame
-
     delivery = ExrDeliverySpec(
         primaries=ColorPrimaries.REC709,
         transfer=ColorTransfer.LINEAR,
@@ -227,9 +218,6 @@ def _default_exr_writer(result: ExpansionResult, path: Path) -> object:
 
 
 def _default_heic_writer(result: ExpansionResult, path: Path) -> object:
-    from kinomlx.media.signals import ColorPrimaries
-    from kinomlx.videotoolbox.heic import save_pq_heic_frame
-
     return save_pq_heic_frame(
         result.linear_rgb,
         path,
@@ -238,8 +226,6 @@ def _default_heic_writer(result: ExpansionResult, path: Path) -> object:
 
 
 def _default_gain_writer(result: ExpansionResult, path: Path, source: Path) -> object:
-    from .expand import write_gain_map_sidecar
-
     return write_gain_map_sidecar(path, result, source_image=source)
 
 
@@ -267,7 +253,7 @@ class GMNetOutputSink:
         transaction: Path,
     ) -> dict[Path, Path]:
         temporary: dict[Path, Path] = {}
-        phase = "write GMNet outputs"
+        phase = "write outputs"
         artifacts = self.plan.artifacts
         total = len(artifacts.paths())
         self.reporter.phase_start(phase, total=total, unit="artifact")
@@ -400,7 +386,6 @@ def write_gmnet_output(
 
 __all__ = [
     "GMNetArtifactSet",
-    "GMNetOutputConfig",
     "GMNetOutputError",
     "GMNetOutputPlan",
     "GMNetOutputReservation",

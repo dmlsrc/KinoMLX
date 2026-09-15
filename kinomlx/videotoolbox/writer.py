@@ -8,8 +8,6 @@ metadata. Audio (if attached) is pulled by AVAssetWriter on a dedicated
 dispatch queue so it does not stall the video append loop.
 """
 
-from __future__ import annotations
-
 import logging
 import threading
 import time
@@ -40,6 +38,15 @@ _log = logging.getLogger(__name__)
 # HEVC profile identifiers (Apple-stable strings; not exposed as PyObjC consts)
 HEVC_PROFILE_MAIN10 = "HEVC_Main10_AutoLevel"  # 4:2:0 10-bit
 HEVC_PROFILE_MAIN422_10 = "HEVC_Main42210_AutoLevel"  # 4:2:2 10-bit (Range Extensions)
+
+
+def hevc_profile_for(delivery: EncodedVideoDeliverySpec) -> str:
+    """Name the encoder profile this validated delivery requires."""
+    return (
+        HEVC_PROFILE_MAIN10
+        if delivery.profile is VideoCodecProfile.MAIN10
+        else HEVC_PROFILE_MAIN422_10
+    )
 
 
 class _AssetWriter(Protocol):
@@ -76,11 +83,7 @@ def hevc_video_settings(
 ) -> dict[object, object]:
     """AVAssetWriterInput output settings for HEVC at the given size + profile."""
     delivery = validate_encoded_delivery(delivery)
-    profile = (
-        HEVC_PROFILE_MAIN10
-        if delivery.profile is VideoCodecProfile.MAIN10
-        else HEVC_PROFILE_MAIN422_10
-    )
+    profile = hevc_profile_for(delivery)
     hdr = delivery.transfer is ColorTransfer.HLG
     color_properties = (
         {
@@ -237,19 +240,14 @@ class AVWriter:
         self.path = output_path
         self.frame_count = 0
         self.audio_track = audio_track
-        self._audio_codec = audio_codec
         self.delivery = delivery
 
-        profile = (
-            HEVC_PROFILE_MAIN10
-            if delivery.profile is VideoCodecProfile.MAIN10
-            else HEVC_PROFILE_MAIN422_10
-        )
+        profile = hevc_profile_for(delivery)
 
         audio_desc = f", audio={audio_codec}" if native_audio_input is not None else ""
         color_label = "BT.2020/HLG" if delivery.transfer is ColorTransfer.HLG else "BT.709"
         _log.info(
-            f"[{label}] AVAssetWriter -> {output_path} "
+            f"Video encode: AVAssetWriter ({label}); "
             f"(HEVC {profile} {color_label} q={quality}{audio_desc})"
         )
 

@@ -1,15 +1,24 @@
 """Build, patchify, and clear video/audio latent denoising states."""
 
-from __future__ import annotations
-
 from dataclasses import dataclass, replace
 
 import mlx.core as mx
 
-from kinomlx.types import LatentState, VideoLatentShape
+from kinomlx.types import VideoLatentShape
 
 from ..patchifier import AudioPatchifier, VideoLatentPatchifier, get_pixel_coords
-from ..types import VIDEO_VAE_SCALE, AudioLatentShape
+from ..types import VIDEO_VAE_SCALE, AudioLatentShape, LatentState
+
+
+def _without_conditioning(state: LatentState, token_count: int) -> LatentState:
+    """Keep the leading tokens of a patchified stream and denoise all of them."""
+    return LatentState(
+        latent=state.latent[:, :token_count],
+        denoise_mask=mx.ones_like(state.denoise_mask[:, :token_count]),
+        positions=state.positions[:, :, :token_count],
+        clean_latent=state.clean_latent[:, :token_count],
+        uniform_mask=True,
+    )
 
 
 @dataclass(frozen=True)
@@ -87,14 +96,7 @@ class VideoLatentTools:
         )
 
     def clear_conditioning(self, state: LatentState) -> LatentState:
-        token_count = self.patchifier.get_token_count(self.target_shape)
-        return LatentState(
-            latent=state.latent[:, :token_count],
-            denoise_mask=mx.ones_like(state.denoise_mask[:, :token_count]),
-            positions=state.positions[:, :, :token_count],
-            clean_latent=state.clean_latent[:, :token_count],
-            uniform_mask=True,
-        )
+        return _without_conditioning(state, self.patchifier.get_token_count(self.target_shape))
 
 
 @dataclass(frozen=True)
@@ -162,14 +164,7 @@ class AudioLatentTools:
         )
 
     def clear_conditioning(self, state: LatentState) -> LatentState:
-        token_count = self.patchifier.get_token_count(self.target_shape)
-        return LatentState(
-            latent=state.latent[:, :token_count],
-            denoise_mask=mx.ones_like(state.denoise_mask[:, :token_count]),
-            positions=state.positions[:, :, :token_count],
-            clean_latent=state.clean_latent[:, :token_count],
-            uniform_mask=True,
-        )
+        return _without_conditioning(state, self.patchifier.get_token_count(self.target_shape))
 
 
 __all__ = ["AudioLatentTools", "VideoLatentTools"]

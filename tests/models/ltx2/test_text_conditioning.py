@@ -1,8 +1,5 @@
 """Encoder-neutral text-conditioning station and provenance contracts."""
 
-from __future__ import annotations
-
-import hashlib
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -10,6 +7,7 @@ import mlx.core as mx
 import pytest
 
 import kinomlx.models.ltx2.text_conditioning as text_module
+from kinomlx.memory_policy import MLXMemoryPolicy
 from kinomlx.models.ltx2.resources import ComponentKind
 from kinomlx.models.ltx2.text_conditioning import (
     NativeTextConditioner,
@@ -17,8 +15,10 @@ from kinomlx.models.ltx2.text_conditioning import (
     text_conditioning_provenance,
 )
 from kinomlx.models.ltx2.text_encoder.encoder import AudioVideoGemmaEncoderOutput
-from kinomlx.models.ltx2.text_encoder.tokenizer_cache import TokenizerCache
+from kinomlx.models.ltx2.text_encoder.tokenizer_derivation import derive_tokenizer
 from kinomlx.models.ltx2.types import DistilledRequest
+
+from .text_encoder._tokenizer_fixtures import tokenizer_json
 
 
 class _Metadata:
@@ -30,23 +30,24 @@ class _Metadata:
 
 
 class _Resources:
+    memory_policy = MLXMemoryPolicy()
+
     def __init__(
         self,
         *,
         gemma_path: Path | None = Path("gemma"),
         generation: str = "ltx-2.3",
-        tokenizer_cache: TokenizerCache | None = None,
+        tokenizer_source: Path | None = None,
     ) -> None:
-        self.tokenizer_cache = tokenizer_cache
+        if tokenizer_source is not None:
+            gemma_path = tokenizer_source
         self.capabilities = SimpleNamespace(
             model_generation=generation,
             text_encoder_family=(
                 "gemma4-12b-ltx" if generation in {"2.5", "ltx-2.5"} else "gemma-3-12b-it"
             ),
         )
-        connector_cache = (
-            None if generation in {"2.5", "ltx-2.5"} else Path("connector.safetensors")
-        )
+        (None if generation in {"2.5", "ltx-2.5"} else Path("connector.safetensors"))
         self.components = {
             ComponentKind.TEXT_ENCODER: (
                 None
@@ -54,7 +55,6 @@ class _Resources:
                 else SimpleNamespace(
                     kind=ComponentKind.TEXT_ENCODER,
                     source_path=gemma_path,
-                    cache_path=None,
                     source_fingerprint="text-fingerprint",
                     metadata=_Metadata("gemma4-12b-ltx"),
                 )
@@ -62,21 +62,18 @@ class _Resources:
             ComponentKind.TEXT_PROJECTION: SimpleNamespace(
                 kind=ComponentKind.TEXT_PROJECTION,
                 source_path=Path("text.safetensors"),
-                cache_path=connector_cache,
                 source_fingerprint="projection-fingerprint",
                 metadata=_Metadata("ltx2-text-projection"),
             ),
             ComponentKind.CONNECTOR: SimpleNamespace(
                 kind=ComponentKind.CONNECTOR,
                 source_path=Path("transformer.safetensors"),
-                cache_path=connector_cache,
                 source_fingerprint="connector-fingerprint",
                 metadata=_Metadata("ltx-2.3-av-connectors"),
             ),
             ComponentKind.TRANSFORMER: SimpleNamespace(
                 kind=ComponentKind.TRANSFORMER,
                 source_path=Path("transformer.safetensors"),
-                cache_path=None,
                 source_fingerprint="transformer-fingerprint",
                 metadata=_Metadata("ltx2-av-transformer"),
             ),
@@ -101,17 +98,10 @@ class _Resources:
         return component
 
 
-def _tokenizer_cache(tmp_path: Path) -> TokenizerCache:
-    model = tmp_path / "tokenizer.model"
-    metadata = tmp_path / "tokenizer.metadata.json"
-    model.write_bytes(b"model")
-    metadata.write_bytes(b"metadata")
-    return TokenizerCache(
-        model_path=model,
-        metadata_path=metadata,
-        source_json_sha256="source-json-digest",
-        model_sha256="model-digest",
-    )
+def _tokenizer_source(tmp_path: Path) -> Path:
+    source = tmp_path / "tokenizer.json"
+    source.write_bytes(tokenizer_json())
+    return source
 
 
 def _encoded(tokens: int = 2) -> AudioVideoGemmaEncoderOutput:
@@ -135,12 +125,10 @@ def test_provenance_identifies_model_encoder_and_projection_layout() -> None:
 
 
 def test_provenance_records_tokenizer_and_both_packaged_sources(tmp_path: Path) -> None:
-    cache = _tokenizer_cache(tmp_path)
-    provenance = text_conditioning_provenance(_Resources(generation="2.5", tokenizer_cache=cache))
+    cache = _tokenizer_source(tmp_path)
+    provenance = text_conditioning_provenance(_Resources(generation="2.5", tokenizer_source=cache))
 
-    assert provenance.tokenizer_source_sha256 == "source-json-digest"
-    assert provenance.tokenizer_model_sha256 == "model-digest"
-    assert provenance.tokenizer_metadata_sha256 == hashlib.sha256(b"metadata").hexdigest()
+    assert provenance.tokenizer_source_sha256 == derive_tokenizer(cache).source_json_sha256
     assert provenance.tokenization_policy is not None
     assert provenance.text_artifact_identity == "gemma4-12b-ltx:text-fingerprint"
     assert provenance.projection_source_identity == ("ltx2-text-projection:projection-fingerprint")
@@ -148,13 +136,13 @@ def test_provenance_records_tokenizer_and_both_packaged_sources(tmp_path: Path) 
 
 
 def test_legacy_sidecar_identity_is_accepted_only_for_ltx23(tmp_path: Path) -> None:
-    cache = _tokenizer_cache(tmp_path)
+    cache = _tokenizer_source(tmp_path)
     expected_23 = text_conditioning_provenance(
-        _Resources(generation="ltx-2.3", tokenizer_cache=cache)
+        _Resources(generation="ltx-2.3", tokenizer_source=cache)
     )
     assert _provenance().is_compatible_with(expected_23)
 
-    expected_25 = text_conditioning_provenance(_Resources(generation="2.5", tokenizer_cache=cache))
+    expected_25 = text_conditioning_provenance(_Resources(generation="2.5", tokenizer_source=cache))
     legacy_25 = TextConditioningProvenance(
         model_generation="2.5",
         text_encoder_identity=expected_25.text_encoder_identity,
@@ -171,7 +159,7 @@ def test_ltx25_incompatible_schema3_sidecar_fails_before_prompt_models(
     sidecar.touch()
     resources = _Resources(
         generation="2.5",
-        tokenizer_cache=_tokenizer_cache(tmp_path),
+        tokenizer_source=_tokenizer_source(tmp_path),
     )
     metadata = {
         "schema_version": "3",
@@ -194,6 +182,26 @@ def test_ltx25_incompatible_schema3_sidecar_fails_before_prompt_models(
             DistilledRequest(text_conditioning=sidecar),
             resources,
         )
+
+
+def test_schema3_replay_does_not_derive_tokenizer(monkeypatch, tmp_path: Path) -> None:
+    resources = _Resources(generation="2.5", tokenizer_source=_tokenizer_source(tmp_path))
+    metadata = {"schema_version": "3", **text_conditioning_provenance(resources).to_metadata()}
+    monkeypatch.setattr(
+        text_module,
+        "derive_tokenizer",
+        lambda *_args, **_kwargs: pytest.fail("replay must not derive SentencePiece"),
+    )
+    monkeypatch.setattr(
+        text_module,
+        "load_text_conditioning",
+        lambda *_args, **_kwargs: (_encoded(), metadata),
+    )
+    result = NativeTextConditioner()(
+        DistilledRequest(text_conditioning=tmp_path / "text.safetensors"),
+        resources,
+    )
+    assert result.replay_receipt["identity_match"] is True
 
 
 def test_saved_conditioning_bypasses_prompt_models(monkeypatch, tmp_path: Path) -> None:
@@ -276,7 +284,7 @@ def test_restart_replay_observes_identity_mismatch_without_veto(
         lambda *_args, **_kwargs: pytest.fail("replay must not load prompt weights"),
     )
 
-    with caplog.at_level("WARNING"):
+    with caplog.at_level("WARNING", logger="kinomlx.models.ltx2.text_conditioning"):
         result = NativeTextConditioner(replay_identity_policy="observe")(
             DistilledRequest(text_conditioning=sidecar),
             _Resources(),
@@ -305,8 +313,8 @@ def test_prompt_station_delegates_concrete_encoder_selection_to_resources(monkey
     assert result.provenance == _provenance()
     assert calls[0][0] == "a lighthouse"
     assert calls[0][1]["gemma_path"] == Path("gemma")
-    assert calls[0][1]["connector_path"] == Path("connector.safetensors")
-    assert calls[0][1]["projection_path"] == Path("connector.safetensors")
+    assert calls[0][1]["connector_path"] == Path("transformer.safetensors")
+    assert calls[0][1]["projection_path"] == Path("text.safetensors")
     assert calls[0][1]["config_path"] == Path("transformer.safetensors")
     assert calls[0][1]["model_generation"] == "ltx-2.3"
     assert calls[0][1]["pad_prompt_to_max"] is False
@@ -325,12 +333,12 @@ def test_ltx25_prompt_station_selects_packaged_text_projection_and_connectors(
     resources = _Resources(
         gemma_path=Path("text.safetensors"),
         generation="2.5",
-        tokenizer_cache=_tokenizer_cache(tmp_path),
+        tokenizer_source=_tokenizer_source(tmp_path),
     )
 
     NativeTextConditioner()(DistilledRequest(prompt="a lighthouse"), resources)
 
-    assert calls[0][1]["gemma_path"] == Path("text.safetensors")
+    assert calls[0][1]["gemma_path"] == tmp_path / "tokenizer.json"
     assert calls[0][1]["projection_path"] == Path("text.safetensors")
     assert calls[0][1]["connector_path"] == Path("transformer.safetensors")
     assert calls[0][1]["config_path"] == Path("transformer.safetensors")
@@ -343,3 +351,53 @@ def test_prompt_station_requires_the_selected_encoder_assets() -> None:
             DistilledRequest(prompt="a lighthouse"),
             _Resources(gemma_path=None),
         )
+
+
+@pytest.mark.parametrize("policy", ["require", "observe"])
+@pytest.mark.parametrize("prompt", ["", "a landscape", None])
+def test_empty_prompt_saved_conditioning_contract(monkeypatch, tmp_path, policy, prompt):
+    metadata = _provenance().to_metadata()
+    if prompt is not None:
+        metadata["prompt"] = prompt
+    monkeypatch.setattr(
+        text_module,
+        "load_text_conditioning",
+        lambda *a, **k: (_encoded(4), metadata),
+    )
+    request = DistilledRequest(
+        text_conditioning=tmp_path / "text.safetensors",
+        prompt_unconditional=True,
+    )
+    conditioner = NativeTextConditioner(replay_identity_policy=policy)
+    if prompt == "":
+        assert conditioner(request, _Resources(gemma_path=None)).prompt == ""
+    else:
+        with pytest.raises(ValueError, match="empty saved"):
+            conditioner(request, _Resources(gemma_path=None))
+
+
+@pytest.mark.parametrize("generation", ["ltx-2.3", "2.5"])
+def test_v3_policy_rename_preserves_identity_checks(tmp_path, generation):
+    from dataclasses import replace
+
+    expected = text_conditioning_provenance(
+        _Resources(generation=generation, tokenizer_source=_tokenizer_source(tmp_path))
+    )
+    saved = replace(
+        expected, tokenization_policy="sentencepiece-bpe-modelproto-v2:cache-v3:left-padding-v1"
+    )
+    assert saved.is_compatible_with(expected)
+    assert expected.is_compatible_with(saved)
+    for field in (
+        "model_generation",
+        "text_encoder_identity",
+        "projection_identity",
+        "tokenizer_source_sha256",
+        "text_artifact_identity",
+        "projection_source_identity",
+        "connector_source_identity",
+    ):
+        assert not replace(saved, **{field: "different"}).is_compatible_with(expected)
+    assert not replace(
+        saved, tokenization_policy="sentencepiece-bpe-modelproto-v2:cache-v2:left-padding-v1"
+    ).is_compatible_with(expected)

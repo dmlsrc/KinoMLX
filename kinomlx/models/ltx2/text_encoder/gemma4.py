@@ -5,17 +5,14 @@ model. Numerical boundaries follow the pinned Apache Transformers Gemma 4
 unified text execution used to freeze the LTX-tuned reference fixture.
 """
 
-from __future__ import annotations
-
 from dataclasses import dataclass, field
 
 import mlx.core as mx
 
 import kinomlx._mlx_nn as nn
 from kinomlx.kernels import gelu_approx, rms_norm
+from kinomlx.modeling.layers import embedding_shell, linear_shell
 from kinomlx.reporting import NullReporter, Reporter
-
-from ._layers import embedding_shell, linear_shell
 
 GEMMA4_LAYER_TYPES = tuple(
     "full_attention" if (index + 1) % 6 == 0 else "sliding_attention" for index in range(48)
@@ -71,7 +68,7 @@ class Gemma4Config:
             raise ValueError("Gemma 4 layer_types must match num_hidden_layers")
         invalid = set(self.layer_types) - {"sliding_attention", "full_attention"}
         if invalid:
-            raise ValueError(f"unsupported Gemma 4 attention type: {sorted(invalid)[0]}")
+            raise ValueError(f"unsupported Gemma 4 attention type: {min(invalid)}")
 
 
 class Gemma4RMSNorm(nn.Module):
@@ -325,7 +322,8 @@ class Gemma4Model(nn.Module):
 
         sink = reporter if reporter is not None else NullReporter()
         phase = "encode prompt with Gemma 4"
-        sink.phase_start(phase, total=len(self.layers), unit="layer")
+        # Indeterminate phase: one lazy graph per prompt, evaluated once below.
+        sink.phase_start(phase)
         try:
             hidden = self.embed_tokens(input_ids)
             scale = mx.array(self.config.hidden_size**0.5, dtype=mx.bfloat16)
@@ -340,16 +338,18 @@ class Gemma4Model(nn.Module):
                     states.append(hidden)
                 mask = sliding_mask if layer.layer_type == "sliding_attention" else full_mask
                 hidden = layer(hidden, mask, position_ids)
-                mx.eval(hidden)
                 if boundaries is not None:
                     boundaries[f"layer.{index:02d}"] = hidden
-                sink.phase_advance(phase)
             hidden = self.norm(hidden)
-            mx.eval(hidden)
             if states is not None:
                 states.append(hidden)
             if boundaries is not None:
                 boundaries["final_norm"] = hidden
+            mx.eval(
+                hidden,
+                *(states or ()),
+                *(boundaries.values() if boundaries else ()),
+            )
             return hidden, tuple(states) if states is not None else None, boundaries
         finally:
             sink.phase_end(phase)

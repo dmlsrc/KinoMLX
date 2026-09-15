@@ -1,7 +1,5 @@
 """Typed metadata for the implemented LTX-2 video VAE graphs."""
 
-from __future__ import annotations
-
 import json
 import math
 from collections.abc import Mapping, Sequence
@@ -729,8 +727,8 @@ LTX23_VIDEO_VAE_CONFIG = VideoVAEConfig(
 
 
 __all__ = [
-    "DiffusionVideoDecoderConfig",
     "LTX23_VIDEO_VAE_CONFIG",
+    "DiffusionVideoDecoderConfig",
     "VideoVAEBlock",
     "VideoVAEConfig",
 ]

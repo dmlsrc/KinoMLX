@@ -1,7 +1,5 @@
 """Explicit opt-in real-weight gate for the complete LTX-2.3 pipeline."""
 
-from __future__ import annotations
-
 import os
 from pathlib import Path
 from typing import Any
@@ -12,13 +10,15 @@ import Foundation
 import mlx.core as mx
 import pytest
 
-from kinomlx.cli.config import OutputConfig
-from kinomlx.cli.output import write_generation
+from kinomlx.models.ltx2.generation import GenerationOutput
+from kinomlx.models.ltx2.output import write_generation
+from kinomlx.models.ltx2.output_config import OutputConfig
 from kinomlx.models.ltx2.pipelines.distilled import generate_distilled
-from kinomlx.models.ltx2.runner import GenerationOutput, LTX2Runner
+from kinomlx.models.ltx2.runner import LTX2Runner
 from kinomlx.models.ltx2.settings import LTX2Settings
 from kinomlx.models.ltx2.types import DistilledRequest
 from kinomlx.settings import Settings
+from tests.models.ltx2._source_weights import NO_LTX23_CHECKPOINT, ltx23_checkpoint
 
 _MAX_UNACCOUNTED_VAE_ENTRY_BYTES = 1 << 30
 
@@ -52,16 +52,15 @@ class _InspectingFrameStream:
 
 
 @pytest.mark.slow
-@pytest.mark.requires_weights
+@pytest.mark.heavy
 @pytest.mark.requires_avfoundation
 def test_real_ltx23_joint_pipeline_writes_video_and_audio(tmp_path: Path) -> None:
     if os.environ.get("KINO_RUN_REAL_PIPELINE") != "1":
         pytest.skip("set KINO_RUN_REAL_PIPELINE=1 for the full real-weight smoke")
     infrastructure = Settings.from_env()
     model_settings = LTX2Settings.from_env()
-    checkpoint = model_settings.weights_path
-    if checkpoint is None or not checkpoint.is_file():
-        pytest.skip("KINO_WEIGHTS_PATH is not configured")
+    if ltx23_checkpoint() is None:
+        pytest.skip(NO_LTX23_CHECKPOINT)
 
     with LTX2Runner(model_settings, infrastructure=infrastructure).run(
         generate_distilled,

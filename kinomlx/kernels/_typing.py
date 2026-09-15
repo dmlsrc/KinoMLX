@@ -1,7 +1,5 @@
 """Internal callable contracts missing from MLX's dynamic kernel API."""
 
-from __future__ import annotations
-
 from collections.abc import Sequence
 from typing import Protocol
 

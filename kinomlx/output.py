@@ -1,15 +1,22 @@
 """Typed generation-to-terminal boundary with a native VideoToolbox sink."""
 
-from __future__ import annotations
-
 import shutil
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Protocol
+from typing import Protocol
 
+import mlx.core as mx
+
+import kinomlx.videotoolbox.writer as _writer
 from kinomlx.errors import KinoMLXError
 from kinomlx.media.frames import CloseableVideoFrameStream
+from kinomlx.media.hdr import (
+    convert_scene_linear_primaries,
+    decode_working_transfer,
+    scene_linear_to_acescct,
+    scene_linear_to_logc3,
+)
 from kinomlx.media.signals import (
     ColorPrimaries,
     ColorTransfer,
@@ -24,12 +31,14 @@ from kinomlx.media.signals import (
     validate_sdr_output_plan,
 )
 from kinomlx.reporting import NullReporter, Reporter
-
-if TYPE_CHECKING:
-    import mlx.core as mx
-
-    from kinomlx.videotoolbox.frame_dump import PNGFrameDumpStream
-    from kinomlx.videotoolbox.writer import AVWriter
+from kinomlx.videotoolbox import encode_video_videotoolbox
+from kinomlx.videotoolbox.encode import prepare_audio_track
+from kinomlx.videotoolbox.errors import is_video_toolbox_operation_error
+from kinomlx.videotoolbox.exr import save_exr_frame, validate_exr_delivery, write_exr_manifest
+from kinomlx.videotoolbox.frame_dump import FrameDumpError, PNGFrameDumpStream
+from kinomlx.videotoolbox.heic import save_pq_heic_frame, write_heic_manifest
+from kinomlx.videotoolbox.hlg import PIX_P010_VIDEO, make_hlg_pixel_buffer
+from kinomlx.videotoolbox.pixel_buffers import PixelBufferAdaptor
 
 
 class OutputError(KinoMLXError, RuntimeError):
@@ -55,6 +64,19 @@ class Generation(Protocol):
     def frame_count(self) -> int: ...
 
     def close(self) -> None: ...
+
+
+class _HDRWriter(Protocol):
+    """Mutable writer surface retained while one HDR transaction is open."""
+
+    @property
+    def adaptor(self) -> PixelBufferAdaptor: ...
+
+    def append(self, pixel_buffer: object) -> None: ...
+
+    def finish(self) -> None: ...
+
+    def cancel(self) -> None: ...
 
 
 def default_vae_frame_directory(path: Path | str) -> Path:
@@ -162,17 +184,10 @@ class VideoToolboxGenerationSink:
             delivery = plan.deliveries[0]
             encoder = self.encoder
             if encoder is None:
-                from kinomlx.videotoolbox import encode_video_videotoolbox
-
                 encoder = encode_video_videotoolbox
             reporter = self.reporter if self.reporter is not None else NullReporter()
             frames: CloseableVideoFrameStream = generation.frames
             if self.vae_frame_directory is not None:
-                from kinomlx.videotoolbox.frame_dump import (
-                    FrameDumpError,
-                    PNGFrameDumpStream,
-                )
-
                 try:
                     dump_stream = PNGFrameDumpStream(frames, self.vae_frame_directory)
                 except FrameDumpError as exc:
@@ -210,12 +225,8 @@ class VideoToolboxGenerationSink:
         except OutputError, UnsupportedSignalError:
             raise
         except Exception as exc:
-            if dump_stream is not None:
-                from kinomlx.videotoolbox.frame_dump import FrameDumpError
-
-                if isinstance(exc, FrameDumpError):
-                    raise OutputError(str(exc)) from exc
-            from kinomlx.videotoolbox.errors import is_video_toolbox_operation_error
+            if dump_stream is not None and isinstance(exc, FrameDumpError):
+                raise OutputError(str(exc)) from exc
 
             if not is_video_toolbox_operation_error(exc):
                 raise
@@ -254,7 +265,6 @@ class HDRGenerationSink:
             raise UnsupportedSignalError(
                 "HDR generation sink requires one EXR and one encoded HLG delivery"
             )
-        from kinomlx.videotoolbox.exr import validate_exr_delivery
 
         validate_exr_delivery(exr[0])
         validate_hlg_delivery(encoded[0])
@@ -285,12 +295,6 @@ class HDRGenerationSink:
         source: VideoSignalSpec,
         delivery: ExrDeliverySpec,
     ) -> mx.array:
-        from kinomlx.media.hdr import (
-            convert_scene_linear_primaries,
-            scene_linear_to_acescct,
-            scene_linear_to_logc3,
-        )
-
         if delivery.transfer is source.transfer and delivery.primaries is source.primaries:
             return working
         converted = convert_scene_linear_primaries(
@@ -309,7 +313,7 @@ class HDRGenerationSink:
     def write(self, generation: Generation, plan: OutputColorPlan) -> ArtifactSet:
         """Consume one frame at a time and publish every HDR output together."""
         transaction: Path | None = None
-        writer: AVWriter | None = None
+        writer: _HDRWriter | None = None
         final_exr = self.exr_directory or default_hdr_exr_directory(self.path)
         final_heic = self.heic_directory
         final_audio = (
@@ -344,20 +348,6 @@ class HDRGenerationSink:
             if temp_heic is not None:
                 temp_heic.mkdir()
 
-            import mlx.core as mx
-
-            from kinomlx.media.hdr import decode_working_transfer
-            from kinomlx.videotoolbox.encode import prepare_audio_track
-            from kinomlx.videotoolbox.exr import save_exr_frame, write_exr_manifest
-            from kinomlx.videotoolbox.hlg import PIX_P010_VIDEO, make_hlg_pixel_buffer
-            from kinomlx.videotoolbox.writer import AVWriter
-
-            if temp_heic is not None:
-                from kinomlx.videotoolbox.heic import (
-                    save_pq_heic_frame,
-                    write_heic_manifest,
-                )
-
             audio_track = prepare_audio_track(
                 generation.audio_waveform,
                 generation.audio_sample_rate,
@@ -365,7 +355,7 @@ class HDRGenerationSink:
                 onset_trim_ms=self.audio_onset_trim_ms,
                 verbose=self.native_verbose,
             )
-            writer = AVWriter(
+            active_writer: _HDRWriter = _writer.AVWriter(
                 temp_video,
                 width=plan.source.width,
                 height=plan.source.height,
@@ -377,6 +367,7 @@ class HDRGenerationSink:
                 audio_track=audio_track,
                 audio_codec=self.audio_codec,
             )
+            writer = active_writer
             phase = (
                 "HDR EXR + PQ HEIC + HLG encode"
                 if temp_heic is not None
@@ -408,10 +399,10 @@ class HDRGenerationSink:
                         )
                     pixel_buffer = make_hlg_pixel_buffer(
                         linear,
-                        writer.adaptor,
+                        active_writer.adaptor,
                         primaries=plan.source.primaries,
                     )
-                    writer.append(pixel_buffer)
+                    active_writer.append(pixel_buffer)
                     sink.phase_advance(phase)
                     del working, linear, exr_frame, pixel_buffer
                     mx.clear_cache()
@@ -421,7 +412,7 @@ class HDRGenerationSink:
                 raise OutputError(
                     f"HDR terminal consumed {count} frames, expected {generation.frame_count}"
                 )
-            writer.finish()
+            active_writer.finish()
             writer = None
             write_exr_manifest(
                 temp_exr,
@@ -513,13 +504,13 @@ class HDRGenerationSink:
 
 __all__ = [
     "ArtifactSet",
-    "default_hdr_exr_directory",
-    "default_hdr_heic_directory",
-    "default_vae_frame_directory",
     "Generation",
     "GenerationSink",
     "HDRGenerationSink",
     "OutputError",
     "VideoToolboxEncoder",
     "VideoToolboxGenerationSink",
+    "default_hdr_exr_directory",
+    "default_hdr_heic_directory",
+    "default_vae_frame_directory",
 ]

@@ -1,89 +1,67 @@
-"""Behavioral tests for ``kinomlx.models.ltx2.sigmas``."""
+"""LTX-2 denoises in two stages, so each schedule is pinned and overridden alone."""
 
-from __future__ import annotations
+import pytest
 
-from itertools import pairwise
-
-import mlx.core as mx
-import numpy as np
-
+from kinomlx.models.ltx2.pipelines.distilled import sampling_facts
 from kinomlx.models.ltx2.sigmas import (
     DISTILLED_STAGE_1_SIGMAS,
     DISTILLED_STAGE_2_SIGMAS,
-    DISTILLED_STAGE_2_START_INDEX,
-    distilled_stage_1_sigmas,
-    distilled_stage_2_sigmas,
+    stage_sigmas,
 )
+from kinomlx.models.ltx2.types import DistilledRequest
 
-# ---------------------------------------------------------------------------
-# Stage 1 - 9 values, 8 steps
-# ---------------------------------------------------------------------------
-
-
-def test_stage_1_has_nine_values() -> None:
-    assert len(DISTILLED_STAGE_1_SIGMAS) == 9
+_DECLARED = "deterministic"
 
 
-def test_stage_1_starts_at_one_ends_at_zero() -> None:
-    assert DISTILLED_STAGE_1_SIGMAS[0] == 1.0
-    assert DISTILLED_STAGE_1_SIGMAS[-1] == 0.0
+def test_no_override_returns_both_pinned_schedules() -> None:
+    assert stage_sigmas() == (DISTILLED_STAGE_1_SIGMAS, DISTILLED_STAGE_2_SIGMAS)
 
 
-def test_stage_1_host_values_match_official_float32_tensor() -> None:
-    official_values = (1.0, 0.99375, 0.9875, 0.98125, 0.975, 0.909375, 0.725, 0.421875, 0.0)
-    expected = tuple(float(value) for value in np.asarray(official_values, dtype=np.float32))
-    assert expected == DISTILLED_STAGE_1_SIGMAS
+def test_the_pinned_schedules_drive_eight_and_three_steps() -> None:
+    first, second = stage_sigmas()
+    assert (len(first) - 1, len(second) - 1) == (8, 3)
 
 
-def test_stage_1_is_strictly_monotonic_decreasing() -> None:
-    for prev, cur in pairwise(DISTILLED_STAGE_1_SIGMAS):
-        assert cur < prev, f"non-decreasing pair: {prev} -> {cur}"
+def test_stage_two_legitimately_starts_below_one() -> None:
+    # It continues from stage 1's tail after the spatial upscaler.
+    _, second = stage_sigmas()
+    assert second[0] < 1.0
+    assert second[-1] == 0.0
 
 
-def test_stage_1_as_mx_array_is_float32() -> None:
-    arr = distilled_stage_1_sigmas()
-    assert arr.dtype == mx.float32
-    assert arr.shape == (9,)
-    np.testing.assert_array_equal(
-        np.asarray(arr), np.asarray(DISTILLED_STAGE_1_SIGMAS, dtype=np.float32)
-    )
+@pytest.mark.parametrize("stage", [1, 2])
+def test_overriding_one_stage_leaves_the_other_pinned(stage) -> None:
+    supplied = (0.9, 0.5, 0.0)
+    first, second = stage_sigmas(*((supplied, ()) if stage == 1 else ((), supplied)))
+    changed, kept = (first, second) if stage == 1 else (second, first)
+    pinned = DISTILLED_STAGE_2_SIGMAS if stage == 1 else DISTILLED_STAGE_1_SIGMAS
+    assert changed == supplied
+    assert kept == pinned
 
 
-# ---------------------------------------------------------------------------
-# Stage 2 - 4 values, 3 steps; mirrors the tail of stage 1
-# ---------------------------------------------------------------------------
+def test_both_stages_can_be_overridden_together() -> None:
+    first, second = stage_sigmas((1.0, 0.5, 0.0), (0.4, 0.0))
+    assert (first, second) == ((1.0, 0.5, 0.0), (0.4, 0.0))
 
 
-def test_stage_2_has_four_values() -> None:
-    assert len(DISTILLED_STAGE_2_SIGMAS) == 4
+@pytest.mark.parametrize("values", [(0.5, 0.9, 0.0), (1.2, 0.0), (1.0,)])
+@pytest.mark.parametrize("stage", [1, 2])
+def test_a_malformed_stage_array_is_rejected(values, stage) -> None:
+    with pytest.raises(ValueError, match="decrease strictly|between 0 and 1|at least two values"):
+        stage_sigmas(*((values, ()) if stage == 1 else ((), values)))
 
 
-def test_stage_2_ends_at_zero() -> None:
-    assert DISTILLED_STAGE_2_SIGMAS[-1] == 0.0
+def test_announced_facts_report_both_schedules_and_their_step_counts() -> None:
+    facts = sampling_facts(DistilledRequest(prompt="p"), _DECLARED)
+    assert facts["stage_1_sigmas"] == list(DISTILLED_STAGE_1_SIGMAS)
+    assert facts["stage_2_sigmas"] == list(DISTILLED_STAGE_2_SIGMAS)
+    assert (facts["stage_1_steps"], facts["stage_2_steps"]) == (8, 3)
+    assert facts["sigma_source"] == "distilled-literal"
 
 
-def test_stage_2_is_strictly_monotonic_decreasing() -> None:
-    for prev, cur in pairwise(DISTILLED_STAGE_2_SIGMAS):
-        assert cur < prev
-
-
-def test_stage_2_host_values_match_independent_official_float32_tensor() -> None:
-    official_values = (0.909375, 0.725, 0.421875, 0.0)
-    expected = tuple(float(value) for value in np.asarray(official_values, dtype=np.float32))
-    assert expected == DISTILLED_STAGE_2_SIGMAS
-
-
-def test_stage_2_mirrors_tail_of_stage_1() -> None:
-    """Stage 2's complete schedule equals stage 1's named tail.
-
-    Stage 1 ends ..., 0.909375, 0.725, 0.421875, 0.0.
-    Stage 2 begins 0.909375, 0.725, 0.421875, 0.0.
-    The non-zero values and terminal zero overlap exactly.
-    """
-    assert DISTILLED_STAGE_1_SIGMAS[DISTILLED_STAGE_2_START_INDEX:] == DISTILLED_STAGE_2_SIGMAS
-
-
-def test_stage_2_as_mx_array_is_float32() -> None:
-    arr = distilled_stage_2_sigmas()
-    assert arr.dtype == mx.float32
-    assert arr.shape == (4,)
+def test_announced_facts_mark_an_override_and_its_new_step_count() -> None:
+    request = DistilledRequest(prompt="p", stage_2_sigmas=(0.9, 0.5, 0.0))
+    facts = sampling_facts(request, _DECLARED)
+    assert facts["sigma_source"] == "explicit"
+    assert facts["stage_2_sigmas"] == [0.9, 0.5, 0.0]
+    assert (facts["stage_1_steps"], facts["stage_2_steps"]) == (8, 2)

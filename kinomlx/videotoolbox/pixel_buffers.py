@@ -7,8 +7,6 @@ fixed-timescale `_frame_pts` so VSR and AVWriter agree on PTSes for any
 arbitrary fps.
 """
 
-from __future__ import annotations
-
 import math
 import operator
 from collections.abc import Mapping
@@ -302,34 +300,6 @@ def flush_pool(pool: object | None) -> None:
         return
     # kCVPixelBufferPoolFlushExcessBuffers = 1
     Quartz.CVPixelBufferPoolFlush(pool, 1)
-
-
-def make_bgra_buffer(
-    adaptor: PixelBufferAdaptor | None,
-    width: int,
-    height: int,
-) -> object:
-    """Get a BGRA CVPixelBuffer for the comparison composite output.
-
-    Prefers the AVAssetWriter adaptor's own pool (zero-copy into the encoder);
-    falls back to fresh allocation if the pool isn't ready yet.
-    """
-    pool = adaptor.pixelBufferPool() if adaptor is not None else None
-    if pool is not None:
-        pb = pool_create_buffer(pool, allocation_threshold=WRITER_POOL_LIMIT)
-        if pb is not None:
-            return pb
-        raise RuntimeError("bounded BGRA writer pool is exhausted")
-    attrs = {
-        Quartz.kCVPixelBufferPixelFormatTypeKey: PIX_BGRA,
-        Quartz.kCVPixelBufferWidthKey: width,
-        Quartz.kCVPixelBufferHeightKey: height,
-        Quartz.kCVPixelBufferIOSurfacePropertiesKey: {},
-    }
-    err, pb = Quartz.CVPixelBufferCreate(None, width, height, PIX_BGRA, attrs, None)
-    if err != 0 or pb is None:
-        raise RuntimeError(f"CVPixelBufferCreate({width}x{height}, BGRA) failed: {err}")
-    return cast(object, pb)
 
 
 # ---------------------------------------------------------------------------

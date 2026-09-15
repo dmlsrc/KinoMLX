@@ -1,12 +1,9 @@
 """Central normal-noise stream parity and ownership tests."""
 
-from __future__ import annotations
-
 import hashlib
 from pathlib import Path
 
 import mlx.core as mx
-import numpy as np
 import pytest
 
 import kinomlx
@@ -19,7 +16,7 @@ from kinomlx.samplers.noise import (
 
 def _float32_sha256(value: mx.array) -> str:
     mx.eval(value)
-    payload = np.asarray(value.astype(mx.float32)).tobytes()
+    payload = memoryview(value.astype(mx.float32))
     return hashlib.sha256(payload).hexdigest()
 
 
@@ -30,7 +27,7 @@ def test_default_noise_backend_preserves_mlx_sequence() -> None:
     expected = explicit.normal((17,), mx.float32)
     actual = default.normal((17,), mx.float32)
 
-    np.testing.assert_array_equal(np.asarray(actual), np.asarray(expected))
+    assert mx.array_equal(actual, expected).item()
     assert default.state.backend == "mlx"
     assert noise_compatibility_profile("mlx") == "mlx-native"
 
@@ -100,7 +97,7 @@ def test_saved_position_can_resume_with_either_backend() -> None:
     expected = uninterrupted.normal((9,), mx.float32)
     actual = resumed.normal((9,), mx.float32)
 
-    np.testing.assert_array_equal(np.asarray(actual), np.asarray(expected))
+    assert mx.array_equal(actual, expected).item()
     assert resumed.state.draws == 2
     assert resumed.state.philox_blocks == 8
 

@@ -2,9 +2,9 @@
 
 from .attention import Attention, RMSNorm
 from .feed_forward import FeedForward
-from .model import LTXAVModel, LTXModel
+from .model import LTXAVModel
 from .rope import LTXRopeType, apply_rotary_emb, precompute_freqs_cis
-from .timestep import AdaLayerNormSingle, resolve_transformer_dtype
+from .timestep import AdaLayerNormSingle
 from .transformer import BasicAVTransformerBlock, TransformerArgs, TransformerConfig
 from .wrappers import Modality, X0Model
 
@@ -14,7 +14,6 @@ __all__ = [
     "BasicAVTransformerBlock",
     "FeedForward",
     "LTXAVModel",
-    "LTXModel",
     "LTXRopeType",
     "Modality",
     "RMSNorm",
@@ -23,5 +22,4 @@ __all__ = [
     "X0Model",
     "apply_rotary_emb",
     "precompute_freqs_cis",
-    "resolve_transformer_dtype",
 ]

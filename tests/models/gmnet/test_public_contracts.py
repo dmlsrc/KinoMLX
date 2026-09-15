@@ -1,11 +1,11 @@
 """The documented GMNet public-API example is importable and executable."""
 
-from __future__ import annotations
-
 import importlib.util
 from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
+
+from kinomlx.memory_policy import MLXMemoryPolicy
 
 _REPO = Path(__file__).parents[3]
 
@@ -38,7 +38,7 @@ def test_external_gmnet_example_executes_through_public_ports(
 
     infrastructure = object()
     model_settings = object()
-    resources = object()
+    resources = SimpleNamespace(memory_policy=MLXMemoryPolicy())
     request = object()
     plan = SimpleNamespace(reserve=lambda: nullcontext(object()))
     expansion = object()
@@ -55,7 +55,7 @@ def test_external_gmnet_example_executes_through_public_ports(
     )
     monkeypatch.setattr(
         module,
-        "prepare_gmnet_resources",
+        "prepare_resources",
         lambda selected, *, infrastructure: (
             calls.append(("resources", (selected, infrastructure))) or resources
         ),

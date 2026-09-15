@@ -1,12 +1,10 @@
 """Complete consumed-target loading for the LTX-tuned Gemma 4 backbone."""
 
-from __future__ import annotations
-
 from pathlib import Path
 
+from kinomlx.modeling.loading import WeightTarget, bind_weight_targets
 from kinomlx.reporting import Reporter
 
-from ._loading import WeightTarget, bind_weight_targets
 from .gemma4 import Gemma4Model
 
 

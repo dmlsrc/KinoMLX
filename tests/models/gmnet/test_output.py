@@ -1,7 +1,5 @@
 """GMNet output naming, reservations, and all-or-nothing publication."""
 
-from __future__ import annotations
-
 from pathlib import Path
 
 import mlx.core as mx
@@ -11,12 +9,11 @@ from kinomlx.io.reservation import reservation_path
 from kinomlx.models.gmnet.catalog import GMNetVariant, variant_spec
 from kinomlx.models.gmnet.expand import ExpansionResult
 from kinomlx.models.gmnet.output import (
-    GMNetOutputConfig,
     GMNetOutputError,
     GMNetOutputSink,
     plan_gmnet_output,
 )
-from kinomlx.models.gmnet.types import GMNetRequest
+from kinomlx.models.gmnet.types import GMNetOutputConfig, GMNetRequest
 
 
 def _request(tmp_path: Path, name: str = "source.png") -> GMNetRequest:
@@ -79,12 +76,14 @@ def test_exact_path_can_add_the_other_display_format_explicitly(tmp_path) -> Non
     assert artifacts.heic == tmp_path / "chosen.heic"
 
 
-def test_derived_output_defaults_to_both_formats_and_input_stem(tmp_path) -> None:
+def test_derived_output_defaults_to_both_formats_and_timestamped_input_stem(tmp_path) -> None:
     request = _request(tmp_path, "my.photo.png")
     output = tmp_path / "outputs"
     plan = plan_gmnet_output(request, GMNetOutputConfig(directory=output))
-    assert plan.artifacts.exr == output / "my.photo.exr"
-    assert plan.artifacts.heic == output / "my.photo.heic"
+    stem = plan.base.name
+    assert stem.startswith("my.photo_")
+    assert plan.artifacts.exr == output / f"{stem}.exr"
+    assert plan.artifacts.heic == output / f"{stem}.heic"
 
 
 def test_output_prefix_and_gain_map_are_resolved_together(tmp_path) -> None:
@@ -101,8 +100,10 @@ def test_output_prefix_and_gain_map_are_resolved_together(tmp_path) -> None:
     )
     artifacts = _sink(plan).write(_result())
     assert artifacts.exr is None
-    assert artifacts.heic == tmp_path / "out" / "expanded.heic"
-    assert artifacts.gain_map == tmp_path / "out" / "expanded.gain_map.safetensors"
+    stem = plan.base.name
+    assert stem.startswith("expanded_")
+    assert artifacts.heic == tmp_path / "out" / f"{stem}.heic"
+    assert artifacts.gain_map == tmp_path / "out" / f"{stem}.gain_map.safetensors"
 
 
 def test_execution_sidecars_share_the_resolved_stem_and_are_reserved(tmp_path) -> None:
@@ -273,7 +274,7 @@ def test_source_overwrite_and_unknown_exact_suffix_are_refused(tmp_path) -> None
     plan = plan_gmnet_output(request, GMNetOutputConfig(path=request.image))
     with pytest.raises(GMNetOutputError, match="source image"):
         plan.reserve().__enter__()
-    with pytest.raises(GMNetOutputError, match="must end in"):
+    with pytest.raises(ValueError, match="must end in"):
         plan_gmnet_output(request, GMNetOutputConfig(path=tmp_path / "output.png"))
 
 

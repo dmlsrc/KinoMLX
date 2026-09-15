@@ -16,8 +16,6 @@ container duration instead, which is exact.
 Tagged ``requires_avfoundation`` for explicit native-test selection.
 """
 
-from __future__ import annotations
-
 from contextlib import nullcontext
 from types import SimpleNamespace
 
@@ -32,7 +30,6 @@ from kinomlx.media.signals import (
     BT709_SDR_422_DELIVERY,
 )
 from kinomlx.models.ltx2.signals import ltx23_sdr_signal
-from kinomlx.reporting import RecordingReporter
 from kinomlx.videotoolbox import encode as encode_module
 from kinomlx.videotoolbox.encode import (
     _normalize_audio_for_track,
@@ -44,6 +41,7 @@ from kinomlx.videotoolbox.pixel_buffers import (
     upload_frame_to_buffer,
 )
 from kinomlx.videotoolbox.writer import AVWriter
+from tests._reporting import RecordingReporter
 
 pytestmark = pytest.mark.requires_avfoundation
 

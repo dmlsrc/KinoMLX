@@ -1,7 +1,5 @@
 """Pure prompt and conditioning-image encoding functions."""
 
-from __future__ import annotations
-
 import logging
 from pathlib import Path
 from typing import Literal, cast
@@ -10,11 +8,18 @@ import mlx.core as mx
 
 from kinomlx.io.image import load_image, load_raw_exr
 from kinomlx.io.safetensors import load_weights_with_metadata
+from kinomlx.media.hdr import (
+    acescct_to_scene_linear,
+    convert_scene_linear_primaries,
+    scene_linear_to_acescct,
+)
+from kinomlx.media.signals import ColorPrimaries
 from kinomlx.reporting import NullReporter, Reporter
 
 from .components import _VideoEncoderCallablePort
-from .text_encoder.encoder import AudioVideoGemmaEncoderOutput, encode_prompt
-from .text_encoder.tokenizer_cache import TokenizerCache
+from .text_encoder.encoder import AudioVideoGemmaEncoderOutput
+from .text_encoder.prompt import encode_prompt
+from .text_encoder.tokenizer_derivation import TokenizerDerivation
 from .types import HDRAuthoring
 
 _CONTEXT_DTYPES = frozenset({mx.bfloat16, mx.float16, mx.float32})
@@ -36,7 +41,7 @@ def encode_text(
     config_path: Path | str,
     model_generation: str = "2.3",
     projection_path: Path | str | None = None,
-    tokenizer_cache: TokenizerCache | None = None,
+    tokenizer: TokenizerDerivation | None = None,
     pad_prompt_to_max: bool = True,
     reporter: Reporter | None = None,
 ) -> AudioVideoGemmaEncoderOutput:
@@ -48,7 +53,7 @@ def encode_text(
         config_path=config_path,
         model_generation=model_generation,
         projection_path=projection_path,
-        tokenizer_cache=tokenizer_cache,
+        tokenizer=tokenizer,
         max_length=1024,
         pad_prompt_to_max=pad_prompt_to_max,
         reporter=reporter,
@@ -161,12 +166,6 @@ def encode_image(
     if source.suffix.lower() == ".exr":
         if hdr_authoring is None:
             raise ValueError("EXR conditioning requires an explicit HDR signal interpretation")
-        from kinomlx.media.hdr import (
-            acescct_to_scene_linear,
-            convert_scene_linear_primaries,
-            scene_linear_to_acescct,
-        )
-        from kinomlx.media.signals import ColorPrimaries
 
         image = load_raw_exr(source, size=(width, height))
         if not bool(mx.all(mx.isfinite(image)).item()):

@@ -1,14 +1,11 @@
 """Shared LTX-2.x feature aggregation over Gemma hidden states."""
 
-from __future__ import annotations
-
 import math
 
 import mlx.core as mx
 
 import kinomlx._mlx_nn as nn
-
-from ._layers import linear_shell
+from kinomlx.modeling.layers import linear_shell
 
 
 def norm_and_concat_per_token_rms(

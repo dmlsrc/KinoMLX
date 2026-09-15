@@ -1,7 +1,5 @@
 """Natural-duration prediction from materialized LTX text conditioning."""
 
-from __future__ import annotations
-
 import json
 import logging
 import math
@@ -326,7 +324,7 @@ def load_duration_head_weights(
 ) -> int:
     """Preflight and bind all 15 execution-changing duration tensors."""
     sink = reporter if reporter is not None else NullReporter()
-    phase = "load LTX duration head"
+    phase = "load duration head"
     sink.phase_start(phase, total=len(_DURATION_TARGETS), unit="tensor")
     weights: dict[str, mx.array] = {}
     try:

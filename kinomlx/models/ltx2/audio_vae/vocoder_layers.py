@@ -1,7 +1,5 @@
 """Convolution, activation, and resampling layers for the LTX vocoder."""
 
-from __future__ import annotations
-
 import math
 
 import mlx.core as mx
@@ -295,7 +293,6 @@ class AMPBlock1(nn.Module):
             strict=True,
         ):
             x = x + conv2(act2(conv1(act1(x))))
-            mx.eval(x)
         return x
 
 

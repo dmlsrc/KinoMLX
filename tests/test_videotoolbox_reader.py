@@ -1,7 +1,5 @@
 """Native SDR reference-reader integration gates."""
 
-from __future__ import annotations
-
 from pathlib import Path
 
 import mlx.core as mx
@@ -18,7 +16,7 @@ from kinomlx.media.signals import (
     ExrSampleType,
     OutputColorPlan,
 )
-from kinomlx.models.ltx2.runner import GenerationOutput
+from kinomlx.models.ltx2.generation import GenerationOutput
 from kinomlx.models.ltx2.signals import ltx23_sdr_signal, ltx_hdr_working_signal
 from kinomlx.output import HDRGenerationSink, VideoToolboxGenerationSink
 from kinomlx.videotoolbox.reader import read_sdr_video_frames

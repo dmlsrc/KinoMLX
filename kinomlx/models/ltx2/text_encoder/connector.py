@@ -1,7 +1,5 @@
 """Shared LTX-2.x audio/video embeddings connectors."""
 
-from __future__ import annotations
-
 import math
 from enum import Enum
 from functools import lru_cache
@@ -10,8 +8,7 @@ import mlx.core as mx
 
 import kinomlx._mlx_nn as nn
 from kinomlx.kernels import gelu_approx, rms_norm
-
-from ._layers import linear_shell
+from kinomlx.modeling.layers import linear_shell
 
 
 def _register_shell() -> mx.array:

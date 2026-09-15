@@ -1,4 +1,4 @@
-from __future__ import annotations
+from types import SimpleNamespace
 
 import mlx.core as mx
 import numpy as np
@@ -9,6 +9,10 @@ from kinomlx.models.ltx2.transformer import (
     precompute_freqs_cis,
 )
 from kinomlx.models.ltx2.transformer.attention import scaled_dot_product_attention
+from kinomlx.models.ltx2.weights.layout import (
+    install_block_layout_weight,
+    install_top_level_layout_weight,
+)
 
 from ._synthetic import (
     build_shaped_adaln,
@@ -159,11 +163,11 @@ def test_attention_pretranspose_releases_sources_without_changing_output() -> No
     )
     value = mx.random.normal((1, 3, 8))
     expected = attention(value)
-    specs = tuple(
-        (target, "pretranspose") for target in ("to_q", "to_k", "to_v", "to_out", "to_gate_logits")
-    )
-    attention.apply_layouts(specs)
-    attention.drop_layout_sources(specs)
+    block = SimpleNamespace(attn1=attention)
+    for target in ("to_q", "to_k", "to_v", "to_out", "to_gate_logits"):
+        install_block_layout_weight(
+            block, f"attn1.{target}.weight_t", mx.contiguous(getattr(attention, target).weight.T)
+        )
     actual = attention(value)
     mx.eval(expected, actual)
     assert mx.allclose(actual, expected, rtol=1e-5, atol=1e-5).item()
@@ -175,8 +179,11 @@ def test_adaln_pretranspose_releases_source_without_changing_output() -> None:
     adaln = build_shaped_adaln(8, 2)
     timestep = mx.array([500.0])
     expected, expected_embedded = adaln(timestep, mx.float32)
-    adaln.apply_layout()
-    adaln.drop_layout_source()
+    install_top_level_layout_weight(
+        SimpleNamespace(adaln_single=adaln),
+        "adaln_single.linear.weight_t",
+        mx.contiguous(adaln.linear.weight.T),
+    )
     actual, actual_embedded = adaln(timestep, mx.float32)
     mx.eval(expected, expected_embedded, actual, actual_embedded)
     assert mx.allclose(actual, expected, rtol=1e-5, atol=1e-5).item()
@@ -189,9 +196,13 @@ def test_feed_forward_pretranspose_releases_sources_without_changing_output() ->
     feed_forward = build_shaped_feed_forward(8)
     value = mx.random.normal((1, 3, 8))
     expected = feed_forward(value)
-    specs = (("project_in", "pretranspose"), ("project_out", "pretranspose"))
-    feed_forward.apply_layouts(specs)
-    feed_forward.drop_layout_sources(specs)
+    block = SimpleNamespace(ff=feed_forward)
+    install_block_layout_weight(
+        block, "ff.project_in.proj.weight_t", mx.contiguous(feed_forward.project_in.proj.weight.T)
+    )
+    install_block_layout_weight(
+        block, "ff.project_out.weight_t", mx.contiguous(feed_forward.project_out.weight.T)
+    )
     actual = feed_forward(value)
     mx.eval(expected, actual)
     assert mx.allclose(actual, expected, rtol=1e-5, atol=1e-5).item()
@@ -204,8 +215,13 @@ def test_feed_forward_pretranspose_releases_sources_without_changing_output() ->
 def test_feed_forward_fp16_boundary_casts_back_to_residual_dtype() -> None:
     feed_forward = build_shaped_feed_forward(8)
     value = mx.random.normal((1, 3, 8)).astype(mx.bfloat16)
-    specs = (("project_in", "pretranspose"), ("project_out", "pretranspose"))
-    feed_forward.apply_layouts(specs)
+    block = SimpleNamespace(ff=feed_forward)
+    install_block_layout_weight(
+        block, "ff.project_in.proj.weight_t", mx.contiguous(feed_forward.project_in.proj.weight.T)
+    )
+    install_block_layout_weight(
+        block, "ff.project_out.weight_t", mx.contiguous(feed_forward.project_out.weight.T)
+    )
     feed_forward._project_in_weight_t = feed_forward._project_in_weight_t.astype(mx.float16)
     feed_forward._project_out_weight_t = feed_forward._project_out_weight_t.astype(mx.float16)
     actual = feed_forward(value)

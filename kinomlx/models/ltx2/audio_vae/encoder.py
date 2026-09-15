@@ -1,7 +1,5 @@
 """Native MLX LTX audio VAE encoder."""
 
-from __future__ import annotations
-
 from pathlib import Path
 from typing import TypedDict
 
@@ -120,7 +118,8 @@ class AudioEncoder(nn.Module):
             raise ValueError(f"audio encoder expects {self.config.mel_bins} mel bins")
         sink = reporter if reporter is not None else NullReporter()
         phase = "audio VAE encode"
-        sink.phase_start(phase, total=len(self.down_blocks) + 2, unit="stage")
+        # Indeterminate phase: one lazy graph, evaluated once at the result.
+        sink.phase_start(phase)
         try:
             x = self.conv_in(spectrogram.astype(self.compute_dtype))
             for level in self.down_blocks:
@@ -129,15 +128,10 @@ class AudioEncoder(nn.Module):
                 downsample = level["downsample"]
                 if downsample is not None:
                     x = downsample(x)
-                mx.eval(x)
-                sink.phase_advance(phase)
             x = self.mid_block_2(self.mid_block_1(x))
-            mx.eval(x)
-            sink.phase_advance(phase)
             x = self.conv_out(silu(self.norm_out(x)))
             result = self._normalize(x).astype(mx.float32)
             mx.eval(result)
-            sink.phase_advance(phase)
             return result
         finally:
             sink.phase_end(phase)

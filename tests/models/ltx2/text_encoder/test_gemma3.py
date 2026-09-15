@@ -1,11 +1,9 @@
-from __future__ import annotations
-
 import mlx.core as mx
 import pytest
 from mlx.utils import tree_flatten
 
 from kinomlx.models.ltx2.text_encoder import Gemma3Config, Gemma3Model, load_gemma3_weights
-from kinomlx.reporting import RecordingReporter
+from tests._reporting import RecordingReporter
 
 from ._synthetic import initialize_test_parameters
 
@@ -59,12 +57,10 @@ def test_gemma_returns_embedding_and_every_layer_state() -> None:
     assert len(states) == 3
     assert mx.allclose(final, states[-1]).item()
     assert mx.all(mx.isfinite(final)).item()
-    assert reporter.events[0] == (
-        "start",
-        "encode prompt with Gemma 3",
-        {"total": 2, "unit": "layer"},
-    )
-    assert reporter.events[-1] == ("end", "encode prompt with Gemma 3", {})
+    assert reporter.events == [
+        ("start", "encode prompt with Gemma 3", {"total": None, "unit": "it"}),
+        ("end", "encode prompt with Gemma 3", {}),
+    ]
 
 
 def test_gemma_rejects_mask_shape_mismatch() -> None:

@@ -1,11 +1,8 @@
 """Native temporal x2 latent upscaler component for LTX-2.5 artifacts."""
 
-from __future__ import annotations
-
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING
 
 import mlx.core as mx
 
@@ -14,10 +11,8 @@ from kinomlx.io.safetensors import load_weights, read_metadata
 from kinomlx.kernels import group_norm, silu
 from kinomlx.reporting import NullReporter, Reporter
 
+from .ports import TemporalUpscalerPort
 from .spatial import ResBlock3d
-
-if TYPE_CHECKING:
-    from kinomlx.models.ltx2.components import TemporalUpscalerPort
 
 
 @dataclass(frozen=True)

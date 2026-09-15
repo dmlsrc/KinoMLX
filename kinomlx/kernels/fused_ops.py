@@ -1,7 +1,5 @@
 """Precision-sensitive operations backed by Metal kernels and faithful formulas."""
 
-from __future__ import annotations
-
 from collections.abc import Callable
 from typing import cast
 

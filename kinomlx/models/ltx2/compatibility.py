@@ -5,8 +5,6 @@ logical components. Both LTX-2.3 and LTX-2.5 pass through this same inspection
 path and every failure names the effective generation being checked.
 """
 
-from __future__ import annotations
-
 import re
 from collections.abc import Callable
 from dataclasses import dataclass

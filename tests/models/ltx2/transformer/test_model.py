@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 from dataclasses import replace
 
 import mlx.core as mx
@@ -7,18 +5,13 @@ import mlx.nn as nn
 import pytest
 from mlx.utils import tree_flatten
 
-import kinomlx.models.ltx2.cache.transformer as transformer_cache_module
-from kinomlx.models.ltx2.cache import (
-    LAYOUT_KEY_PREFIX,
-    TransformerBlockStreamer,
-    TransformerCacheResult,
-    load_transformer_cache,
-    load_transformer_weights_cached,
-    load_transformer_weights_cached_streaming,
-)
-from kinomlx.models.ltx2.cache.keys import flatten_to_nested
+from kinomlx.io.safetensors import load_weights
 from kinomlx.models.ltx2.transformer import LTXAVModel, Modality, X0Model
 from kinomlx.models.ltx2.transformer import model as model_module
+from kinomlx.models.ltx2.weights.keys import flatten_to_nested
+from kinomlx.models.ltx2.weights.loading import bind_transformer, bind_transformer_weights
+from kinomlx.models.ltx2.weights.schema import LAYOUT_KEY_PREFIX
+from kinomlx.models.ltx2.weights.streaming import TransformerBlockStreamer
 
 from ._synthetic import build_shaped_ltx_model
 
@@ -273,14 +266,14 @@ def test_cross_scale_shift_uses_own_timesteps_and_gate_uses_other_sigma() -> Non
     assert mx.any(baseline.cross_gate_timestep != other_sigma_changed.cross_gate_timestep).item()
 
 
-def test_model_parameter_tree_round_trips_through_transformer_cache(tmp_path) -> None:
+def test_model_parameter_tree_round_trips_through_transformer_weights(tmp_path) -> None:
     mx.random.seed(19)
     source = _small_model(mx.float32, layers=2)
     cache = tmp_path / "transformer.safetensors"
     weights = dict(tree_flatten(source.parameters()))
     mx.save_safetensors(str(cache), weights)
     target = _small_model(mx.float32, layers=2, shaped=False)
-    loaded, layouts, quantized = load_transformer_cache(target, cache)
+    loaded, layouts, quantized = bind_transformer_weights(target, load_weights(cache))
     assert (loaded, layouts, quantized) == (len(weights), 0, 0)
     video, audio = _modalities()
     expected = source(video, audio)
@@ -290,25 +283,43 @@ def test_model_parameter_tree_round_trips_through_transformer_cache(tmp_path) ->
     assert mx.allclose(actual[1], expected[1], rtol=1e-5, atol=1e-5).item()
 
 
+@pytest.mark.parametrize("packed", [False, True])
 @pytest.mark.parametrize("compile_group_size", [None, 1])
 def test_bounded_streaming_rotates_one_slot_and_reloads_for_next_forward(
     tmp_path,
     compile_group_size: int | None,
+    packed: bool,
 ) -> None:
+    from kinomlx.models.ltx2.adapters.loading import streamed_adapter_check
+    from kinomlx.models.ltx2.weights.schema import QUANT_KEY_PREFIX
+    from kinomlx.reporting import NullReporter
+
     mx.random.seed(23)
     source = _small_model(mx.float32, layers=4)
     weights = dict(tree_flatten(source.parameters()))
+    if packed:
+        for index in range(4):
+            base = f"transformer_blocks.{index}.ff.project_out"
+            weight, scales = mx.quantize(weights.pop(base + ".weight"), mode="mxfp8")
+            weights[QUANT_KEY_PREFIX + base + ".weight"] = weight
+            weights[QUANT_KEY_PREFIX + base + ".scales"] = scales
+        bind_transformer_weights(source, weights, transformer_quantize="mxfp8-blocks")
     cache = tmp_path / "streaming-transformer.safetensors"
     mx.save_safetensors(str(cache), weights)
 
     target = _small_model(mx.float32, layers=4, shaped=False)
     non_block = {
-        key: value for key, value in weights.items() if not key.startswith("transformer_blocks.")
+        key: value
+        for key, value in weights.items()
+        if not key.startswith(("transformer_blocks.", QUANT_KEY_PREFIX))
     }
     target.update(flatten_to_nested(non_block))
     target.transformer_blocks = target.transformer_blocks[:1]
     target.transformer_compile_group_size = compile_group_size
-    streamer = TransformerBlockStreamer(cache)
+    streamer = TransformerBlockStreamer(
+        weight_loader=lambda _index: load_weights(cache),
+        transformer_quantize="mxfp8-blocks" if packed else "off",
+    )
     target.transformer_block_streamer = streamer
     bound: list[tuple[int, int | None]] = []
     original_bind = streamer.bind
@@ -327,6 +338,25 @@ def test_bounded_streaming_rotates_one_slot_and_reloads_for_next_forward(
         )
 
     streamer.bind = recording_bind
+    evaluated = []
+    validate = streamed_adapter_check(
+        frozenset(
+            f"transformer_blocks.{index}.{kind}.project_out"
+            for index in range(4)
+            for kind in ("ff", "audio_ff")
+        ),
+        enabled=True,
+        reporter=NullReporter(),
+    )
+
+    def on_evaluated(blocks, active):
+        validate(blocks, active)
+        evaluated.extend(index for index, _ in blocks)
+        assert active("transformer_blocks.0.ff.project_out.weight")
+        assert active("transformer_blocks.0.audio_ff.project_out.weight")
+        assert all(block is target.transformer_blocks[0] for _, block in blocks)
+
+    streamer.on_evaluated = on_evaluated
     video, audio = _modalities()
     expected = source(video, audio)
     mx.eval(*expected)
@@ -335,6 +365,7 @@ def test_bounded_streaming_rotates_one_slot_and_reloads_for_next_forward(
         mx.eval(*first)
         second = target(video, audio)
         mx.eval(*second)
+        assert evaluated == [0, 1, 2, 3, 0, 1, 2, 3]
         assert target.num_blocks == 4
         assert X0Model(target).num_blocks == 4
         assert bound == [
@@ -383,7 +414,9 @@ def test_heterogeneous_layout_streaming_matches_eager_across_window_rebind(
     target.update(flatten_to_nested(non_block))
     target.transformer_blocks = target.transformer_blocks[:2]
     target.transformer_compile_group_size = compile_group_size
-    target.transformer_block_streamer = TransformerBlockStreamer(cache)
+    target.transformer_block_streamer = TransformerBlockStreamer(
+        weight_loader=lambda _index: load_weights(cache)
+    )
 
     video, audio = _modalities()
     expected = source(video, audio)
@@ -434,22 +467,15 @@ def test_streaming_loader_rejects_wrong_logical_depth_before_model_truncation(
                 weights[f"transformer_blocks.4.{suffix}"] = value
     cache = tmp_path / "wrong-depth.safetensors"
     mx.save_safetensors(str(cache), weights)
-    monkeypatch.setattr(
-        transformer_cache_module,
-        "ensure_transformer_cache",
-        lambda *_args, **_kwargs: TransformerCacheResult(cache, False, 0, 0),
-    )
     target = _small_model(mx.float32, layers=4, shaped=False)
 
     with pytest.raises(
         ValueError,
         match="parameter graph mismatch",
     ):
-        load_transformer_weights_cached_streaming(
+        bind_transformer(
             target,
-            tmp_path / "unused.safetensors",
-            cache_mode="auto",
-            cache_root=tmp_path / "cache",
+            weight_loader=lambda _index: load_weights(cache),
             include_audio=True,
             resident_blocks=1,
             transformer_dtype=mx.float32,
@@ -469,22 +495,15 @@ def test_streaming_loader_rejects_missing_later_block_tensor_before_mutation(
     weights.pop(missing_key)
     cache = tmp_path / "missing-tensor.safetensors"
     mx.save_safetensors(str(cache), weights)
-    monkeypatch.setattr(
-        transformer_cache_module,
-        "ensure_transformer_cache",
-        lambda *_args, **_kwargs: TransformerCacheResult(cache, False, 0, 0),
-    )
     target = _small_model(mx.float32, layers=4, shaped=False)
 
     with pytest.raises(
         ValueError,
         match="parameter graph mismatch.*transformer_blocks.3.ff.project_out.bias",
     ):
-        load_transformer_weights_cached_streaming(
+        bind_transformer(
             target,
-            tmp_path / "unused.safetensors",
-            cache_mode="auto",
-            cache_root=tmp_path / "cache",
+            weight_loader=lambda _index: load_weights(cache),
             include_audio=True,
             resident_blocks=1,
             transformer_dtype=mx.float32,
@@ -507,18 +526,11 @@ def test_streaming_loader_installs_top_level_adaln_layout_and_matches_eager(
     weights[layout_key] = mx.contiguous(adaln_weight.T)
     cache = tmp_path / "adaln-layout.safetensors"
     mx.save_safetensors(str(cache), weights)
-    monkeypatch.setattr(
-        transformer_cache_module,
-        "ensure_transformer_cache",
-        lambda *_args, **_kwargs: TransformerCacheResult(cache, False, 0, 0),
-    )
     target = _small_model(mx.float32, layers=2, shaped=False)
 
-    load_transformer_weights_cached_streaming(
+    bind_transformer(
         target,
-        tmp_path / "unused.safetensors",
-        cache_mode="auto",
-        cache_root=tmp_path / "cache",
+        weight_loader=lambda _index: load_weights(cache),
         include_audio=True,
         resident_blocks=1,
         transformer_dtype=mx.float32,
@@ -536,24 +548,22 @@ def test_streaming_loader_installs_top_level_adaln_layout_and_matches_eager(
         target.close_streamer()
 
 
-def test_cached_load_rejects_model_compute_dtype_mismatch(tmp_path) -> None:
+def test_weightsd_load_rejects_model_compute_dtype_mismatch(tmp_path) -> None:
     model = _small_model(mx.bfloat16)
     options = {
         "transformer_dtype": mx.float16,
-        "cache_mode": "auto",
-        "cache_root": tmp_path / "cache",
         "include_audio": True,
     }
     with pytest.raises(ValueError, match="model compute dtype"):
-        load_transformer_weights_cached(
+        bind_transformer(
             model,
-            tmp_path / "missing.safetensors",
+            weight_loader=lambda _index: {},
             **options,
         )
     with pytest.raises(ValueError, match="model compute dtype"):
-        load_transformer_weights_cached_streaming(
+        bind_transformer(
             model,
-            tmp_path / "missing.safetensors",
+            weight_loader=lambda _index: {},
             resident_blocks=1,
             **options,
         )
@@ -585,12 +595,105 @@ def test_x0_model_uses_per_token_timesteps_not_scalar_sigma() -> None:
     ).item()
 
 
-def test_x0_model_keeps_lora_receipts_out_of_module_state() -> None:
+def test_x0_model_keeps_adapter_receipts_out_of_module_state() -> None:
     class Velocity(nn.Module):
         def __call__(self, video: Modality, audio: Modality | None):
             return video.latent, None
 
     model = X0Model(Velocity())
 
-    assert model.lora_receipts == ()
-    assert "lora_receipts" not in model
+    assert model.adapter_receipts == ()
+    assert "adapter_receipts" not in model
+
+
+@pytest.mark.parametrize("resident_blocks", [None, 1])
+@pytest.mark.parametrize("compiled", [False, True])
+def test_reloadable_source_matches_weights_with_streaming_and_compile(
+    tmp_path, resident_blocks, compiled
+):
+    from kinomlx.models.ltx2.weights.loading import bind_transformer
+
+    source = _small_model(mx.float32, layers=2)
+    path = tmp_path / "weights.safetensors"
+    mx.save_safetensors(str(path), dict(tree_flatten(source.parameters())))
+    target = _small_model(mx.float32, layers=2)
+    target.compile_block_groups = compiled
+    loads = []
+
+    def load(block_index=None):
+        loads.append(block_index)
+        return mx.load(str(path))
+
+    bind_transformer(
+        target,
+        weight_loader=load,
+        resident_blocks=resident_blocks,
+        transformer_dtype=mx.float32,
+    )
+    expected = source(*_modalities())
+    mx.eval(expected)
+    try:
+        for _ in range(2):
+            actual = target(*_modalities())
+            mx.eval(actual)
+            for left, right in zip(actual, expected, strict=True):
+                assert mx.allclose(left, right, atol=1e-5, rtol=1e-5).item()
+        assert len(loads) > 1 if resident_blocks else len(loads) == 1
+    finally:
+        target.close_streamer()
+
+
+@pytest.mark.parametrize(("resident", "compile_group_size"), [(2, None), (4, 2), (4, 1), (3, 1)])
+def test_streaming_pipelines_groups_within_the_resident_ring(
+    tmp_path,
+    resident: int,
+    compile_group_size: int | None,
+) -> None:
+    mx.random.seed(31)
+    source = _small_model(mx.float32, layers=4)
+    weights = dict(tree_flatten(source.parameters()))
+    cache = tmp_path / "streaming-transformer.safetensors"
+    mx.save_safetensors(str(cache), weights)
+
+    target = _small_model(mx.float32, layers=4, shaped=False)
+    non_block = {
+        key: value for key, value in weights.items() if not key.startswith("transformer_blocks.")
+    }
+    target.update(flatten_to_nested(non_block))
+    target.transformer_blocks = target.transformer_blocks[:resident]
+    target.transformer_compile_group_size = compile_group_size
+    streamer = TransformerBlockStreamer(weight_loader=lambda _index: load_weights(cache))
+    target.transformer_block_streamer = streamer
+    bound: list[tuple[int, int | None]] = []
+    original_bind = streamer.bind
+
+    def recording_bind(
+        block: nn.Module,
+        block_idx: int,
+        *,
+        evict_block_idx: int | None = None,
+    ) -> nn.Module:
+        bound.append((block_idx, evict_block_idx))
+        return original_bind(block, block_idx, evict_block_idx=evict_block_idx)
+
+    streamer.bind = recording_bind
+    evaluated: list[int] = []
+    streamer.on_evaluated = lambda blocks, _active: evaluated.extend(index for index, _ in blocks)
+    video, audio = _modalities()
+    expected = source(video, audio)
+    mx.eval(*expected)
+    try:
+        for _ in range(2):
+            actual = target(video, audio)
+            mx.eval(*actual)
+            assert mx.allclose(actual[0], expected[0], rtol=1e-5, atol=1e-5).item()
+            assert mx.allclose(actual[1], expected[1], rtol=1e-5, atol=1e-5).item()
+        assert evaluated == [0, 1, 2, 3, 0, 1, 2, 3]
+        if (resident, compile_group_size) == (2, None):
+            # Two slot groups: each group is bound into the slots its predecessor's
+            # predecessor used, after that group was waited on; repeats per forward.
+            assert bound == [(0, None), (1, None), (2, 0), (3, 1)] * 2
+        if (resident, compile_group_size) == (4, 2):
+            assert bound == [(0, None), (1, None), (2, None), (3, None)] * 2
+    finally:
+        target.close_streamer()

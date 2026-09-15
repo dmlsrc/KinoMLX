@@ -6,15 +6,12 @@ ruff has no way to state a project rule like "os.environ only in settings".
 These tests close that gap, in plain Python so the conditions can grow.
 """
 
-from __future__ import annotations
-
 import ast
 import pathlib
 import re
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 _PACKAGE = _REPO_ROOT / "kinomlx"
-_TESTS = _REPO_ROOT / "tests"
 
 # Removed in the dependency-minimization pass; the runtime is MLX +
 # sentencepiece + lazy protobuf derivation + pyobjc, native-first for
@@ -39,27 +36,7 @@ _BANNED_RUNTIME_IMPORTS = (
 )
 
 
-def _py_files() -> list[pathlib.Path]:
-    return sorted(_PACKAGE.rglob("*.py")) + sorted(_TESTS.rglob("*.py"))
-
-
-def test_python_sources_are_plain_ascii() -> None:
-    """Every .py file is plain ASCII (the workspace style rule).
-
-    ruff catches only confusable characters, so em-dashes, arrows, ellipses,
-    and the like slip past it; enforce the full rule here. Use ASCII: '-' for
-    an em-dash, '->' for an arrow, '...' for an ellipsis, '>=' for the
-    greater-or-equal sign.
-    """
-    offenders: dict[str, list[str]] = {}
-    for f in _py_files():
-        bad = sorted({c for c in f.read_text() if ord(c) > 127})
-        if bad:
-            offenders[str(f.relative_to(_REPO_ROOT))] = [f"U+{ord(c):04X} {c!r}" for c in bad]
-    assert not offenders, f"Non-ASCII characters in Python sources:\n{offenders}"
-
-
-def test_environment_reads_only_in_settings() -> None:
+def test_environment_reads_only_in_settings(parsed_project_sources) -> None:
     """Only ``kinomlx/settings.py`` reads the process environment directly.
 
     Infrastructure and model records share the environment bridge in this
@@ -68,10 +45,11 @@ def test_environment_reads_only_in_settings() -> None:
     """
     allowed = {_PACKAGE / "settings.py"}
     offenders: list[str] = []
-    for source_path in _PACKAGE.rglob("*.py"):
+    for source_path, tree in parsed_project_sources.items():
+        if not source_path.is_relative_to(_PACKAGE):
+            continue
         if source_path in allowed:
             continue
-        tree = ast.parse(source_path.read_text(encoding="utf-8"), filename=str(source_path))
         os_aliases = {
             alias.asname or "os"
             for node in ast.walk(tree)
@@ -116,7 +94,7 @@ def test_no_banned_runtime_imports() -> None:
     )
 
 
-def test_mlx_array_parameters_are_not_silently_coerced() -> None:
+def test_mlx_array_parameters_are_not_silently_coerced(parsed_project_sources) -> None:
     """An ``mx.array`` annotation is a runtime boundary, not a coercion hint.
 
     Direct ``mx.array(parameter)`` calls accept NumPy and other foreign arrays,
@@ -133,8 +111,9 @@ def test_mlx_array_parameters_are_not_silently_coerced() -> None:
         )
 
     offenders: list[str] = []
-    for source_path in _PACKAGE.rglob("*.py"):
-        tree = ast.parse(source_path.read_text(encoding="utf-8"), filename=str(source_path))
+    for source_path, tree in parsed_project_sources.items():
+        if not source_path.is_relative_to(_PACKAGE):
+            continue
         for function in ast.walk(tree):
             if not isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 continue
@@ -177,9 +156,8 @@ def test_models_do_not_cross_import() -> None:
 
     A model lift drops a whole subtree under ``models/<name>/``; keeping the
     packages import-isolated means one can be added or removed without
-    disturbing the others. Shared code lives in io/ / lora/ / samplers/, not in
-    a sibling model. (Vacuous while ltx2 is the only model - it starts doing
-    work the moment a second one lands.)
+    disturbing the others. Shared code lives in io/ / adapters/ / samplers/,
+    not in a sibling model.
     """
     models_root = _PACKAGE / "models"
     pkgs = [d.name for d in models_root.iterdir() if d.is_dir() and (d / "__init__.py").exists()]

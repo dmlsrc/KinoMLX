@@ -1,7 +1,5 @@
 """The five canonical two-stage LoRA transition-table cases."""
 
-from __future__ import annotations
-
 import pytest
 
 from ._contracts import (

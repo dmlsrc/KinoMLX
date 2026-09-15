@@ -1,7 +1,5 @@
 """Generic config composition, override, schema, and dump contracts."""
 
-from __future__ import annotations
-
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
@@ -179,3 +177,19 @@ def test_top_level_schema_rejects_unknown_and_non_table_values() -> None:
         validate_top_level({"generat": {}}, tables={"generate"})
     with pytest.raises(ConfigError, match=r"\[generate\] must be a table"):
         validate_top_level({"generate": 3}, tables={"generate"})
+
+
+@pytest.mark.parametrize(
+    "value", ["a\x7fb", "\x7f", "tab\tand\x7fdel", "plain", 'quote"and\\slash']
+)
+def test_a_dumped_string_reads_back_as_itself(value: str) -> None:
+    """F-31: DEL is legal in a Python string and illegal raw in a TOML basic one."""
+    rendered = dump_toml_value(value)
+    assert tomllib.loads(f"key = {rendered}")["key"] == value
+
+
+def test_a_config_containing_del_round_trips_through_a_file(tmp_path: Path) -> None:
+    rendered = dump_config({"generate": {"prompt": "before\x7fafter"}})
+    path = tmp_path / "del.toml"
+    path.write_text(rendered, encoding="utf-8")
+    assert load_config(path) == {"generate": {"prompt": "before\x7fafter"}}

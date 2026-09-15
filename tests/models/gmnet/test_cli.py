@@ -1,7 +1,5 @@
 """The ``--model gmnet`` command: routing, precedence, and refusals."""
 
-from __future__ import annotations
-
 import json
 import subprocess
 import sys
@@ -14,7 +12,7 @@ import pytest
 
 from kinomlx.cli.main import main
 from kinomlx.config import ConfigError
-from kinomlx.models.gmnet.cli import build_parser
+from kinomlx.models.gmnet.arguments import build_parser
 from kinomlx.models.gmnet.config import assemble
 from kinomlx.models.gmnet.settings import GMNetSettings
 from kinomlx.settings import Settings
@@ -22,7 +20,7 @@ from kinomlx.settings import Settings
 _BLOCKED_HELP_PROBE = r"""
 import sys
 
-BLOCKED = ("mlx", "google.protobuf", "sentencepiece", "Foundation", "AVFoundation", "VideoToolbox")
+BLOCKED = ("tokenizers", "transformers", "diffusers", "torch", "PIL")
 
 def is_blocked(name):
     return any(name == prefix or name.startswith(prefix + ".") for prefix in BLOCKED)
@@ -30,7 +28,7 @@ def is_blocked(name):
 class Blocker:
     def find_spec(self, name, path=None, target=None):
         if is_blocked(name):
-            raise ImportError(f"{name} blocked: gmnet help must stay lightweight")
+            raise ImportError(f"{name} blocked: gmnet help must use KinoMLX dependencies")
         return None
 
 sys.meta_path.insert(0, Blocker())
@@ -47,8 +45,8 @@ for arguments in (
     except SystemExit as exit_info:
         assert exit_info.code == 0
 offenders = sorted(name for name in sys.modules if is_blocked(name))
-assert not offenders, f"runtime modules imported by gmnet help: {offenders}"
-print("lightweight model and converter help ok")
+assert not offenders, f"optional external runtimes imported by gmnet help: {offenders}"
+print("model and converter help ok")
 """
 
 
@@ -61,6 +59,7 @@ def _assemble(argv: list[str], *, model_settings: GMNetSettings | None = None):
 
 
 def test_default_output_directory_is_stable_without_environment(monkeypatch) -> None:
+    monkeypatch.delenv("KINO_GMNET_OUTPUT_DIR", raising=False)
     monkeypatch.delenv("KINO_OUTPUT_DIR", raising=False)
 
     invocation = _assemble([], model_settings=GMNetSettings())
@@ -68,7 +67,7 @@ def test_default_output_directory_is_stable_without_environment(monkeypatch) -> 
     assert invocation.output.directory == Path("outputs")
 
 
-def test_gmnet_help_stays_free_of_the_model_runtime() -> None:
+def test_gmnet_help_avoids_optional_external_runtimes() -> None:
     process = subprocess.run(
         [sys.executable, "-c", _BLOCKED_HELP_PROBE],
         capture_output=True,
@@ -77,7 +76,7 @@ def test_gmnet_help_stays_free_of_the_model_runtime() -> None:
         check=False,
     )
     assert process.returncode == 0, process.stderr
-    assert "lightweight model and converter help ok" in process.stdout
+    assert "model and converter help ok" in process.stdout
 
 
 def test_root_help_is_compact_and_model_neutral(capsys) -> None:
@@ -117,7 +116,7 @@ def test_gmnet_save_config_and_sparse_env_values_share_the_registry(
     capsys,
 ) -> None:
     monkeypatch.setenv("KINO_GMNET_VARIANT", "synthetic")
-    monkeypatch.setenv("KINO_OUTPUT_DIR", str(tmp_path / "renders"))
+    monkeypatch.setenv("KINO_GMNET_OUTPUT_DIR", str(tmp_path / "renders"))
     saved = tmp_path / "gmnet.toml"
     arguments = ["--model", "gmnet", "--image", "input.png"]
 
@@ -158,7 +157,9 @@ def test_gmnet_save_all_expands_every_applicable_sidecar() -> None:
 def test_gmnet_save_all_writes_execution_sidecars_before_model_loading(
     tmp_path,
     monkeypatch,
+    capsys,
 ) -> None:
+    monkeypatch.delenv("KINO_GMNET_OUTPUT_DIR", raising=False)
     monkeypatch.delenv("KINO_OUTPUT_DIR", raising=False)
     source = tmp_path / "source.png"
     source.write_bytes(b"source")
@@ -181,14 +182,15 @@ def test_gmnet_save_all_writes_execution_sidecars_before_model_loading(
         return {
             "action": "expand",
             "outputs": plan.artifacts.to_dict(),
-            "variant": "realworld",
+            "generation": {"variant": "realworld"},
+            "warnings": [],
         }
 
     monkeypatch.setattr(
-        "kinomlx.models.gmnet.cli._reporter_stack",
+        "kinomlx.models.gmnet.command.command_reporter",
         lambda _stack, _settings: FakeReporter(),
     )
-    monkeypatch.setattr("kinomlx.models.gmnet.cli._run_expand", fake_run)
+    monkeypatch.setattr("kinomlx.models.gmnet.command._run_expand", fake_run)
 
     assert (
         main(
@@ -200,6 +202,7 @@ def test_gmnet_save_all_writes_execution_sidecars_before_model_loading(
                 "--output",
                 str(output),
                 "--save-all-sidecars",
+                "--json",
             ]
         )
         == 0
@@ -233,13 +236,33 @@ def test_gmnet_save_all_writes_execution_sidecars_before_model_loading(
         "gain_map",
         "run_log",
     }
-    assert "--save-all-sidecars" in execution.read_text(encoding="utf-8")
+    execution_text = execution.read_text(encoding="utf-8")
+    assert "--save-all-sidecars" in execution_text
+    assert "Run:" in execution_text
+    assert "Model: GMNet Realworld" in execution_text
+    assert "Planned outputs:" in execution_text
+    assert "Outputs:" in execution_text
+    result = json.loads(capsys.readouterr().out)
+    assert result["status"] == "ok"
+    assert result["model"] == "gmnet"
+    assert result["action"] == "expand"
+    assert result["generation"] == {"variant": "realworld"}
+    assert result["warnings"] == []
+    assert result["sidecar_errors"] == []
+    assert set(result["outputs"]) == {
+        "effective_config",
+        "execution_log",
+        "exr",
+        "gain_map",
+        "run_log",
+    }
 
 
 def test_gmnet_failure_finalizes_sidecars_and_releases_reservations(
     tmp_path,
     monkeypatch,
 ) -> None:
+    monkeypatch.delenv("KINO_GMNET_OUTPUT_DIR", raising=False)
     monkeypatch.delenv("KINO_OUTPUT_DIR", raising=False)
     source = tmp_path / "source.png"
     source.write_bytes(b"source")
@@ -263,10 +286,10 @@ def test_gmnet_failure_finalizes_sidecars_and_releases_reservations(
         raise RuntimeError("synthetic expansion failure")
 
     monkeypatch.setattr(
-        "kinomlx.models.gmnet.cli._reporter_stack",
+        "kinomlx.models.gmnet.command.command_reporter",
         lambda _stack, _settings: FakeReporter(),
     )
-    monkeypatch.setattr("kinomlx.models.gmnet.cli._run_expand", fail)
+    monkeypatch.setattr("kinomlx.models.gmnet.command._run_expand", fail)
 
     assert (
         main(
@@ -463,11 +486,16 @@ def test_success_payload_names_achieved_peak_and_records_model_provenance(
     monkeypatch,
     caplog,
 ) -> None:
-    from kinomlx.models.gmnet.cli import _run_expand
+    from kinomlx.models.gmnet.command import _run_expand
 
     weights = tmp_path / "gmnet_synthetic.safetensors"
     variant = SimpleNamespace(value="synthetic")
-    spec = SimpleNamespace(variant=variant, sdr_reference_white_nits=100.0)
+    spec = SimpleNamespace(
+        variant=variant,
+        network_scale=1,
+        peak_over_sdr_white=8.0,
+        sdr_reference_white_nits=100.0,
+    )
     result = SimpleNamespace(
         qmax_normalized=0.75,
         peak_linear=6.0,
@@ -497,11 +525,11 @@ def test_success_payload_names_achieved_peak_and_records_model_provenance(
             )
 
     monkeypatch.setattr(
-        "kinomlx.models.gmnet.output.plan_gmnet_output",
+        "kinomlx.models.gmnet.command.plan_gmnet_output",
         lambda *_args: FakePlan(),
     )
-    monkeypatch.setattr("kinomlx.models.gmnet.output.GMNetOutputSink", FakeSink)
-    monkeypatch.setattr("kinomlx.models.gmnet.runner.GMNetRunner", FakeRunner)
+    monkeypatch.setattr("kinomlx.models.gmnet.command.GMNetOutputSink", FakeSink)
+    monkeypatch.setattr("kinomlx.models.gmnet.command.GMNetRunner", FakeRunner)
     invocation = SimpleNamespace(
         request=SimpleNamespace(),
         output=SimpleNamespace(),
@@ -510,18 +538,20 @@ def test_success_payload_names_achieved_peak_and_records_model_provenance(
     )
     reporter = SimpleNamespace(memory_checkpoint=lambda _name: None)
 
-    with caplog.at_level("INFO"):
+    with caplog.at_level("INFO", logger="kinomlx.models.gmnet.command"):
         payload = _run_expand(invocation, reporter)
 
-    assert payload["variant"] == "synthetic"
-    assert payload["weights_path"] == str(weights)
-    assert payload["model_sdr_reference_white_nits"] == 100.0
-    assert payload["achieved_peak_over_sdr_white"] == 6.0
-    assert payload["achieved_model_contract_peak_nits"] == 600.0
-    assert payload["pq_delivery_reference_white_nits"] == 203.0
-    assert payload["achieved_pq_delivery_peak_nits"] == 1218.0
-    assert "peak_over_sdr_white" not in payload
-    assert f"GMNet variant synthetic; weights {weights}" in caplog.text
+    generation = payload["generation"]
+    assert generation["variant"] == "synthetic"
+    assert generation["weights_path"] == str(weights)
+    assert generation["model_sdr_reference_white_nits"] == 100.0
+    assert generation["achieved_peak_over_sdr_white"] == 6.0
+    assert generation["achieved_model_contract_peak_nits"] == 600.0
+    assert generation["pq_delivery_reference_white_nits"] == 203.0
+    assert generation["achieved_pq_delivery_peak_nits"] == 1218.0
+    assert "peak_over_sdr_white" not in generation
+    assert "Resources:" in caplog.text
+    assert f"Weights: {weights}" in caplog.text
 
 
 class TestSettingsEquivalence:

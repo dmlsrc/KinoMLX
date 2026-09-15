@@ -1,7 +1,5 @@
 """Typed generation-sink behavior at the public terminal boundary."""
 
-from __future__ import annotations
-
 from pathlib import Path
 
 import mlx.core as mx
@@ -18,7 +16,7 @@ from kinomlx.media.signals import (
     OutputColorPlan,
     UnsupportedSignalError,
 )
-from kinomlx.models.ltx2.runner import GenerationOutput
+from kinomlx.models.ltx2.generation import GenerationOutput
 from kinomlx.models.ltx2.signals import (
     SCENE_LINEAR_HDR_SIGNAL,
     ltx23_sdr_signal,
@@ -96,7 +94,6 @@ def test_sink_dumps_vae_frames_before_the_encoder(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    from kinomlx.videotoolbox import images
 
     generation = _generation()
     output = tmp_path / "output.mp4"
@@ -114,7 +111,7 @@ def test_sink_dumps_vae_frames_before_the_encoder(
         events.append("encode:end")
         return Path(path)
 
-    monkeypatch.setattr(images, "save_image", save_image)
+    monkeypatch.setattr("kinomlx.videotoolbox.frame_dump.save_image", save_image)
     sink = VideoToolboxGenerationSink(
         path=output,
         fps=24.0,
@@ -138,7 +135,7 @@ def test_hdr_sink_fans_one_working_frame_to_exr_and_hlg_transactionally(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    from kinomlx.videotoolbox import exr, heic, hlg, writer
+    from kinomlx.videotoolbox import writer
 
     signal = ltx_hdr_working_signal(
         transfer=ColorTransfer.ACESCCT,
@@ -192,9 +189,9 @@ def test_hdr_sink_fans_one_working_frame_to_exr_and_hlg_transactionally(
         return path
 
     monkeypatch.setattr(writer, "AVWriter", FakeWriter)
-    monkeypatch.setattr(exr, "save_exr_frame", save)
-    monkeypatch.setattr(heic, "save_pq_heic_frame", save_heic)
-    monkeypatch.setattr(hlg, "make_hlg_pixel_buffer", convert)
+    monkeypatch.setattr("kinomlx.output.save_exr_frame", save)
+    monkeypatch.setattr("kinomlx.output.save_pq_heic_frame", save_heic)
+    monkeypatch.setattr("kinomlx.output.make_hlg_pixel_buffer", convert)
     exr_delivery = ExrDeliverySpec(
         primaries=ColorPrimaries.ACESCG,
         transfer=ColorTransfer.ACESCCT,
@@ -232,7 +229,7 @@ def test_hdr_sink_fanout_stays_frame_bounded(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    from kinomlx.videotoolbox import exr, hlg, writer
+    from kinomlx.videotoolbox import writer
 
     signal = ltx_hdr_working_signal(
         transfer=ColorTransfer.LOGC3,
@@ -271,8 +268,8 @@ def test_hdr_sink_fanout_stays_frame_bounded(
         return frame
 
     monkeypatch.setattr(writer, "AVWriter", FakeWriter)
-    monkeypatch.setattr(exr, "save_exr_frame", save)
-    monkeypatch.setattr(hlg, "make_hlg_pixel_buffer", convert)
+    monkeypatch.setattr("kinomlx.output.save_exr_frame", save)
+    monkeypatch.setattr("kinomlx.output.make_hlg_pixel_buffer", convert)
     plan = OutputColorPlan(
         source=signal,
         deliveries=(
@@ -307,7 +304,7 @@ def test_hdr_sink_cancels_and_removes_transaction_on_frame_failure(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    from kinomlx.videotoolbox import exr, heic, hlg, writer
+    from kinomlx.videotoolbox import writer
 
     signal = ltx_hdr_working_signal(
         transfer=ColorTransfer.ACESCCT,
@@ -358,9 +355,9 @@ def test_hdr_sink_cancels_and_removes_transaction_on_frame_failure(
         return path
 
     monkeypatch.setattr(writer, "AVWriter", FakeWriter)
-    monkeypatch.setattr(exr, "save_exr_frame", save)
-    monkeypatch.setattr(heic, "save_pq_heic_frame", save_heic)
-    monkeypatch.setattr(hlg, "make_hlg_pixel_buffer", convert)
+    monkeypatch.setattr("kinomlx.output.save_exr_frame", save)
+    monkeypatch.setattr("kinomlx.output.save_pq_heic_frame", save_heic)
+    monkeypatch.setattr("kinomlx.output.make_hlg_pixel_buffer", convert)
     output = tmp_path / "failed.mp4"
     plan = OutputColorPlan(
         source=signal,

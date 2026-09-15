@@ -1,15 +1,13 @@
 """Append clean keyframe tokens at an arbitrary pixel-frame position."""
 
-from __future__ import annotations
-
 from dataclasses import dataclass
 
 import mlx.core as mx
 
-from kinomlx.types import LatentState, VideoLatentShape
+from kinomlx.types import VideoLatentShape
 
 from ..patchifier import get_pixel_coords
-from ..types import VIDEO_VAE_SCALE
+from ..types import VIDEO_VAE_SCALE, LatentState
 from .latent import ConditioningError
 from .tools import VideoLatentTools
 

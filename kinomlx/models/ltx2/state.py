@@ -1,22 +1,18 @@
 """Pure construction and conditioning of LTX-2.3 latent states."""
 
-from __future__ import annotations
-
 from collections.abc import Iterable
 
 import mlx.core as mx
 
-from kinomlx.types import LatentState, VideoLatentShape
+from kinomlx.types import VideoLatentShape
 
 from .conditioning import (
     AudioLatentTools,
     EncodedCondition,
-    VideoConditionByKeyframeIndex,
-    VideoConditionByLatentIndex,
     VideoLatentTools,
 )
 from .patchifier import AudioPatchifier, VideoLatentPatchifier
-from .types import AudioLatentShape, ImageConditioningConfig
+from .types import AudioLatentShape, LatentState
 
 
 def create_video_latent_tools(
@@ -60,24 +56,6 @@ def init_audio_latent_state(
     return tools.create_initial_state(dtype=dtype, initial_latent=initial_latent)
 
 
-def image_conditioning_item(
-    latent: mx.array,
-    config: ImageConditioningConfig,
-) -> EncodedCondition:
-    """Select first-frame replacement or appended keyframe semantics."""
-    if config.frame_index == 0:
-        return VideoConditionByLatentIndex(
-            latent=latent,
-            strength=config.strength,
-            latent_idx=0,
-        )
-    return VideoConditionByKeyframeIndex(
-        keyframes=latent,
-        frame_idx=config.frame_index,
-        strength=config.strength,
-    )
-
-
 def apply_encoded_conditions(
     state: LatentState,
     conditionings: Iterable[EncodedCondition],
@@ -109,7 +87,6 @@ __all__ = [
     "apply_encoded_conditions",
     "create_audio_latent_tools",
     "create_video_latent_tools",
-    "image_conditioning_item",
     "init_audio_latent_state",
     "init_video_latent_state",
     "post_process_latent",

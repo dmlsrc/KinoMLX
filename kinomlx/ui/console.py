@@ -1,7 +1,5 @@
 """The shared Rich console used by CLI logging and progress bars."""
 
-from __future__ import annotations
-
 from rich.console import Console
 from rich.theme import Theme
 

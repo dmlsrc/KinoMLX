@@ -1,6 +1,3 @@
-from __future__ import annotations
-
-from dataclasses import replace
 from pathlib import Path
 
 import mlx.core as mx
@@ -8,10 +5,11 @@ import pytest
 from mlx.utils import tree_flatten
 
 import kinomlx.models.ltx2.metadata as metadata_module
-from kinomlx.models.ltx2.cache import ensure_transformer_cache, load_transformer_cache
-from kinomlx.models.ltx2.cache.keys import flatten_to_nested
-from kinomlx.models.ltx2.metadata import TransformerConstructorConfig
 from kinomlx.models.ltx2.transformer import LTXAVModel, Modality
+from kinomlx.models.ltx2.transformer_config import TransformerConstructorConfig
+from kinomlx.models.ltx2.weights.keys import flatten_to_nested
+from kinomlx.models.ltx2.weights.loading import bind_transformer_weights
+from tests.models.ltx2._source_weights import transformer_weights
 
 from ._synthetic import build_shaped_ltx_model
 
@@ -130,7 +128,7 @@ def test_static_prompt_modulation_omits_prompt_adaln_parameters_and_runs() -> No
     assert mx.all(mx.isfinite(output)).item()
 
 
-def test_full_cache_binding_rejects_the_other_generation_before_mutation(tmp_path) -> None:
+def test_full_weights_binding_rejects_the_other_generation_before_mutation(tmp_path) -> None:
     source = _model(_config("2.3"), shaped=True)
     cache = tmp_path / "ltx23.safetensors"
     mx.save_safetensors(str(cache), dict(tree_flatten(source.parameters())))
@@ -138,7 +136,7 @@ def test_full_cache_binding_rejects_the_other_generation_before_mutation(tmp_pat
     before = {key: tuple(value.shape) for key, value in tree_flatten(target.parameters())}
 
     with pytest.raises(ValueError, match="parameter graph mismatch"):
-        load_transformer_cache(target, cache)
+        bind_transformer_weights(target, dict(tree_flatten(source.parameters())))
 
     after = {key: tuple(value.shape) for key, value in tree_flatten(target.parameters())}
     assert after == before
@@ -189,16 +187,6 @@ def test_transformer_header_binding_requires_every_target_and_ignores_baggage(
         )
 
 
-def test_transformer_config_identity_changes_with_prompt_policy() -> None:
-    dynamic = _config("2.5")
-    static = replace(
-        dynamic,
-        use_prompt_adaln_single=False,
-        config_digest="synthetic-2.5-false",
-    )
-    assert dynamic.cache_identity() != static.cache_identity()
-
-
 def test_bias_free_graph_matches_zero_bias_synthetic_block() -> None:
     with_bias = _model(_config("2.3"), shaped=True)
     bias_free = _model(_config("2.5"), shaped=True)
@@ -216,7 +204,7 @@ def test_bias_free_graph_matches_zero_bias_synthetic_block() -> None:
     assert mx.allclose(actual, expected, rtol=1e-5, atol=1e-5).item()
 
 
-def test_binding_driven_cache_build_accepts_wrapper_and_ignores_baggage(
+def test_binding_driven_weights_build_accepts_wrapper_and_ignores_baggage(
     tmp_path: Path,
 ) -> None:
     config = _config("2.5")
@@ -236,19 +224,17 @@ def test_binding_driven_cache_build_accepts_wrapper_and_ignores_baggage(
     checkpoint = tmp_path / "community-transformer.safetensors"
     mx.save_safetensors(str(checkpoint), weights)
 
-    result = ensure_transformer_cache(
+    result = transformer_weights(
         checkpoint,
-        cache_mode="rebuild",
-        cache_root=tmp_path / "cache",
         include_audio=True,
         video_ff_layout_specs=(),
         video_attn_layout_specs=(),
-        constructor_config=config,
+        config=config,
     )
     target = _model(config, shaped=False)
-    loaded, layouts, quantized = load_transformer_cache(
+    loaded, layouts, quantized = bind_transformer_weights(
         target,
-        result.cache_path,
+        result,
         include_audio=True,
     )
 

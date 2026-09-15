@@ -1,4 +1,4 @@
-"""Model-agnostic shape and state primitives.
+"""Model-agnostic shape and policy primitives.
 
 Per-model constants (sigma schedules, VAE compression ratios, native
 frame rates, audio encoder geometry) live under
@@ -7,18 +7,13 @@ models reuse the shape primitives without inheriting another model's
 defaults.
 """
 
-from __future__ import annotations
-
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, Literal, NamedTuple
-
-if TYPE_CHECKING:
-    import mlx.core as mx
-
+from typing import Literal, NamedTuple
 
 NoiseBackend = Literal["mlx", "torch-mps"]
 NOISE_BACKEND_CHOICES = ("mlx", "torch-mps")
 DEFAULT_NOISE_BACKEND: NoiseBackend = "mlx"
+VAETilingMode = Literal["auto", "single", "custom"]
+VAE_TILING_MODE_CHOICES = ("auto", "single", "custom")
 
 
 class VideoPixelShape(NamedTuple):
@@ -75,43 +70,3 @@ class SpatioTemporalScaleFactors(NamedTuple):
     time: int
     height: int
     width: int
-
-
-@dataclass(frozen=True)
-class LatentState:
-    """State of a latent tensor during diffusion denoising.
-
-    Fields:
-        latent: The currently-noisy latent being denoised.
-        denoise_mask: Per-token denoising strength (1 = full, 0 = none).
-        positions: Positional indices used for positional embeddings.
-        clean_latent: Initial latent before denoising; may include
-            conditioning latents (image, keyframe).
-        uniform_mask: Python-side flag - True iff every entry of
-            ``denoise_mask`` is 1.  Not derived from mask values in
-            the hot path (that would force an ``mx.eval``).  Models
-            may key a fastpath on this flag to skip per-token
-            timestep work when the mask is uniform.  LTX-2 A/V
-            cross-attention also relies on the distinction: scale/shift
-            follows own per-token timesteps, not the other modality's
-            scalar sigma.
-
-    **uniform_mask footgun.**  When constructing a new state via
-    ``dataclasses.replace(state, denoise_mask=new_mask)``, you MUST
-    also pass ``uniform_mask=False`` if the new mask is mixed.  The
-    flag does not auto-update; silent staleness would fire the
-    fastpath against a non-uniform mask and break downstream
-    conditioning::
-
-        # correct
-        state = dataclasses.replace(state, denoise_mask=m, uniform_mask=False)
-
-        # WRONG - fastpath stays active
-        state = dataclasses.replace(state, denoise_mask=m)
-    """
-
-    latent: mx.array
-    denoise_mask: mx.array
-    positions: mx.array
-    clean_latent: mx.array
-    uniform_mask: bool = True

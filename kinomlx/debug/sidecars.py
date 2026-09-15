@@ -1,12 +1,11 @@
 """Generic safetensors persistence for model-contributed artifacts."""
 
-from __future__ import annotations
-
 import logging
 from collections.abc import Collection, Iterator, Mapping
 from contextlib import contextmanager
 from pathlib import Path
-from typing import TYPE_CHECKING
+
+import mlx.core as mx
 
 from kinomlx.artifacts import TensorArtifact
 from kinomlx.io.fingerprints import file_sha256
@@ -14,9 +13,6 @@ from kinomlx.io.safetensors import save_weights
 from kinomlx.reporting import NullReporter, Reporter
 
 from .metadata import sidecar_failure
-
-if TYPE_CHECKING:
-    import mlx.core as mx
 
 _LOG = logging.getLogger(__name__)
 
@@ -39,6 +35,7 @@ class SidecarArtifactSink:
             raise ValueError(f"enabled artifacts have no output path: {', '.join(sorted(missing))}")
         self.reporter = reporter if reporter is not None else NullReporter()
         self._manifest: dict[str, str] = {}
+        self._offered: set[str] = set()
         self._fingerprints: dict[str, str] = {}
         self._fingerprint_errors: dict[str, str] = {}
         self._errors = errors if errors is not None else []
@@ -47,6 +44,16 @@ class SidecarArtifactSink:
     def manifest(self) -> dict[str, str]:
         """Return sidecars that were successfully materialized."""
         return dict(self._manifest)
+
+    @property
+    def unoffered(self) -> tuple[str, ...]:
+        """Return enabled artifacts the run never handed to this sink.
+
+        A name that was offered and failed to write is already reported as a
+        sidecar error. A name never offered at all is different: the run was
+        planned to produce it, told the user so, and then finished without it.
+        """
+        return tuple(sorted(self._enabled - self._offered))
 
     @property
     def errors(self) -> list[dict[str, str]]:
@@ -126,6 +133,7 @@ class SidecarArtifactSink:
         """Persist one enabled envelope without interpreting model vocabulary."""
         if artifact.name not in self._enabled:
             return
+        self._offered.add(artifact.name)
         self._save(
             self._paths[artifact.name],
             dict(artifact.tensors),

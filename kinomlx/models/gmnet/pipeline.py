@@ -1,7 +1,7 @@
 """Public stateless GMNet SDR-to-HDR recipe."""
 
-from __future__ import annotations
-
+from kinomlx.io.image import load_image
+from kinomlx.memory_policy import memory_managed
 from kinomlx.reporting import NullReporter, Reporter
 
 from .components import GMNetComponents, NativeGMNetComponents
@@ -20,6 +20,7 @@ def _validate_request(request: GMNetRequest) -> None:
         )
 
 
+@memory_managed
 def expand_gmnet(
     request: GMNetRequest,
     resources: GMNetResources,
@@ -32,8 +33,6 @@ def expand_gmnet(
     sink = reporter if reporter is not None else NullReporter()
     provider = components if components is not None else NativeGMNetComponents(reporter=sink)
 
-    from kinomlx.io.image import load_image
-
     load_phase = "load SDR image"
     sink.phase_start(load_phase, total=1, unit="image")
     try:
@@ -42,7 +41,7 @@ def expand_gmnet(
     finally:
         sink.phase_end(load_phase)
 
-    inference_phase = "GMNet expansion"
+    inference_phase = "expand image"
     sink.phase_start(inference_phase, total=1, unit="image")
     try:
         with provider.generator(resources) as model:

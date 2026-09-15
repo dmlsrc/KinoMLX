@@ -1,7 +1,5 @@
 """Generic checkpoint conversion stays value-preserving and transactional."""
 
-from __future__ import annotations
-
 import io
 import zipfile
 from collections import OrderedDict

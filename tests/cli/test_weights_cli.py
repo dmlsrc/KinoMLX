@@ -1,7 +1,5 @@
 """The generic weights host dispatches model-specific extensions."""
 
-from __future__ import annotations
-
 import json
 
 import numpy as np
@@ -32,7 +30,7 @@ def test_generic_convert_dispatch(monkeypatch) -> None:
 def test_gmnet_convert_dispatch(monkeypatch) -> None:
     received: list[list[str]] = []
     monkeypatch.setattr(
-        "kinomlx.models.gmnet.converter_cli.run_gmnet_convert_command",
+        "kinomlx.weights.cli.run_gmnet_convert_command",
         lambda argv: received.append(argv) or 19,
     )
 
@@ -43,7 +41,7 @@ def test_gmnet_convert_dispatch(monkeypatch) -> None:
 def test_root_main_dispatches_weights_before_model_routing(monkeypatch) -> None:
     received: list[list[str]] = []
     monkeypatch.setattr(
-        "kinomlx.weights.cli.run_weights_command",
+        "kinomlx.cli.main.run_weights_command",
         lambda argv: received.append(argv) or 23,
     )
 

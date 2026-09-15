@@ -1,7 +1,5 @@
 """Joint audio/video DiT blocks for the LTX-2 velocity model."""
 
-from __future__ import annotations
-
 from dataclasses import dataclass, replace
 
 import mlx.core as mx
@@ -9,6 +7,7 @@ import mlx.core as mx
 import kinomlx._mlx_nn as nn
 
 from .attention import Attention, rms_norm
+from .execution import TransformerExecution
 from .feed_forward import FeedForward
 from .rope import LTXRopeType
 
@@ -31,8 +30,18 @@ def _gated_residual(
     return (value + residual * gate).astype(value.dtype)
 
 
+def _modulate(value: mx.array, scale: mx.array, shift: mx.array) -> mx.array:
+    return (value * (1.0 + scale) + shift).astype(value.dtype)
+
+
+def _gate(value: mx.array, gate: mx.array) -> mx.array:
+    return (value * gate).astype(value.dtype)
+
+
 _compiled_adaln = mx.compile(_adaln)
 _compiled_gated_residual = mx.compile(_gated_residual)
+_compiled_modulate = mx.compile(_modulate)
+_compiled_gate = mx.compile(_gate)
 
 
 def _table_shell() -> mx.array:
@@ -212,12 +221,10 @@ class BasicAVTransformerBlock(nn.Module):
             prompt = prompt + args.prompt_timestep
         shift_context = prompt[:, :, 0, :]
         scale_context = prompt[:, :, 1, :]
-        query = (rms_norm(value, eps=self.norm_eps) * (1.0 + scale_query) + shift_query).astype(
-            value.dtype
-        )
-        context = (args.context * (1.0 + scale_context) + shift_context).astype(args.context.dtype)
+        query = _compiled_adaln(value, scale_query, shift_query, self.norm_eps)
+        context = _compiled_modulate(args.context, scale_context, shift_context)
         output = attention(query, context=context, mask=args.context_mask)
-        return (output * gate).astype(output.dtype)
+        return _compiled_gate(output, gate)
 
     def __call__(
         self,
@@ -226,20 +233,17 @@ class BasicAVTransformerBlock(nn.Module):
     ) -> tuple[TransformerArgs | None, TransformerArgs | None]:
         video_value = video.x if video is not None else None
         audio_value = audio.x if audio is not None else None
-        run_video = (
-            video is not None and video_value is not None and video.enabled and video_value.size > 0
+        execution = TransformerExecution.resolve(
+            video_present=video_value is not None and video_value.size > 0,
+            audio_present=audio_value is not None and audio_value.size > 0,
+            video_enabled=video is not None and video.enabled,
+            audio_enabled=audio is not None and audio.enabled,
         )
-        run_audio = (
-            audio is not None and audio_value is not None and audio.enabled and audio_value.size > 0
-        )
-        # ``enabled`` gates updates to the query stream. A present disabled
-        # stream remains valid K/V context for the other modality's update.
-        run_audio_to_video = (
-            run_video and audio is not None and audio_value is not None and audio_value.size > 0
-        )
-        run_video_to_audio = (
-            run_audio and video is not None and video_value is not None and video_value.size > 0
-        )
+        run_video = execution.video
+        run_audio = execution.audio
+        # Disabled but present streams can still supply cross-attention K/V.
+        run_audio_to_video = execution.audio_to_video
+        run_video_to_audio = execution.video_to_audio
 
         if run_video:
             assert video is not None
@@ -347,12 +351,8 @@ class BasicAVTransformerBlock(nn.Module):
             )
 
             if run_audio_to_video:
-                a2v_query = (video_norm * (1.0 + video_scale_a2v) + video_shift_a2v).astype(
-                    video_norm.dtype
-                )
-                a2v_context = (audio_norm * (1.0 + audio_scale_a2v) + audio_shift_a2v).astype(
-                    audio_norm.dtype
-                )
+                a2v_query = _compiled_modulate(video_norm, video_scale_a2v, video_shift_a2v)
+                a2v_context = _compiled_modulate(audio_norm, audio_scale_a2v, audio_shift_a2v)
                 a2v = self.audio_to_video_attn(
                     a2v_query,
                     context=a2v_context,
@@ -362,12 +362,8 @@ class BasicAVTransformerBlock(nn.Module):
                 video_value = _compiled_gated_residual(video_base, a2v, gate_a2v)
 
             if run_video_to_audio:
-                v2a_query = (audio_norm * (1.0 + audio_scale_v2a) + audio_shift_v2a).astype(
-                    audio_norm.dtype
-                )
-                v2a_context = (video_norm * (1.0 + video_scale_v2a) + video_shift_v2a).astype(
-                    video_norm.dtype
-                )
+                v2a_query = _compiled_modulate(audio_norm, audio_scale_v2a, audio_shift_v2a)
+                v2a_context = _compiled_modulate(video_norm, video_scale_v2a, video_shift_v2a)
                 v2a = self.video_to_audio_attn(
                     v2a_query,
                     context=v2a_context,

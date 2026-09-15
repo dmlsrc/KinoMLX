@@ -1,5 +1,6 @@
 """Spatial recipe upscaling and public temporal x2 component support."""
 
+from .ports import LatentStatisticsPort, SpatialUpscalerPort, TemporalUpscalerPort
 from .spatial import (
     PixelShuffle2d,
     ResBlock3d,
@@ -19,13 +20,16 @@ from .temporal import (
 )
 
 __all__ = [
-    "PixelShuffle2d",
+    "LatentStatisticsPort",
     "PixelShuffle1d",
+    "PixelShuffle2d",
     "ResBlock3d",
     "SpatialUpscaler",
     "SpatialUpscalerConfig",
+    "SpatialUpscalerPort",
     "TemporalUpscaler",
     "TemporalUpscalerConfig",
+    "TemporalUpscalerPort",
     "load_spatial_upscaler",
     "load_spatial_upscaler_weights",
     "load_temporal_upscaler",

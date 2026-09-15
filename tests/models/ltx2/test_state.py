@@ -1,7 +1,5 @@
 """Latent-state construction and reference conditioning semantics."""
 
-from __future__ import annotations
-
 import mlx.core as mx
 import pytest
 
@@ -16,8 +14,8 @@ from kinomlx.models.ltx2.state import (
     init_video_latent_state,
     post_process_latent,
 )
-from kinomlx.models.ltx2.types import AudioLatentShape
-from kinomlx.types import LatentState, VideoLatentShape
+from kinomlx.models.ltx2.types import AudioLatentShape, LatentState
+from kinomlx.types import VideoLatentShape
 
 
 def test_video_state_round_trip_and_clear_conditioning() -> None:

@@ -1,14 +1,12 @@
 """Prompt and conditioning-input boundary tests."""
 
-from __future__ import annotations
-
 import mlx.core as mx
 import pytest
 
 import kinomlx.models.ltx2.encode as encode
 from kinomlx.media.hdr import scene_linear_to_acescct
 from kinomlx.models.ltx2.types import HDRAuthoring
-from kinomlx.reporting import RecordingReporter
+from tests._reporting import RecordingReporter
 
 
 def _conditioning_arrays() -> dict[str, mx.array]:
@@ -60,7 +58,7 @@ def test_structural_text_replay_ignores_metadata_and_unconsumed_baggage(
         ),
     )
 
-    with caplog.at_level("WARNING"):
+    with caplog.at_level("WARNING", logger="kinomlx.models.ltx2.encode"):
         output, metadata = encode.load_text_conditioning(
             "conditioning.safetensors",
             metadata_policy="observe",

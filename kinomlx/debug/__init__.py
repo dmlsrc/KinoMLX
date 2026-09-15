@@ -30,7 +30,7 @@ __all__ = [
     "initialize_execution_log",
     "normalized_video_path",
     "selected_execution_sidecar_paths",
-    "sidecar_selected",
     "sidecar_failure",
+    "sidecar_selected",
     "write_effective_config",
 ]

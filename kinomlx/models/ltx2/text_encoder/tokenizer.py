@@ -1,7 +1,5 @@
 """SentencePiece-backed Gemma tokenizer for prompt encoding."""
 
-from __future__ import annotations
-
 import logging
 import re
 import unicodedata
@@ -9,11 +7,11 @@ from collections.abc import Sequence
 from pathlib import Path
 
 import mlx.core as mx
+import sentencepiece
 
-from .tokenizer_cache import (
-    TokenizerCache,
-    ensure_tokenizer_cache,
-    load_tokenizer_derivation,
+from .tokenizer_derivation import (
+    TokenizerDerivation,
+    derive_tokenizer,
 )
 
 _log = logging.getLogger(__name__)
@@ -74,34 +72,28 @@ class GemmaTokenizer:
 
     def __init__(
         self,
-        source: Path | str | TokenizerCache,
-        *,
-        cache_root: Path | str | None = None,
+        source: Path | str | TokenizerDerivation,
     ) -> None:
-        import sentencepiece
-
-        cache = (
-            source
-            if isinstance(source, TokenizerCache)
-            else ensure_tokenizer_cache(source, cache_root=cache_root)
-        )
-        self._processor = sentencepiece.SentencePieceProcessor(model_file=str(cache.model_path))
-        metadata = load_tokenizer_derivation(cache)
+        """Derive the native tokenizer in memory from its original source."""
+        derived = source if isinstance(source, TokenizerDerivation) else derive_tokenizer(source)
+        self._processor = sentencepiece.SentencePieceProcessor(model_proto=derived.model)
+        metadata = derived.derivation
+        label = "in-memory tokenizer derivation"
         special = metadata.get("special_ids")
         added = metadata.get("added_tokens")
         special_token_ids = metadata.get("special_token_ids")
         literal = metadata.get("wrapper_literal_tokens")
         prepends_bos = metadata.get("post_processor_prepends_bos")
         if not isinstance(special, dict):
-            raise ValueError(f"tokenizer cache has no special-token ids: {cache.metadata_path}")
+            raise ValueError(f"tokenizer derivation has no special-token ids: {label}")
         if not isinstance(added, dict):
-            raise ValueError(f"tokenizer cache has no added-token ledger: {cache.metadata_path}")
+            raise ValueError(f"tokenizer derivation has no added-token ledger: {label}")
         if not isinstance(special_token_ids, list):
-            raise ValueError(f"tokenizer cache has no special-token ledger: {cache.metadata_path}")
+            raise ValueError(f"tokenizer derivation has no special-token ledger: {label}")
         if not isinstance(literal, dict):
-            raise ValueError(f"tokenizer cache has no literal-token ledger: {cache.metadata_path}")
+            raise ValueError(f"tokenizer derivation has no literal-token ledger: {label}")
         if not isinstance(prepends_bos, bool):
-            raise ValueError(f"tokenizer cache has no BOS policy: {cache.metadata_path}")
+            raise ValueError(f"tokenizer derivation has no BOS policy: {label}")
         try:
             self.bos_id = int(special["<bos>"])
             self.eos_id = int(special["<eos>"])
@@ -110,11 +102,9 @@ class GemmaTokenizer:
             self._special_token_ids = frozenset(int(index) for index in special_token_ids)
             self._literal_tokens = {str(token): int(index) for token, index in literal.items()}
         except (KeyError, TypeError, ValueError) as exc:
-            raise ValueError(f"tokenizer cache metadata is invalid: {cache.metadata_path}") from exc
+            raise ValueError(f"tokenizer derivation metadata is invalid: {label}") from exc
         if not set(self._literal_tokens.values()) <= self._added_token_ids:
-            raise ValueError(
-                f"tokenizer cache literal tokens are not added tokens: {cache.metadata_path}"
-            )
+            raise ValueError(f"tokenizer derivation literal tokens are not added tokens: {label}")
         self._always_prepend_bos = prepends_bos
         self._splitter = (
             re.compile(
@@ -130,10 +120,10 @@ class GemmaTokenizer:
         )
 
     def _encode_text(self, text: str) -> list[int]:
-        splitter = getattr(self, "_splitter", None)
+        splitter = self._splitter
         if splitter is None:
             return list(self._processor.encode(text))
-        literal_tokens = getattr(self, "_literal_tokens", {})
+        literal_tokens = self._literal_tokens
         ids: list[int] = []
         for segment in splitter.split(text):
             if not segment:
@@ -186,7 +176,7 @@ class GemmaTokenizer:
         *,
         skip_special_tokens: bool = False,
     ) -> str:
-        """Decode ids with the special-token policy recorded in the cache."""
+        """Decode ids with the special-token policy recorded in the derivation."""
         values = [int(index) for index in ids]
         if skip_special_tokens:
             values = [index for index in values if index not in self._special_token_ids]

@@ -1,12 +1,11 @@
 """Lazy LTX-2.3 VAE frame-boundary tests."""
 
-from __future__ import annotations
-
 from types import SimpleNamespace
 
 import mlx.core as mx
 import pytest
 
+import kinomlx.modeling.memory as memory
 import kinomlx.models.ltx2.decode as decode
 from kinomlx.components import ComponentLease
 from kinomlx.media.signals import UnsupportedSignalError
@@ -15,8 +14,8 @@ from kinomlx.models.ltx2.signals import (
     SCENE_LINEAR_HDR_SIGNAL,
     ltx23_sdr_signal,
 )
-from kinomlx.reporting import RecordingReporter
 from kinomlx.samplers.noise import NoiseStreamState
+from tests._reporting import RecordingReporter
 
 
 def _decoded_chunk() -> mx.array:
@@ -131,7 +130,7 @@ def test_receipt_uses_available_at_entry_memory_for_auto_plan(monkeypatch) -> No
         total_bytes=32_000_000_000,
         recommended_working_set_bytes=28_000_000_000,
         available_bytes=24_000_000_000,
-        planner_budget_bytes=12_000_000_000,
+        planner_budget_bytes=24_000_000_000,
     )
     seen = []
     monkeypatch.setattr(
@@ -161,7 +160,7 @@ def test_receipt_uses_available_at_entry_memory_for_auto_plan(monkeypatch) -> No
     )
 
     assert len(list(stream)) == 1
-    assert seen == [(2, 2, 1, 12.0, mx.bfloat16)]
+    assert seen == [(2, 2, 1, 24.0, mx.bfloat16)]
     assert stream.receipts["vae_entry"] is receipt
     assert stream.receipts["vae_tiling"] is not None
     assert receipt.live_assets == frozenset({"final_video_latent", "video_decoder"})
@@ -196,7 +195,7 @@ def test_auto_full_fit_bypasses_the_legacy_default_budget_replan(monkeypatch) ->
     assert stream.receipts["vae_tiling"] is seen[0]
 
 
-def test_capture_receipt_subtracts_active_and_cache_from_recommended_limit(
+def test_capture_receipt_uses_full_headroom_without_charging_reclaimable_weights(
     monkeypatch,
 ) -> None:
     monkeypatch.setattr(
@@ -210,6 +209,7 @@ def test_capture_receipt_subtracts_active_and_cache_from_recommended_limit(
     monkeypatch.setattr(decode.mx, "get_active_memory", lambda: 3_000_000_000)
     monkeypatch.setattr(decode.mx, "get_cache_memory", lambda: 1_000_000_000)
     monkeypatch.setattr(decode.mx, "get_peak_memory", lambda: 5_000_000_000)
+    monkeypatch.setattr(memory, "system_reclaimable_memory", lambda: 30_000_000_000)
 
     latent = mx.zeros((1, 3), dtype=mx.float16)
     decoder = SimpleNamespace(parameters=lambda: {"weight": mx.zeros((4,), dtype=mx.float16)})
@@ -218,8 +218,8 @@ def test_capture_receipt_subtracts_active_and_cache_from_recommended_limit(
         decoder=decoder,
     )
 
-    assert receipt.available_bytes == 24_000_000_000
-    assert receipt.planner_budget_bytes == 12_000_000_000
+    assert receipt.available_bytes == 25_000_000_000
+    assert receipt.planner_budget_bytes == 25_000_000_000
     assert receipt.active_bytes == 3_000_000_000
     assert receipt.cache_bytes == 1_000_000_000
     assert receipt.latent_bytes == 6
@@ -236,7 +236,7 @@ def test_video_decode_diagnostics_serializes_memory_and_replayable_plan() -> Non
         total_bytes=10_000,
         recommended_working_set_bytes=8_000,
         available_bytes=5_700,
-        planner_budget_bytes=2_850,
+        planner_budget_bytes=5_700,
         latent_bytes=20,
         decoder_parameter_bytes=1_500,
     )
@@ -289,7 +289,9 @@ def test_video_decode_diagnostics_serializes_memory_and_replayable_plan() -> Non
                 "total_bytes": 10_000,
                 "recommended_working_set_bytes": 8_000,
                 "available_bytes": 5_700,
-                "planner_budget_bytes": 2_850,
+                "planner_budget_bytes": 5_700,
+                "system_reclaimable_bytes": None,
+                "memory_limit_bytes": None,
                 "latent_bytes": 20,
                 "decoder_parameter_bytes": 1_500,
                 "accounted_asset_bytes": 1_520,

@@ -1,7 +1,5 @@
 """Explicit HDR recipe facts remain metadata-driven and generation-specific."""
 
-from __future__ import annotations
-
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -10,7 +8,9 @@ import pytest
 
 from kinomlx.io.safetensors import save_weights
 from kinomlx.media.signals import ColorTransfer
-from kinomlx.models.ltx2.cache import LoRAAdapterReceipt
+from kinomlx.memory_policy import MLXMemoryPolicy
+from kinomlx.models.ltx2.adapters.inputs import LTX2AdapterConfig
+from kinomlx.models.ltx2.adapters.receipt import LTX2AdapterReceipt
 from kinomlx.models.ltx2.hdr_profile import (
     resolve_hdr_recipe,
     validate_hdr_adapter_placement,
@@ -24,10 +24,11 @@ from kinomlx.models.ltx2.types import (
 
 def _resources(generation: str, *, native_hdr: bool = False) -> SimpleNamespace:
     return SimpleNamespace(
+        memory_policy=MLXMemoryPolicy(),
         capabilities=SimpleNamespace(
             model_generation=generation,
             native_hdr=native_hdr,
-        )
+        ),
     )
 
 
@@ -36,8 +37,8 @@ def _adapter(path: Path, **metadata: str) -> Path:
     return path
 
 
-def _receipt(path: Path, *, placed: int, complete: int) -> LoRAAdapterReceipt:
-    return LoRAAdapterReceipt(
+def _receipt(path: Path, *, placed: int, complete: int) -> LTX2AdapterReceipt:
+    return LTX2AdapterReceipt(
         path=path,
         fingerprint="test",
         base_model_generation="2.3",
@@ -50,7 +51,9 @@ def _receipt(path: Path, *, placed: int, complete: int) -> LoRAAdapterReceipt:
         structural_coverage=placed / complete if complete else 0.0,
         target_categories=(),
         skipped_reasons=(),
-        warning=False,
+        effective=placed > 0,
+        warnings=(),
+        adapter_types=("lora",),
     )
 
 
@@ -107,7 +110,7 @@ def test_ltx23_hdr_uses_declared_facts_not_filename_or_hash(tmp_path: Path) -> N
             height=64,
             frames=9,
             hdr="SRGB_LINEAR",
-            lora_paths=(adapter,),
+            adapters=(LTX2AdapterConfig(path=adapter),),
             hdr_reference=HDRReferenceConditioningConfig(Path("reference.mp4")),
         ),
         _resources("2.3"),
@@ -143,7 +146,7 @@ def test_ltx23_hdr_rejects_missing_or_unsupported_recipe_facts(
         height=64,
         frames=9,
         hdr="ACESCCT",
-        lora_paths=(adapter,),
+        adapters=(LTX2AdapterConfig(path=adapter),),
     )
     with pytest.raises(ValueError, match=message):
         resolve_hdr_recipe(request, _resources("2.3"))
@@ -163,7 +166,7 @@ def test_ltx23_hdr_rejects_text_only_until_real_generation_is_validated(
         height=64,
         frames=9,
         hdr="SRGB_LINEAR",
-        lora_paths=(adapter,),
+        adapters=(LTX2AdapterConfig(path=adapter),),
     )
     with pytest.raises(ValueError, match="text-only HDR is not supported"):
         resolve_hdr_recipe(request, _resources("2.3"))
@@ -183,7 +186,10 @@ def test_generic_companion_lora_does_not_change_hdr_profile_selection(tmp_path: 
             height=64,
             frames=9,
             hdr="ACESCG",
-            lora_paths=(style, hdr),
+            adapters=(
+                LTX2AdapterConfig(path=style),
+                LTX2AdapterConfig(path=hdr),
+            ),
             hdr_reference=HDRReferenceConditioningConfig(Path("reference.mp4")),
         ),
         _resources("2.3"),
@@ -205,7 +211,7 @@ def test_hdr_adapter_requires_complete_structural_placement(tmp_path: Path) -> N
             height=64,
             frames=9,
             hdr="ACESCG",
-            lora_paths=(adapter,),
+            adapters=(LTX2AdapterConfig(path=adapter),),
             hdr_reference=HDRReferenceConditioningConfig(Path("reference.mp4")),
         ),
         _resources("2.3"),

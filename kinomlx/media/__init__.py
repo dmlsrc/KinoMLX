@@ -29,10 +29,10 @@ from .signals import (
 )
 
 __all__ = [
-    "BT2020_HLG_DELIVERY",
     "BT709_SDR_420_DELIVERY",
     "BT709_SDR_422_DELIVERY",
     "BT709_SDR_DELIVERY",
+    "BT2020_HLG_DELIVERY",
     "ChromaSubsampling",
     "CloseableVideoFrameStream",
     "ColorMatrix",
@@ -51,8 +51,8 @@ __all__ = [
     "VideoLayout",
     "VideoSignalSpec",
     "VideoValueDomain",
-    "validate_sdr_delivery",
     "validate_encoded_delivery",
     "validate_hlg_delivery",
+    "validate_sdr_delivery",
     "validate_sdr_output_plan",
 ]

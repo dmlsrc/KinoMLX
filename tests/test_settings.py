@@ -4,18 +4,20 @@ Covers the env-resolution + CLI-verbatim contracts that are easy to
 regress when adding fields or adjusting the resolver.
 """
 
-from __future__ import annotations
-
 import argparse
 import os
 from collections.abc import Iterator
 from dataclasses import dataclass, field, fields
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
-from kinomlx.cli.config_records import OutputConfig
-from kinomlx.models.gmnet.types import GMNetOutputConfig
+from kinomlx.config_records import config_record, record_intent, supplied_fields
+from kinomlx.model_registry import config_registry
+from kinomlx.models.flux2.settings import Flux2Settings
+from kinomlx.models.gmnet.settings import GMNetSettings
+from kinomlx.models.krea2.settings import Krea2Settings
 from kinomlx.models.ltx2.settings import LTX2Settings
 from kinomlx.settings import (
     EnvironmentSettings,
@@ -26,72 +28,17 @@ from kinomlx.settings import (
     settings_from_args,
 )
 
-# Env vars that the resolver / Settings.from_env can read.  We wipe them
-# all at the start of each test so behavior is deterministic regardless
-# of the shell environment pytest was launched from.
-_ENV_KEYS = [
-    "HF_HOME",
-    "KINO_CACHE_DIR",
-    "KINO_CACHE_MODE",
-    "KINO_DURATION_HEAD_PATH",
-    "KINO_FAST_MODE",
-    "KINO_GEMMA_PATH",
-    "KINO_JSON",
-    "KINO_MLX_CACHE_LIMIT_GB",
-    "KINO_OUTPUT_DIR",
-    "KINO_PROFILE_SIGNPOST_LOG",
-    "KINO_PROFILE_SIGNPOSTS",
-    "KINO_QUIET",
-    "KINO_TEXT_ENCODER_PATH",
-    "KINO_TEMPORAL_LATENT_UPSCALER_PATH",
-    "KINO_TRANSFORMER_PATH",
-    "KINO_TRANSFORMER_COMPILE_GROUP_SIZE",
-    "KINO_TRANSFORMER_CACHE_QUANTIZE",
-    "KINO_TRANSFORMER_DTYPE",
-    "KINO_STEEL_ATTENTION",
-    "KINO_STEEL_ATTENTION_D64",
-    "KINO_STEEL_ATTENTION_PROBE",
-    "KINO_STREAM_TRANSFORMER",
-    "KINO_COMPILE_ATTENTION",
-    "KINO_TRANSFORMER_RESIDENT_BLOCKS",
-    "KINO_COMPILE_BLOCK_GROUPS",
-    "KINO_VIDEO_FF_LAYOUT_SPECS",
-    "KINO_VIDEO_FF_LAYOUT_LAYERS",
-    "KINO_VIDEO_ATTN_LAYOUT_SPECS",
-    "KINO_VIDEO_ATTN_LAYOUT_LAYERS",
-    "KINO_AUDIO_LAYOUT_MIRROR",
-    "KINO_AUDIO_VAE_PATH",
-    "KINO_AUDIO_FF_LAYOUT_SPECS",
-    "KINO_AUDIO_FF_LAYOUT_LAYERS",
-    "KINO_AUDIO_ATTN_LAYOUT_SPECS",
-    "KINO_AUDIO_ATTN_LAYOUT_LAYERS",
-    "KINO_ADALN_PRETRANSPOSE",
-    "KINO_VIDEO_FF_QUANTIZE_SPECS",
-    "KINO_VIDEO_FF_QUANTIZE_LAYERS",
-    "KINO_VIDEO_FF_QUANTIZE_GROUP_SIZE",
-    "KINO_VIDEO_FF_QUANTIZE_BITS",
-    "KINO_VIDEO_VAE_PATH",
-    "KINO_SPATIAL_UPSCALER_PATH",
-    "KINO_VERBOSE",
-    "KINO_WEIGHTS_PATH",
-    "KINOMLX_TEST_ENV_A",
-    "KINOMLX_TEST_ENV_B",
-    "KINOMLX_TEST_ENV_MISSING",
-]
-
 
 @pytest.fixture(autouse=True)
 def _clean_env() -> Iterator[None]:
-    """Wipe Settings-relevant env vars; restore after the test."""
-    saved = {k: os.environ.pop(k, None) for k in _ENV_KEYS}
-    try:
+    """Isolate registered settings and restore even direct writes made by tests."""
+    with patch.dict(os.environ):
+        for name in config_registry().environment_variables():
+            os.environ.pop(name, None)
+        for name in tuple(os.environ):
+            if name.startswith("KINOMLX_TEST_ENV_"):
+                os.environ.pop(name)
         yield
-    finally:
-        for k, v in saved.items():
-            if v is None:
-                os.environ.pop(k, None)
-            else:
-                os.environ[k] = v
 
 
 # ---------------------------------------------------------------------------
@@ -105,7 +52,7 @@ def test_bare_string_is_literal_not_env_lookup() -> None:
     # A bare name is literal and must not pick up its environment value.
     assert _resolve_env_entry("KINOMLX_TEST_ENV_A") == "KINOMLX_TEST_ENV_A"
     assert _resolve_env_entry("/literal/path") == "/literal/path"
-    assert _resolve_env_entry("KINO_CACHE_DIR") == "KINO_CACHE_DIR"
+    assert _resolve_env_entry("KINO_APP_CACHE_DIR") == "KINO_APP_CACHE_DIR"
 
 
 def test_template_substitution_resolves_from_env() -> None:
@@ -146,7 +93,7 @@ def test_environment_metadata_rejects_a_malformed_variable_template() -> None:
 def test_from_env_no_env_uses_field_defaults() -> None:
     infrastructure = Settings.from_env()
     model = LTX2Settings.from_env()
-    assert infrastructure.cache_dir == Path("~/.cache/kinomlx").expanduser()
+    assert infrastructure.app_cache_dir == Path("~/Library/Caches/KinoMLX").expanduser()
     assert infrastructure.profile_signposts is False
     assert infrastructure.profile_signpost_log is None
     assert model.fast_mode is True
@@ -161,57 +108,50 @@ def test_from_env_no_env_uses_field_defaults() -> None:
 def test_from_env_cache_dir_ignores_hf_home() -> None:
     os.environ["HF_HOME"] = "/tmp/hfroot"
     s = Settings.from_env()
-    assert s.cache_dir == Path("~/.cache/kinomlx").expanduser()
+    assert s.app_cache_dir == Path("~/Library/Caches/KinoMLX").expanduser()
     assert s.hf_home == Path("/tmp/hfroot")
 
 
 def test_from_env_cache_dir_uses_kino_var_independently_of_hf_home() -> None:
-    os.environ["KINO_CACHE_DIR"] = "/tmp/explicit"
+    os.environ["KINO_APP_CACHE_DIR"] = "/tmp/explicit"
     os.environ["HF_HOME"] = "/tmp/hfroot"
     s = Settings.from_env()
-    assert s.cache_dir == Path("/tmp/explicit")
+    assert s.app_cache_dir == Path("/tmp/explicit")
     assert s.hf_home == Path("/tmp/hfroot")
-
-
-def test_output_directory_environment_is_product_specific(monkeypatch) -> None:
-    monkeypatch.setenv("KINO_OUTPUT_DIR", "/tmp/kinomlx")
-    expected = {"directory": Path("/tmp/kinomlx")}
-    assert OutputConfig.overrides_from_env_fields("directory") == expected
-    assert GMNetOutputConfig.overrides_from_env_fields("directory") == expected
-    monkeypatch.delenv("KINO_OUTPUT_DIR")
-    assert OutputConfig.overrides_from_env_fields("directory") == {}
-    assert GMNetOutputConfig.overrides_from_env_fields("directory") == {}
 
 
 def test_from_env_bare_settings_reads_no_env() -> None:
     """Direct infrastructure and model records do not touch env."""
-    os.environ["KINO_CACHE_DIR"] = "/should/be/ignored"
+    os.environ["KINO_APP_CACHE_DIR"] = "/should/be/ignored"
     os.environ["HF_HOME"] = "/should/also/be/ignored"
-    os.environ["KINO_FAST_MODE"] = "0"
-    assert Settings().cache_dir == Path("~/.cache/kinomlx").expanduser()
+    os.environ["KINO_LTX2_FAST_MODE"] = "0"
+    assert Settings().app_cache_dir == Path("~/Library/Caches/KinoMLX").expanduser()
     assert LTX2Settings().fast_mode is True
 
 
-def test_runtime_light_layout_default_matches_cache_policy() -> None:
-    from kinomlx.models.ltx2.cache.policy import DEFAULT_VIDEO_FF_LAYOUT_SPECS
+def test_runtime_light_layout_default_matches_weight_policy() -> None:
+    from kinomlx.models.ltx2.weights.policy import DEFAULT_VIDEO_FF_LAYOUT_SPECS
 
     expected = tuple(f"{target}:{layout}" for target, layout in DEFAULT_VIDEO_FF_LAYOUT_SPECS)
     assert LTX2Settings().video_ff_layout_specs == expected
 
 
 def test_from_env_parses_typed_values() -> None:
-    os.environ["KINO_LTX_GENERATION"] = "2.5"
-    os.environ["KINO_VIDEO_VAE"] = "diffusion"
-    os.environ["KINO_FAST_MODE"] = "0"
-    os.environ["KINO_TRANSFORMER_RESIDENT_BLOCKS"] = "4"
-    os.environ["KINO_TRANSFORMER_DTYPE"] = "float16"
-    os.environ["KINO_STEEL_ATTENTION"] = "0"
-    os.environ["KINO_STEEL_ATTENTION_D64"] = "0"
-    os.environ["KINO_STEEL_ATTENTION_PROBE"] = "1"
-    os.environ["KINO_COMPILE_ATTENTION"] = "0"
+    os.environ["KINO_LTX2_MODEL_GENERATION"] = "2.5"
+    os.environ["KINO_LTX2_VIDEO_VAE"] = "diffusion"
+    os.environ["KINO_LTX2_FAST_MODE"] = "0"
+    os.environ["KINO_LTX2_TRANSFORMER_RESIDENT_BLOCKS"] = "4"
+    os.environ["KINO_LTX2_TRANSFORMER_DTYPE"] = "float16"
+    os.environ["KINO_LTX2_STEEL_ATTENTION"] = "0"
+    os.environ["KINO_LTX2_STEEL_ATTENTION_D64"] = "0"
+    os.environ["KINO_LTX2_STEEL_ATTENTION_PROBE"] = "1"
+    os.environ["KINO_LTX2_COMPILE_ATTENTION"] = "0"
     os.environ["KINO_MLX_CACHE_LIMIT_GB"] = "2.5"
-    os.environ["KINO_VIDEO_FF_LAYOUT_SPECS"] = "project_in:pretranspose,project_out:pretranspose"
-    os.environ["KINO_VIDEO_FF_LAYOUT_LAYERS"] = "0,7,47"
+    os.environ["KINO_MLX_WIRED_LIMIT_GB"] = "48"
+    os.environ["KINO_LTX2_VIDEO_FF_LAYOUT_SPECS"] = (
+        "project_in:pretranspose,project_out:pretranspose"
+    )
+    os.environ["KINO_LTX2_VIDEO_FF_LAYOUT_LAYERS"] = "0,7,47"
     infrastructure = Settings.from_env()
     model = LTX2Settings.from_env()
     assert model.model_generation == "2.5"
@@ -224,6 +164,12 @@ def test_from_env_parses_typed_values() -> None:
     assert model.steel_attention_probe is True
     assert model.compile_attention is False
     assert infrastructure.mlx_cache_limit_gb == pytest.approx(2.5)
+    assert infrastructure.mlx_wired_limit_gb == pytest.approx(48.0)
+    assert Settings().mlx_wired_limit_gb is None
+    for value in (-1.0, float("nan"), float("inf")):
+        with pytest.raises(ValueError, match="mlx_wired_limit_gb"):
+            Settings(mlx_wired_limit_gb=value).validate()
+    Settings(mlx_wired_limit_gb=0.0).validate()
     assert model.video_ff_layout_specs == (
         "project_in:pretranspose",
         "project_out:pretranspose",
@@ -233,13 +179,13 @@ def test_from_env_parses_typed_values() -> None:
 
 def test_from_env_parses_generation_neutral_component_paths() -> None:
     values = {
-        "KINO_TRANSFORMER_PATH": "/models/transformer.safetensors",
-        "KINO_TEXT_ENCODER_PATH": "/models/text.safetensors",
-        "KINO_VIDEO_VAE_PATH": "/models/video-vae.safetensors",
-        "KINO_AUDIO_VAE_PATH": "/models/audio-vae.safetensors",
-        "KINO_SPATIAL_UPSCALER_PATH": "/models/spatial.safetensors",
-        "KINO_TEMPORAL_LATENT_UPSCALER_PATH": "/models/temporal.safetensors",
-        "KINO_DURATION_HEAD_PATH": "/models/duration.safetensors",
+        "KINO_LTX2_TRANSFORMER_PATH": "/models/transformer.safetensors",
+        "KINO_LTX2_TEXT_ENCODER_PATH": "/models/text.safetensors",
+        "KINO_LTX2_VIDEO_VAE_PATH": "/models/video-vae.safetensors",
+        "KINO_LTX2_AUDIO_VAE_PATH": "/models/audio-vae.safetensors",
+        "KINO_LTX2_SPATIAL_UPSCALER_PATH": "/models/spatial.safetensors",
+        "KINO_LTX2_TEMPORAL_LATENT_UPSCALER_PATH": "/models/temporal.safetensors",
+        "KINO_LTX2_DURATION_HEAD_PATH": "/models/duration.safetensors",
     }
     os.environ.update(values)
 
@@ -247,7 +193,7 @@ def test_from_env_parses_generation_neutral_component_paths() -> None:
 
     assert settings.uses_split_checkpoint
     for environment_name, value in values.items():
-        field_name = environment_name.removeprefix("KINO_").lower()
+        field_name = environment_name.removeprefix("KINO_LTX2_").lower()
         assert getattr(settings, field_name) == Path(value)
 
 
@@ -300,7 +246,7 @@ def test_monolithic_primary_accepts_independent_component_overrides() -> None:
 
 
 def test_model_generation_rejects_unknown_binder() -> None:
-    with pytest.raises(ValueError, match="model_generation must be one of: 2.3, 2.5"):
+    with pytest.raises(ValueError, match="model_generation: must be one of: 2.3, 2.5"):
         LTX2Settings(model_generation="future").validate()
 
 
@@ -309,18 +255,18 @@ def test_video_vae_selector_is_generation_neutral() -> None:
     LTX2Settings(model_generation="2.3", video_vae="diffusion").validate()
     LTX2Settings(model_generation="2.5", video_vae="diffusion").validate()
 
-    with pytest.raises(ValueError, match="video_vae must be one of: conv, diffusion"):
+    with pytest.raises(ValueError, match="video_vae: must be one of: conv, diffusion"):
         LTX2Settings(video_vae="future").validate()
 
 
 def test_stream_transformer_environment_and_preset_resolution() -> None:
-    os.environ["KINO_STREAM_TRANSFORMER"] = "1"
+    os.environ["KINO_LTX2_STREAM_TRANSFORMER"] = "1"
     unresolved = LTX2Settings.from_env()
     assert unresolved.stream_transformer is True
     assert unresolved.transformer_resident_blocks is None
     resolved = unresolved.resolve_presets()
-    assert resolved.transformer_resident_blocks == 16
-    assert resolved.transformer_compile_group_size == 4
+    assert resolved.transformer_resident_blocks == 8
+    assert resolved.transformer_compile_group_size is None
 
 
 def test_stream_transformer_preset_keeps_explicit_low_level_values() -> None:
@@ -353,14 +299,14 @@ def test_signpost_settings_resolve_from_environment() -> None:
 
 
 def test_from_env_names_the_setting_with_an_invalid_typed_value() -> None:
-    os.environ["KINO_TRANSFORMER_RESIDENT_BLOCKS"] = "many"
+    os.environ["KINO_LTX2_TRANSFORMER_RESIDENT_BLOCKS"] = "many"
     with pytest.raises(ValueError, match="transformer_resident_blocks: invalid value"):
         LTX2Settings.from_env()
 
 
 def test_from_env_fields_bootstraps_one_setting_independently() -> None:
     os.environ["KINO_JSON"] = "1"
-    os.environ["KINO_TRANSFORMER_RESIDENT_BLOCKS"] = "many"
+    os.environ["KINO_LTX2_TRANSFORMER_RESIDENT_BLOCKS"] = "many"
     settings = Settings.from_env_fields("json_output")
     assert settings.json_output is True
     with pytest.raises(ValueError, match="transformer_resident_blocks: invalid value"):
@@ -372,19 +318,19 @@ def test_from_env_fields_rejects_unknown_field_names() -> None:
         Settings.from_env_fields("not_a_setting")
 
 
-@pytest.mark.parametrize("raw", ["1", "true", "TRUE", "yes", "on", "anything"])
+@pytest.mark.parametrize("raw", ["1", "true", "TRUE", "yes", "on"])
 def test_from_env_accepts_conventional_truthy_booleans(raw: str) -> None:
-    os.environ["KINO_FAST_MODE"] = raw
+    os.environ["KINO_LTX2_FAST_MODE"] = raw
     assert LTX2Settings.from_env().fast_mode is True
 
 
 @pytest.mark.parametrize("raw", ["0", "false", "FALSE", "no", "off"])
 def test_from_env_accepts_conventional_falsy_booleans(raw: str) -> None:
-    os.environ["KINO_FAST_MODE"] = raw
+    os.environ["KINO_LTX2_FAST_MODE"] = raw
     assert LTX2Settings.from_env().fast_mode is False
 
 
-def test_from_env_empty_boolean_is_unresolved_not_truthy() -> None:
+def test_from_env_empty_boolean_is_explicit_false() -> None:
     os.environ["KINO_QUIET"] = ""
     assert Settings.from_env().quiet is False
 
@@ -395,23 +341,23 @@ def test_from_env_empty_boolean_is_unresolved_not_truthy() -> None:
 
 
 def test_cli_does_not_substitute_template_syntax_in_paths() -> None:
-    """``--cache-dir '{{KINOMLX_TEST_ENV_A}}/foo'`` stays literal."""
+    """``--app-cache-dir '{{KINOMLX_TEST_ENV_A}}/foo'`` stays literal."""
     os.environ["KINOMLX_TEST_ENV_A"] = "/some/cache-root"
     parser = argparse.ArgumentParser()
     add_argparse_args(parser)
-    args = parser.parse_args(["--cache-dir", "{{KINOMLX_TEST_ENV_A}}/foo"])
+    args = parser.parse_args(["--app-cache-dir", "{{KINOMLX_TEST_ENV_A}}/foo"])
     final = settings_from_args(args, Settings.from_env())
     # The literal braces must survive into the resolved Path.
-    assert final.cache_dir == Path("{{KINOMLX_TEST_ENV_A}}/foo")
+    assert final.app_cache_dir == Path("{{KINOMLX_TEST_ENV_A}}/foo")
 
 
 def test_cli_overrides_env_resolved_values() -> None:
-    os.environ["KINO_CACHE_DIR"] = "/from/env"
+    os.environ["KINO_APP_CACHE_DIR"] = "/from/env"
     parser = argparse.ArgumentParser()
     add_argparse_args(parser)
-    args = parser.parse_args(["--cache-dir", "/from/cli"])
+    args = parser.parse_args(["--app-cache-dir", "/from/cli"])
     final = settings_from_args(args, Settings.from_env())
-    assert final.cache_dir == Path("/from/cli")
+    assert final.app_cache_dir == Path("/from/cli")
 
 
 def test_cli_boolean_pairs_work() -> None:
@@ -451,12 +397,12 @@ def test_cli_parses_cache_selector_tuples_and_off() -> None:
     final.validate()
 
 
-def test_settings_validate_cache_policy_conflicts() -> None:
+def test_settings_validate_weight_policy_conflicts() -> None:
     with pytest.raises(ValueError, match="audio_layout_mirror"):
         LTX2Settings(audio_ff_layout_specs=("project_out:pretranspose",)).validate()
     with pytest.raises(ValueError, match="cannot be combined"):
         LTX2Settings(
-            transformer_cache_quantize="mxfp8-blocks",
+            transformer_quantize="mxfp8-blocks",
             video_ff_quantize_specs=("project_out:mxfp8",),
         ).validate()
     with pytest.raises(ValueError, match="between 0 and 47"):
@@ -495,11 +441,221 @@ def test_json_setting_uses_short_cli_vocabulary() -> None:
 
 def test_argparse_generation_can_skip_an_owned_setting() -> None:
     parser = argparse.ArgumentParser()
-    add_argparse_args(parser, skip={"cache_dir"})
+    add_argparse_args(parser, skip={"app_cache_dir"})
     dests = {action.dest for action in parser._actions}
-    assert "cache_dir" not in dests
+    assert "app_cache_dir" not in dests
 
 
 def test_gemma_variant_rejects_unknown_value() -> None:
-    with pytest.raises(ValueError, match="gemma_variant must be one of: qat, plain"):
+    with pytest.raises(ValueError, match="gemma_variant: must be one of: qat, plain"):
         LTX2Settings(gemma_variant="quantized").validate()
+
+
+def test_adapter_weight_check_shared_environment_default_and_override(monkeypatch):
+    monkeypatch.delenv("KINO_CHECK_ADAPTER_WEIGHTS", raising=False)
+    assert Settings.from_env().check_adapter_weights is True
+    monkeypatch.setenv("KINO_CHECK_ADAPTER_WEIGHTS", "false")
+    assert Settings.from_env().check_adapter_weights is False
+    assert (
+        Settings.from_env().with_overrides(check_adapter_weights=True).check_adapter_weights is True
+    )
+
+
+@pytest.mark.parametrize("model", ["flux2", "krea2", "ltx2"])
+def test_adapter_weight_check_cli_is_identical_between_models(model):
+    import importlib
+
+    module = importlib.import_module(f"kinomlx.models.{model}.arguments")
+    parser = module.build_parser()
+    assert parser.parse_args(["--no-check-adapter-weights"]).check_adapter_weights is False
+    assert parser.parse_args(["--check-adapter-weights"]).check_adapter_weights is True
+
+
+def test_application_cache_override_and_xdg_fallback(monkeypatch, tmp_path):
+    from kinomlx.settings import Settings
+
+    monkeypatch.delenv("KINO_APP_CACHE_DIR", raising=False)
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "xdg"))
+    assert Settings.from_env_fields("app_cache_dir").app_cache_dir == tmp_path / "xdg" / "KinoMLX"
+    monkeypatch.setenv("KINO_APP_CACHE_DIR", str(tmp_path / "explicit"))
+    assert Settings.from_env_fields("app_cache_dir").app_cache_dir == tmp_path / "explicit"
+
+
+@pytest.mark.parametrize("layers", [(0, 0), (-1,), (48,)])
+def test_quantization_exclusions_reject_invalid_layers(layers):
+    with pytest.raises(ValueError, match="transformer_quantize_exclude_layers"):
+        LTX2Settings(
+            transformer_quantize="mxfp8-blocks", transformer_quantize_exclude_layers=layers
+        ).validate()
+
+
+def test_quantization_exclusions_require_quantization():
+    with pytest.raises(ValueError, match="requires whole-block quantization"):
+        LTX2Settings(transformer_quantize_exclude_layers=(0,)).validate()
+
+
+def test_quantization_exclusions_parse_cli_and_environment(monkeypatch):
+    from kinomlx.models.ltx2.arguments import build_parser
+
+    args = build_parser().parse_args(
+        [
+            "--transformer-quantize",
+            "mxfp8-blocks",
+            "--transformer-quantize-exclude-layers",
+            "0,1,2,3,47",
+        ]
+    )
+    assert tuple(args.transformer_quantize_exclude_layers) == (0, 1, 2, 3, 47)
+    monkeypatch.setenv("KINO_LTX2_TRANSFORMER_QUANTIZE", "mxfp8-blocks")
+    monkeypatch.setenv("KINO_LTX2_TRANSFORMER_QUANTIZE_EXCLUDE_LAYERS", "0,1,46,47")
+    assert LTX2Settings.from_env().transformer_quantize_exclude_layers == (0, 1, 46, 47)
+
+
+def test_environment_boolean_rejects_misspellings(monkeypatch) -> None:
+    monkeypatch.setenv("KINO_LTX2_FAST_MODE", "anything")
+    with pytest.raises(ValueError, match="fast_mode"):
+        LTX2Settings.from_env()
+
+
+def test_adapter_accumulation_choices_validation_and_auto_resolution() -> None:
+    with pytest.raises(ValueError, match="adapter_accumulation: must be one of"):
+        LTX2Settings(adapter_accumulation="half").validate()
+    with pytest.raises(ValueError, match="requires transformer_dtype=float16"):
+        LTX2Settings(adapter_accumulation="float16").validate()
+    LTX2Settings(adapter_accumulation="float16", transformer_dtype="float16").validate()
+
+    def resolved(**overrides: object) -> str:
+        return LTX2Settings(**overrides).resolved_adapter_accumulation()
+
+    assert resolved() == "float32"
+    assert resolved(transformer_dtype="float16") == "float32"
+    assert resolved(stream_transformer=True) == "float32"
+    assert resolved(stream_transformer=True, transformer_dtype="float16") == "float16"
+    assert resolved(transformer_resident_blocks=8, transformer_dtype="float16") == "float16"
+    assert (
+        resolved(
+            stream_transformer=True, transformer_dtype="float16", adapter_accumulation="float32"
+        )
+        == "float32"
+    )
+    assert resolved(transformer_dtype="float16", adapter_accumulation="float16") == "float16"
+
+
+def test_environment_value_resolves_each_selected_source_once(monkeypatch):
+    from kinomlx import settings
+
+    reads = []
+
+    def read(name):
+        reads.append(name)
+        return {"KINO_APP_CACHE_DIR": None, "XDG_CACHE_HOME": "/cache"}.get(name)
+
+    monkeypatch.setattr(settings, "read_environment", read)
+    selected = Settings.values_from_env_fields("app_cache_dir")["app_cache_dir"]
+    assert reads == ["KINO_APP_CACHE_DIR", "XDG_CACHE_HOME"]
+    assert selected.value == Path("/cache/KinoMLX")
+    assert selected.source == "{{XDG_CACHE_HOME}}/KinoMLX"
+    assert selected.explicit
+
+
+def test_settings_environment_presence_excludes_literal_fallbacks():
+    settings = Settings.from_env()
+    assert supplied_fields(settings) == frozenset()
+    assert record_intent(settings) == {}
+    assert settings.app_cache_dir == Path("~/Library/Caches/KinoMLX").expanduser()
+
+
+def test_settings_environment_presence_retains_explicit_default_and_zero():
+    os.environ["KINO_VERBOSE"] = "false"
+    os.environ["KINO_MLX_CACHE_LIMIT_GB"] = "0"
+    settings = Settings.from_env()
+    assert record_intent(settings) == {"verbose": False, "mlx_cache_limit_gb": 0.0}
+    changed = settings.with_overrides(quiet=False, profile_signpost_log=None)
+    assert record_intent(changed) == {
+        "verbose": False,
+        "quiet": False,
+        "mlx_cache_limit_gb": 0.0,
+    }
+    assert record_intent(settings.with_overrides()) == record_intent(settings)
+
+
+def test_settings_environment_template_fallback_is_explicit():
+    os.environ["XDG_CACHE_HOME"] = "cache-root"
+    settings = Settings.from_env_fields("app_cache_dir")
+    assert record_intent(settings) == {"app_cache_dir": Path("cache-root/KinoMLX")}
+    os.environ["KINO_APP_CACHE_DIR"] = "preferred-cache"
+    assert record_intent(Settings.from_env_fields("app_cache_dir")) == {
+        "app_cache_dir": Path("preferred-cache")
+    }
+
+
+def test_settings_cli_bridge_preserves_sparse_presence():
+    parser = argparse.ArgumentParser()
+    add_argparse_args(parser)
+    base = Settings(verbose=False)
+    settings = settings_from_args(parser.parse_args(["--quiet", "--mlx-cache-limit-gb", "0"]), base)
+    assert record_intent(settings) == {"verbose": False, "quiet": True, "mlx_cache_limit_gb": 0.0}
+    assert record_intent(settings_from_args(parser.parse_args([]), base)) == {"verbose": False}
+
+
+def test_environment_presence_is_available_during_post_init():
+    @config_record
+    @dataclass(frozen=True)
+    class Tracked(EnvironmentSettings):
+        enabled: bool = field(default=True, metadata={"env": "false"})
+
+        def __post_init__(self):
+            if "enabled" in supplied_fields(self):
+                raise ValueError("explicit enabled is not allowed")
+
+    assert Tracked.from_env().enabled is False
+    assert record_intent(Tracked.from_env()) == {}
+    with pytest.raises(ValueError, match="explicit enabled"):
+        Tracked(enabled=False)
+
+
+@pytest.mark.parametrize(
+    ("record", "variable", "field_name", "raw", "expected"),
+    [
+        (
+            Flux2Settings,
+            "KINO_FLUX2_TRANSFORMER_DTYPE",
+            "transformer_dtype",
+            "bfloat16",
+            "bfloat16",
+        ),
+        (
+            Krea2Settings,
+            "KINO_KREA2_TRANSFORMER_DTYPE",
+            "transformer_dtype",
+            "bfloat16",
+            "bfloat16",
+        ),
+        (GMNetSettings, "KINO_GMNET_VARIANT", "variant", "realworld", "realworld"),
+    ],
+)
+def test_model_settings_share_presence_across_constructors_env_and_copies(
+    record, variable, field_name, raw, expected
+):
+    from kinomlx.config import dataclass_from_mapping
+
+    assert record_intent(record.from_env()) == {}
+    os.environ[variable] = raw
+    loaded = record.from_env()
+    assert record_intent(loaded) == {field_name: expected}
+    assert record_intent(record(**{field_name: expected})) == {field_name: expected}
+    copied = loaded.with_overrides(**{field_name: expected})
+    assert record_intent(copied) == {field_name: expected}
+    assert record_intent(dataclass_from_mapping(record, copied, table="model_settings")) == {
+        field_name: expected
+    }
+
+
+@pytest.mark.parametrize("model", ["krea2", "flux2", "gmnet"])
+def test_model_settings_inspection_reports_constructor_tracking(model):
+    from kinomlx.config.inspection import configuration_inventory
+
+    items = configuration_inventory(config_registry().model(model))["fields"]
+    settings = [item for item in items if item["path"].startswith("model_settings.")]
+    assert settings
+    assert all(item["constructor_presence"] == "tracked" for item in settings)

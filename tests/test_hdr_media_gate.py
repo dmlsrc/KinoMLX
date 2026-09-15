@@ -1,7 +1,5 @@
 """End-to-end native EXR plus HEVC Main10 HLG media gate."""
 
-from __future__ import annotations
-
 import json
 import shutil
 import subprocess
@@ -22,7 +20,7 @@ from kinomlx.media.signals import (
     ExrSampleType,
     OutputColorPlan,
 )
-from kinomlx.models.ltx2.runner import GenerationOutput
+from kinomlx.models.ltx2.generation import GenerationOutput
 from kinomlx.models.ltx2.signals import ltx_hdr_working_signal
 from kinomlx.output import HDRGenerationSink
 from kinomlx.videotoolbox.exr import read_exr_frame

@@ -1,7 +1,5 @@
 """Expansion math, geometry handling, and the gain-map sidecar."""
 
-from __future__ import annotations
-
 import math
 
 import mlx.core as mx
@@ -21,16 +19,16 @@ from kinomlx.models.gmnet.net import GMNet
 def test_reconstruction_law_hits_known_values():
     image = mx.array([[[1.0, 1.0, 1.0], [0.5, 0.5, 0.5]]])
     gain = mx.array([[1.0, 0.0]])
-    linear = np.array(reconstruct_linear_hdr(image, gain, math.log2(5.0)))
-    np.testing.assert_allclose(linear[0, 0], 5.0, rtol=1e-6)
-    np.testing.assert_allclose(linear[0, 1], 0.5**2.2, rtol=1e-6)
+    linear = reconstruct_linear_hdr(image, gain, math.log2(5.0))
+    assert mx.allclose(linear[0, 0], mx.array(5.0), rtol=1e-6, atol=0.0).item()
+    assert mx.allclose(linear[0, 1], mx.array(0.5**2.2), rtol=1e-6, atol=0.0).item()
 
 
 def test_reconstruction_clips_out_of_range_inputs():
     image = mx.array([[[2.0, -1.0, 1.0]]])
     gain = mx.array([[3.0]])
-    linear = np.array(reconstruct_linear_hdr(image, gain, 2.0))
-    np.testing.assert_allclose(linear[0, 0], [4.0, 0.0, 4.0], rtol=1e-6)
+    linear = reconstruct_linear_hdr(image, gain, 2.0)
+    assert mx.allclose(linear[0, 0], mx.array([4.0, 0.0, 4.0]), rtol=1e-6, atol=0.0).item()
 
 
 def _random_model() -> GMNet:
@@ -47,10 +45,10 @@ def test_expand_image_realworld_geometry_and_bounds():
 
     assert tuple(result.linear_rgb.shape) == (33, 47, 3)
     assert tuple(result.gain_map.shape) == (33, 47)
-    gain = np.array(result.gain_map)
-    assert gain.min() >= 0.0
-    assert gain.max() <= 1.0
+    assert mx.min(result.gain_map).item() >= 0.0
+    assert mx.max(result.gain_map).item() <= 1.0
     linear = np.array(result.linear_rgb)
+    # Independent CPU reference for the SDR transfer function.
     sdr_linear = np.clip(np.array(image), 0.0, 1.0) ** 2.2
     assert (linear >= sdr_linear - 1e-5).all()
     assert linear.max() <= spec.peak_over_sdr_white + 1e-4
@@ -63,7 +61,7 @@ def test_expand_image_synthetic_runs_full_resolution():
     image = mx.random.uniform(shape=(32, 40, 3))
     result = expand_image(_random_model(), image, spec)
     assert tuple(result.linear_rgb.shape) == (32, 40, 3)
-    assert np.array(result.linear_rgb).max() <= spec.peak_over_sdr_white + 1e-4
+    assert mx.max(result.linear_rgb).item() <= spec.peak_over_sdr_white + 1e-4
 
 
 def test_gain_map_sidecar_round_trips(tmp_path):
@@ -78,7 +76,7 @@ def test_gain_map_sidecar_round_trips(tmp_path):
     )
 
     tensors, metadata = load_weights_with_metadata(target)
-    np.testing.assert_array_equal(np.array(tensors["gain_map"]), np.array(result.gain_map))
+    assert mx.array_equal(tensors["gain_map"], result.gain_map).item()
     assert metadata["producer"] == "gmnet"
     assert metadata["variant"] == "realworld"
     assert metadata["peak_over_sdr_white"] == "5"

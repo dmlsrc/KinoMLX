@@ -1,63 +1,49 @@
-"""Opt-in real-cache forward gate for the LTX-2.3 transformer."""
-
-from __future__ import annotations
+"""Opt-in real-checkpoint forward gate for the LTX-2.3 transformer."""
 
 import gc
+import os
 
 import mlx.core as mx
 import pytest
 from mlx.utils import tree_flatten
 
-from kinomlx.models.ltx2.cache import (
-    LAYOUT_KEY_PREFIX,
-    load_transformer_weights_cached_streaming,
-    transformer_cache_paths,
-)
-from kinomlx.models.ltx2.cache.storage import cache_artifacts_exist, load_cache_weights
 from kinomlx.models.ltx2.metadata import checkpoint_config
-from kinomlx.models.ltx2.settings import LTX2Settings
 from kinomlx.models.ltx2.transformer import LTXAVModel, Modality, X0Model
-from kinomlx.settings import Settings
+from kinomlx.models.ltx2.weights.loading import bind_transformer
+from kinomlx.models.ltx2.weights.schema import LAYOUT_KEY_PREFIX
+from tests.models.ltx2._source_weights import (
+    NO_LTX23_CHECKPOINT,
+    ltx23_checkpoint,
+    transformer_weights,
+)
 
 
-@pytest.mark.requires_weights
-def test_real_ltx23_transformer_cache_binds_and_runs_video_forward() -> None:
-    settings = Settings.from_env()
-    checkpoint = LTX2Settings.from_env().weights_path
-    if checkpoint is None or not checkpoint.is_file():
-        pytest.skip("KINO_WEIGHTS_PATH is not configured")
+@pytest.mark.heavy
+def test_real_ltx23_transformer_weights_binds_and_runs_video_forward() -> None:
+    if os.environ.get("KINO_RUN_REAL_LTX23_TRANSFORMER") != "1":
+        pytest.skip("set KINO_RUN_REAL_LTX23_TRANSFORMER=1 to build and test the full transformer")
+    checkpoint = ltx23_checkpoint()
+    if checkpoint is None:
+        pytest.skip(NO_LTX23_CHECKPOINT)
     config = checkpoint_config(checkpoint).transformer
     assert config.model_generation == "2.3"
-    cache_file, _metadata_file, _payload = transformer_cache_paths(
-        checkpoint,
-        settings.cache_dir,
-        transformer_dtype=mx.bfloat16,
-        include_audio=True,
-        constructor_identity=config.cache_identity(),
-    )
-    if not cache_artifacts_exist(cache_file):
-        pytest.skip("a compatible LTX-2.3 transformer cache is not present")
-
     model = None
     output = None
     audio_output = None
     try:
         model = LTXAVModel.from_config(config, compute_dtype=mx.bfloat16)
-        result = load_transformer_weights_cached_streaming(
+        bind_transformer(
             model,
-            checkpoint,
+            weight_loader=lambda _index: transformer_weights(checkpoint, config=config),
             transformer_dtype=mx.bfloat16,
-            cache_mode="auto",
-            cache_root=settings.cache_dir,
             include_audio=True,
             resident_blocks=1,
-            constructor_config=config,
         )
         assert model.num_blocks == 48
         assert X0Model(model).num_blocks == 48
         model.transformer_block_streamer.bind(model.transformer_blocks[0], 0)
         parameters = dict(tree_flatten(model.parameters()))
-        cached = load_cache_weights(result.cache_path)
+        cached = transformer_weights(checkpoint, config=config)
         expected = {
             key
             for key in cached

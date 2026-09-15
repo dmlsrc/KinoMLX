@@ -1,7 +1,5 @@
 """Small native video VAE architecture used by unit tests."""
 
-from __future__ import annotations
-
 from typing import Any
 
 from kinomlx.models.ltx2.video_vae.config import VideoVAEConfig

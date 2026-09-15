@@ -1,24 +1,23 @@
 """Resolve TOML, environment, and CLI input into typed GMNet invocations."""
 
-from __future__ import annotations
-
 import argparse
 from dataclasses import dataclass
 
-from kinomlx.cli._registry import config_registry
 from kinomlx.config import (
     ConfigError,
-    apply_set_overrides,
     coerce_dataclass_fields,
     dataclass_from_mapping,
     dataclass_to_mapping,
-    load_config,
-    merge_configs,
-    normalize_output_selection,
     validate_top_level,
 )
+from kinomlx.config.assembly import collect_invocation_layers
+from kinomlx.config.paths import TargetPath
+from kinomlx.config.provenance import PreparedConfig
+from kinomlx.config_rules import validate_record
+from kinomlx.model_registry import config_registry
 from kinomlx.settings import Settings
 
+from .output import GMNetOutputError, plan_gmnet_output
 from .settings import GMNetSettings
 from .types import GMNetExpandConfig, GMNetOutputConfig, GMNetRequest
 
@@ -32,24 +31,12 @@ class GMNetInvocation:
     output: GMNetOutputConfig
     request: GMNetRequest | None
     resolved_config: dict[str, object]
+    config_intent: PreparedConfig
 
-
-def _cli_layer(options: argparse.Namespace) -> dict[str, object]:
-    return config_registry().model("gmnet").cli_layer(options)
-
-
-def _validate_settings(settings: Settings) -> None:
-    try:
-        settings.validate()
-    except ValueError as exc:
-        raise ConfigError(f"[settings].{exc}") from exc
-
-
-def _validate_model_settings(settings: GMNetSettings) -> None:
-    try:
-        settings.validate()
-    except ValueError as exc:
-        raise ConfigError(f"[model_settings].{exc}") from exc
+    @property
+    def explicit_config_paths(self) -> frozenset[TargetPath]:
+        """Supplied presence comes from retained intent, never resolved-value equality."""
+        return self.config_intent.explicit
 
 
 def assemble(
@@ -61,20 +48,12 @@ def assemble(
     """Resolve defaults < env < TOML < CLI < ``--set`` exactly once."""
     source = str(options.config) if options.config is not None else "invocation"
     schema = config_registry().model("gmnet")
-    file_layer = normalize_output_selection(
-        schema.expand_layer_implications(
-            load_config(options.config) if options.config is not None else {}
-        )
+    inputs = collect_invocation_layers(
+        schema, options, base_settings=base_settings, base_model_settings=base_model_settings
     )
-    cli_layer = normalize_output_selection(schema.expand_layer_implications(_cli_layer(options)))
-    set_layer = normalize_output_selection(
-        schema.expand_layer_implications(apply_set_overrides({}, options.set_overrides))
-    )
-    explicit = merge_configs(file_layer, cli_layer, set_layer)
-    output_overrides = GMNetOutputConfig.overrides_from_env_fields("directory")
-    output_environment = {"output": output_overrides} if output_overrides else {}
-    merged = merge_configs(output_environment, file_layer, cli_layer, set_layer)
-    merged = schema.normalize_config(merged)
+    intent = inputs.state()
+    explicit = intent.values
+    merged = schema.normalize_config(intent.values)
     validate_top_level(
         merged,
         tables=schema.top_level_tables(),
@@ -91,12 +70,9 @@ def assemble(
         table="[settings]",
     )
     if base_settings is None:
-        try:
-            base_settings = Settings.from_env()
-        except (TypeError, ValueError) as exc:
-            raise ConfigError(f"environment settings: {exc}") from exc
+        base_settings = Settings()
     settings = base_settings.with_overrides(**settings_overrides)
-    _validate_settings(settings)
+    settings.validate()
 
     model_overrides = coerce_dataclass_fields(
         GMNetSettings,
@@ -104,12 +80,9 @@ def assemble(
         table="[model_settings]",
     )
     if base_model_settings is None:
-        try:
-            base_model_settings = GMNetSettings.from_env()
-        except (TypeError, ValueError) as exc:
-            raise ConfigError(f"environment model settings: {exc}") from exc
+        base_model_settings = GMNetSettings()
     model_settings = base_model_settings.with_overrides(**model_overrides)
-    _validate_model_settings(model_settings)
+    model_settings.validate()
 
     expand = dataclass_from_mapping(
         GMNetExpandConfig,
@@ -121,6 +94,7 @@ def assemble(
         merged.get("output", {}),
         table="[output]",
     )
+    validate_record(output, location="[output]")
     request = None if expand.image is None else GMNetRequest(expand.image)
 
     resolved: dict[str, object] = {
@@ -137,6 +111,7 @@ def assemble(
         output=output,
         request=request,
         resolved_config=resolved,
+        config_intent=intent,
     )
 
 
@@ -149,7 +124,6 @@ def validate_for_execution(invocation: GMNetInvocation) -> None:
         raise ConfigError(f"[expand].image does not exist: {source}")
     if source.suffix.lower() == ".exr":
         raise ConfigError("[expand].image must be a display-referred SDR still, not an EXR")
-    from .output import GMNetOutputError, plan_gmnet_output
 
     try:
         plan_gmnet_output(invocation.request, invocation.output)
@@ -158,7 +132,6 @@ def validate_for_execution(invocation: GMNetInvocation) -> None:
 
 
 __all__ = [
-    "GMNetExpandConfig",
     "GMNetInvocation",
     "assemble",
     "validate_for_execution",

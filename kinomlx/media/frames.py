@@ -1,16 +1,13 @@
 """Closeable, single-consumer frame streams."""
 
-from __future__ import annotations
-
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import suppress
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Protocol, runtime_checkable
+from typing import Protocol, runtime_checkable
+
+import mlx.core as mx
 
 from .signals import VideoSignalSpec
-
-if TYPE_CHECKING:
-    import mlx.core as mx
 
 
 @runtime_checkable
@@ -25,7 +22,7 @@ class CloseableVideoFrameStream(Protocol):
     def close(self) -> None: ...
 
 
-class VideoFrameStream(Iterator["mx.array"]):
+class VideoFrameStream(Iterator[mx.array]):
     """Lazily open a producer and validate its public frame contract.
 
     The factory is discarded on early close, so resources captured for a

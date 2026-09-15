@@ -8,7 +8,7 @@ texts. When code is borrowed verbatim, the originating file in
 license.
 
 Model weights are licensed separately and are not covered by any entry
-here; see the "Model Weights" section of the [README](./README.md).
+here; see the "Attribution and license" section of the [README](./README.md).
 
 ---
 
@@ -16,7 +16,8 @@ here; see the "Model Weights" section of the [README](./README.md).
 
 - **Source:** <https://github.com/ml-explore/mlx>
 - **Used in:** runtime dependency declared in `pyproject.toml`, plus the
-  BF16-only STEEL attention Metal resources under `kinomlx/kernels/metal/`.
+  BF16-only STEEL attention Metal resources under
+  `kinomlx/models/ltx2/kernels/metal/`.
   Those derived resources use MLX source commit
   `2165dc08d7b33258260aa849d39f087d50e62962`.
 - **License:** MIT
@@ -52,7 +53,9 @@ THE SOFTWARE.
 - **Source:** <https://github.com/ml-explore/mlx-lm>
 - **Used in:** Gemma 3 and Gemma 4 text backbones under
   `kinomlx/models/ltx2/text_encoder/`, adapted to expose the hidden states
-  consumed by LTX.
+  consumed by LTX, plus structural reference for the allocation-light Qwen
+  text graph under `kinomlx/models/krea2/text_encoder/`. The inspected source
+  revision was `77c33b14373ac70d7abd6f82af15962852adadbb`.
 - **License:** MIT
 
 ```text
@@ -87,8 +90,32 @@ SOFTWARE.
 - **Copyright:** The Hugging Face team and contributors
 - **Used in:** referenced implementation for the Gemma 3 and Gemma 4 text-encoder
   semantics (configuration schema, attention and RoPE behavior)
-  implemented under `kinomlx/models/ltx2/text_encoder/`.
+  implemented under `kinomlx/models/ltx2/text_encoder/`, plus the Qwen3-VL
+  configuration, grouped-query attention, MRoPE, text-only tensor selection,
+  and tokenizer semantics implemented under `kinomlx/models/krea2/`. The Krea
+  Qwen behavior was inspected at the Transformers 4.57.1 source revision
+  `8cb5963cc22174954e7dca2c0a3320b7dc2f4edc`.
+  The native Qwen3-VL vision graph, visual patch merging, multimodal positions,
+  and DeepStack language integration additionally reference
+  `ac3244569528944b9d5773cafea525cd8a8b63de`. The implementation uses native MLX
+  operations and separately bound, allocation-light model components.
 - **License:** Apache-2.0 (full text in the shared section below)
+
+---
+
+## Krea 2
+
+- **Source:** <https://github.com/krea-ai/krea-2>
+- **Used in:** referenced implementation for Krea 2 Raw/Turbo graph metadata,
+  native checkpoint key semantics, MMDiT topology, grouped-query attention,
+  three-axis RoPE, mask and sequence-padding behavior, modulation and residual
+  order, component selection, recipe identity, prompt layout, and hidden-state
+  selection implemented under `kinomlx/models/krea2/`. The inspected source revision was
+  `db3984fbc6e13b34c0064990fc2d95ac64d00058`.
+- **License:** Apache-2.0 (full text in the shared section below)
+
+The Krea model weights are separate external artifacts under their own terms;
+this source-code notice does not license or redistribute them.
 
 ---
 
@@ -96,12 +123,75 @@ SOFTWARE.
 
 - **Source:** <https://github.com/huggingface/diffusers>
 - **Copyright:** the LTX-2 modules are marked "Copyright 2025 The
-  Lightricks team and The HuggingFace Team"
+  Lightricks team and The HuggingFace Team"; the FLUX.2 transformer is marked
+  "Copyright 2025 Black Forest Labs, The HuggingFace Team and The InstantX Team.
+  All rights reserved."
 - **Used in:** referenced implementation for the LTX-2 model semantics
   (transformer, video and audio VAEs, vocoder, text connectors, and
   spatial latent upsampler) implemented under `kinomlx/models/ltx2/`, plus
-  the RF ancestral Euler sampler implemented under `kinomlx/samplers/`.
+  the RF ancestral Euler sampler implemented under `kinomlx/samplers/`, and
+  the Krea 2 Diffusers component packaging, canonical transformer keys,
+  equivalent MMDiT configuration and forward semantics, Qwen text selection,
+  and Qwen Image decoder topology, causal still-frame specialization,
+  normalization, attention, upsampling, and tiling behavior under
+  `kinomlx/models/krea2/`. The inspected source revision was
+  `c1bf18c92c6285334adcaac7e75ef8946a227f49`.
+  The first-frame Qwen Image encoder, spatial downsampling, and posterior-mode
+  encoding under `kinomlx/models/krea2/vae/` additionally reference
+  `bda3386ddcaa31bc2853567a95e815629c8022b7`. The encoder is a native MLX
+  implementation with allocation-light weights and a deterministic RGB-to-latent API.
+  Klein component semantics under `kinomlx/models/flux2/` reference the same
+  `bda3386ddcaa31bc2853567a95e815629c8022b7` revision: Qwen text selection,
+  VAE packing and normalization, double/single transformer blocks, four-axis
+  rotary positions, modulation, target-only reference editing, reference-only KV
+  attention and fixed-reference modulation, and the empirical
+  flow-matching Euler schedule. These are native MLX implementations; Diffusers
+  is not a runtime dependency.
 - **License:** Apache-2.0 (full text in the shared section below)
+
+---
+
+## PEFT (Hugging Face)
+
+- **Source:** <https://github.com/huggingface/peft>
+- **Copyright:** The Hugging Face team and contributors
+- **Used in:** static adapter checkpoint schemas, scaling and inference equations
+  implemented independently under `kinomlx/adapters/`. The inspected source
+  revision was `004fd0369e770dc857b895050f65bb40f7bca89c`. PEFT is not a runtime dependency.
+- **License:** Apache-2.0 (full text in the shared section below)
+
+---
+
+## PyWavelets coefficient data
+
+- **Source:** <https://github.com/PyWavelets/pywt>, through PEFT's WaveFT coefficient table.
+- **Used in:** reconstruction low-pass coefficient data in
+  `kinomlx/adapters/wavelet_filters.py`. The MLX synthesis implementation
+  does not include wavelet-toolbox code or add a PyWavelets dependency.
+- **License:** MIT
+
+```text
+Copyright (c) 2006-2012 Filip Wasilewski <http://en.ig.ma/>
+Copyright (c) 2012- The PyWavelets Developers <https://github.com/PyWavelets/pywt>
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of
+this software and associated documentation files (the "Software"), to deal in
+the Software without restriction, including without limitation the rights to
+use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software is furnished to do so,
+subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
 
 ---
 
@@ -241,10 +331,21 @@ SOFTWARE.
 
 ---
 
+## comfyui-krea2edit
+
+- **Source:** <https://github.com/lbouaraba/comfyui-krea2edit>
+- **Revision:** `86f886dac23013d88996e3a2e99093ba44d322fb`
+- **Used in:** Krea image-edit reference geometry, centered reference positions,
+  attention boosting, and grounded conversation template under
+  `kinomlx/models/krea2/`. Source-mask cropping is a KinoMLX usability adaptation.
+- **License:** Apache-2.0 (full text in the shared section below)
+
+---
+
 ## Apache License 2.0 (shared text)
 
-The complete license text below applies to the Transformers and
-diffusers entries above.
+The complete license text below applies to the Transformers, Krea 2,
+diffusers, PEFT, and comfyui-krea2edit entries above.
 
 ```text
                                  Apache License

@@ -1,12 +1,9 @@
 """Model-neutral persistence vocabulary for materialized tensor artifacts."""
 
-from __future__ import annotations
-
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Protocol, runtime_checkable
+from typing import Protocol, runtime_checkable
 
-if TYPE_CHECKING:
-    import mlx.core as mx
+import mlx.core as mx
 
 
 @dataclass(frozen=True)

@@ -1,7 +1,5 @@
 """Native MLX LTX audio VAE decoder."""
 
-from __future__ import annotations
-
 from pathlib import Path
 from typing import TypedDict
 
@@ -118,7 +116,8 @@ class AudioDecoder(nn.Module):
             raise ValueError(f"audio decoder expects {self.config.latent_mel_bins} latent mel bins")
         sink = reporter if reporter is not None else NullReporter()
         phase = "audio VAE decode"
-        sink.phase_start(phase, total=len(self.up_blocks) + 2, unit="stage")
+        # Indeterminate phase: one lazy graph, evaluated once at the result.
+        sink.phase_start(phase)
         try:
             sample = self._denormalize(sample.astype(self.compute_dtype))
             target_frames = sample.shape[2] * self.config.downsample_factor
@@ -126,16 +125,12 @@ class AudioDecoder(nn.Module):
                 target_frames = max(target_frames - (self.config.downsample_factor - 1), 1)
             x = self.conv_in(sample)
             x = self.mid_block_2(self.mid_block_1(x))
-            mx.eval(x)
-            sink.phase_advance(phase)
             for level in self.up_blocks:
                 for block in level["res_blocks"]:
                     x = block(x)
                 upsample = level["upsample"]
                 if upsample is not None:
                     x = upsample(x)
-                mx.eval(x)
-                sink.phase_advance(phase)
             x = self.conv_out(silu(self.norm_out(x)))
             x = x[
                 :,
@@ -157,7 +152,6 @@ class AudioDecoder(nn.Module):
                 )
             result = x[:, :, :target_frames, : self.config.mel_bins]
             mx.eval(result)
-            sink.phase_advance(phase)
             return result
         finally:
             sink.phase_end(phase)

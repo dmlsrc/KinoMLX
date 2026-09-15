@@ -1,25 +1,24 @@
 """Top-level LTX-2 joint audio/video velocity model."""
 
-from __future__ import annotations
-
 import logging
 from collections.abc import Callable, Sequence
 from dataclasses import replace
-from typing import TYPE_CHECKING, TypedDict, TypeGuard, Unpack, cast
+from typing import TypedDict, TypeGuard, Unpack, cast
 
 import mlx.core as mx
 
 import kinomlx._mlx_nn as nn
+from kinomlx.modeling.dtypes import resolve_float_dtype
+from kinomlx.modeling.evaluation import async_eval_arrays
 
+from ..transformer_config import TransformerConstructorConfig
 from .attention import _linear_shell
+from .execution import TransformerExecution
 from .graph import TransformerGraphSpec, transformer_parameter_shapes
 from .preprocessing import ModalityPreprocessor
-from .timestep import AdaLayerNormSingle, resolve_transformer_dtype
+from .timestep import AdaLayerNormSingle
 from .transformer import BasicAVTransformerBlock, TransformerArgs, TransformerConfig
 from .wrappers import Modality
-
-if TYPE_CHECKING:
-    from ..metadata import TransformerConstructorConfig
 
 _log = logging.getLogger(__name__)
 
@@ -180,7 +179,7 @@ class LTXAVModel(nn.Module):
             raise ValueError("compile_block_groups must be positive")
         if transformer_compile_group_size is not None and transformer_compile_group_size <= 0:
             raise ValueError("transformer_compile_group_size must be positive")
-        self.compute_dtype = resolve_transformer_dtype(compute_dtype)
+        self.compute_dtype = resolve_float_dtype(compute_dtype, owner="LTX transformer")
         self.norm_eps = norm_eps
         self.video_inner_dim = video_heads * video_head_dim
         self.audio_inner_dim = audio_heads * audio_head_dim
@@ -397,6 +396,8 @@ class LTXAVModel(nn.Module):
     def _eval_args(
         video: TransformerArgs | None,
         audio: TransformerArgs | None,
+        *,
+        wait: bool = True,
     ) -> None:
         arrays = []
         if video is not None:
@@ -404,7 +405,10 @@ class LTXAVModel(nn.Module):
         if audio is not None:
             arrays.append(audio.x)
         if arrays:
-            mx.eval(*arrays)
+            if wait:
+                mx.eval(*arrays)
+            else:
+                async_eval_arrays(arrays)
 
     def _process_blocks(
         self,
@@ -464,87 +468,112 @@ class LTXAVModel(nn.Module):
                     self._eval_args(video, audio)
             return video, audio
 
+        execution = TransformerExecution.resolve(
+            video_present=video is not None,
+            audio_present=audio is not None,
+            video_enabled=video is not None and video.enabled,
+            audio_enabled=audio is not None and audio.enabled,
+        )
+
+        def checked_group(indices: range, blocks: list[BasicAVTransformerBlock]) -> None:
+            if streamer.on_evaluated is not None:
+                streamer.on_evaluated(
+                    tuple(zip(indices, blocks, strict=True)), execution.uses_weight
+                )
+
         resident = len(self.transformer_blocks)
         if resident == 0:
             raise ValueError("streaming transformer has no resident block slots")
-        previous: list[int | None] = [None] * resident
         compile_group_size = self.transformer_compile_group_size
         compile_disabled = object.__getattribute__(
             self,
             "_transformer_block_compile_disabled",
         )
-        if compile_group_size is not None and not compile_disabled and compile_modalities_enabled:
-            compiled = object.__getattribute__(
-                self,
-                "_compiled_transformer_block_groups",
-            )
-            use_compiled = True
-            for window_start in range(0, streamer.block_count, resident):
-                window_size = min(
-                    resident,
-                    streamer.block_count - window_start,
-                )
-                for offset in range(window_size):
-                    block_index = window_start + offset
-                    streamer.bind(
-                        self.transformer_blocks[offset],
-                        block_index,
-                        evict_block_idx=previous[offset],
-                    )
-                    previous[offset] = block_index
-                for group_start in range(0, window_size, compile_group_size):
-                    blocks = self.transformer_blocks[
-                        group_start : min(
-                            group_start + compile_group_size,
-                            window_size,
-                        )
-                    ]
-                    if use_compiled:
-                        key = ("streaming", group_start, len(blocks))
-                        call = compiled.get(key)
-                        if call is None:
-                            call = _compile_transformer_block_group(blocks)
-                            compiled[key] = call
-                        try:
-                            video_packed, audio_packed = call(
-                                _pack_transformer_args(video),
-                                _pack_transformer_args(audio),
-                            )
-                            video = _unpack_transformer_args(video_packed)
-                            audio = _unpack_transformer_args(audio_packed)
-                        except (RuntimeError, TypeError, ValueError) as exc:
-                            _log.warning(
-                                "Streaming block-group compile failed; using eager blocks: %s",
-                                exc,
-                            )
-                            use_compiled = False
-                            object.__setattr__(
-                                self,
-                                "_transformer_block_compile_disabled",
-                                True,
-                            )
-                            object.__setattr__(
-                                self,
-                                "_compiled_transformer_block_groups",
-                                {},
-                            )
-                    if not use_compiled:
-                        for block in blocks:
-                            video, audio = block(video, audio)
-                    self._eval_args(video, audio)
-            return video, audio
+        use_compiled = (
+            compile_group_size is not None and not compile_disabled and compile_modalities_enabled
+        )
+        compiled = object.__getattribute__(self, "_compiled_transformer_block_groups")
+        # The resident slots form a ring of block groups. With at least two groups
+        # resident, each group's computation is dispatched without waiting, so its
+        # source reads and preparation (issued by that dispatch) overlap the previous
+        # group's computation; the wait for a group comes one group later, when its
+        # slots are about to be reused. Slot groups keep their compiled call.
+        group_size = min(
+            compile_group_size if compile_group_size is not None else max(1, resident // 2),
+            resident,
+        )
+        slot_groups = resident // group_size
+        groups = [
+            range(start, min(start + group_size, streamer.block_count))
+            for start in range(0, streamer.block_count, group_size)
+        ]
+        bound: list[int | None] = [None] * resident
 
-        for index in range(streamer.block_count):
-            slot = index % resident
-            block = streamer.bind(
-                self.transformer_blocks[slot],
-                index,
-                evict_block_idx=previous[slot],
-            )
-            previous[slot] = index
-            video, audio = block(video, audio)
-            if (index + 1) % resident == 0 or index + 1 == streamer.block_count:
+        def bind_group(position: int) -> list[BasicAVTransformerBlock]:
+            base_slot = (position % slot_groups) * group_size
+            blocks: list[BasicAVTransformerBlock] = []
+            for offset, block_index in enumerate(groups[position]):
+                slot = base_slot + offset
+                streamer.bind(
+                    self.transformer_blocks[slot],
+                    block_index,
+                    evict_block_idx=bound[slot],
+                )
+                bound[slot] = block_index
+                blocks.append(self.transformer_blocks[slot])
+            return blocks
+
+        pipelined = slot_groups >= 2
+        in_flight: (
+            tuple[
+                range, list[BasicAVTransformerBlock], TransformerArgs | None, TransformerArgs | None
+            ]
+            | None
+        ) = None
+        blocks = bind_group(0)
+        for position, group in enumerate(groups):
+            if position and not pipelined:
+                blocks = bind_group(position)
+            if use_compiled:
+                key = ("streaming", (position % slot_groups) * group_size, len(blocks))
+                call = compiled.get(key)
+                if call is None:
+                    call = _compile_transformer_block_group(blocks)
+                    compiled[key] = call
+                try:
+                    video_packed, audio_packed = call(
+                        _pack_transformer_args(video),
+                        _pack_transformer_args(audio),
+                    )
+                    video = _unpack_transformer_args(video_packed)
+                    audio = _unpack_transformer_args(audio_packed)
+                except (RuntimeError, TypeError, ValueError) as exc:
+                    _log.warning(
+                        "Streaming block-group compile failed; using eager blocks: %s",
+                        exc,
+                    )
+                    use_compiled = False
+                    object.__setattr__(self, "_transformer_block_compile_disabled", True)
+                    object.__setattr__(self, "_compiled_transformer_block_groups", {})
+            if not use_compiled:
+                for block in blocks:
+                    video, audio = block(video, audio)
+            if not pipelined:
                 self._eval_args(video, audio)
+                checked_group(group, blocks)
+                continue
+            self._eval_args(video, audio, wait=False)
+            if in_flight is not None:
+                previous_group, previous_blocks, previous_video, previous_audio = in_flight
+                self._eval_args(previous_video, previous_audio)
+                checked_group(previous_group, previous_blocks)
+            in_flight = (group, blocks, video, audio)
+            if position + 1 < len(groups):
+                blocks = bind_group(position + 1)
+        if in_flight is not None:
+            last_group, last_blocks, last_video, last_audio = in_flight
+            self._eval_args(last_video, last_audio)
+            checked_group(last_group, last_blocks)
         return video, audio
 
     def _output(
@@ -608,17 +637,13 @@ class LTXAVModel(nn.Module):
         return video_output, audio_output
 
     def close_streamer(self) -> None:
-        """Release a cache-backed block streamer without owning other models."""
+        """Release a source-backed block streamer without owning other models."""
         if self.transformer_block_streamer is not None:
             self.transformer_block_streamer.close()
             self.transformer_block_streamer = None
         object.__setattr__(self, "_compiled_transformer_block_groups", {})
 
 
-LTXModel = LTXAVModel
-
 __all__ = [
     "LTXAVModel",
-    "LTXModel",
-    "resolve_transformer_dtype",
 ]

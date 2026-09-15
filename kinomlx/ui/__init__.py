@@ -22,6 +22,7 @@ from kinomlx.ui.logging import (
     configure_logging,
     configure_logging_from_settings,
     configure_machine_output,
+    console_message_width,
 )
 
 __all__ = [
@@ -31,6 +32,7 @@ __all__ = [
     "configure_logging",
     "configure_logging_from_settings",
     "configure_machine_output",
+    "console_message_width",
     "get_console",
     "log_phase_summary",
     "make_progress",

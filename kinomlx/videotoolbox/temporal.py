@@ -18,8 +18,6 @@ Cleanly handles arbitrary float fps both sides:
              (caller should detect this and skip the stage entirely).
 """
 
-from __future__ import annotations
-
 import logging
 import math
 from collections.abc import Iterator

@@ -1,7 +1,5 @@
 """Raw condition sources and bounded encoder preparation."""
 
-from __future__ import annotations
-
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
@@ -131,25 +129,15 @@ def prepare_conditions(
             raise ValueError(
                 f"condition frame {source.frame_index} is outside {geometry.frames} frames"
             )
-        if source.hdr_authoring is None:
-            latent = encode_image(
-                source.path,
-                encoder,
-                width=geometry.width,
-                height=geometry.height,
-                compute_dtype=compute_dtype,
-                reporter=reporter,
-            )
-        else:
-            latent = encode_image(
-                source.path,
-                encoder,
-                width=geometry.width,
-                height=geometry.height,
-                compute_dtype=compute_dtype,
-                hdr_authoring=source.hdr_authoring,
-                reporter=reporter,
-            )
+        latent = encode_image(
+            source.path,
+            encoder,
+            width=geometry.width,
+            height=geometry.height,
+            compute_dtype=compute_dtype,
+            hdr_authoring=source.hdr_authoring,
+            reporter=reporter,
+        )
         if source.frame_index == 0:
             prepared.append(
                 VideoConditionByLatentIndex(

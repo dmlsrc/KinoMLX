@@ -7,8 +7,6 @@ in a frame (uint8 RGB or fp16 RGBA) and gets back a destination buffer
 ready to feed straight into AVAssetWriter.
 """
 
-from __future__ import annotations
-
 import logging
 import os
 import sys
@@ -86,7 +84,7 @@ def _suppress_native_stderr(*, enabled: bool = True) -> Iterator[None]:
         def _cleanup(label: str, operation: Callable[[int], None], fd: int) -> None:
             try:
                 operation(fd)
-            except BaseException as exc:  # noqa: BLE001 - preserved below
+            except BaseException as exc:
                 cleanup_failures.append((label, exc))
 
         try:

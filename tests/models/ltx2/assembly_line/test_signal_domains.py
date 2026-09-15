@@ -1,7 +1,5 @@
 """Signal-domain separation and current SDR-terminal rejection contracts."""
 
-from __future__ import annotations
-
 import pytest
 
 from kinomlx.errors import KinoMLXError

@@ -18,10 +18,8 @@ False positives are cheap (one frame of "no prior-frame context", visually
 invisible). False negatives let a cut ghost - tune the threshold down.
 """
 
-from __future__ import annotations
-
 import math
-from typing import cast
+from typing import ClassVar, cast
 
 import mlx.core as mx
 
@@ -74,7 +72,7 @@ class CutDetector:
     Always returns False on the first frame (no previous to compare).
     """
 
-    _DEFAULT_THRESHOLDS = {
+    _DEFAULT_THRESHOLDS: ClassVar[dict[str, float]] = {
         "off": 0.0,
         "simple": 0.25,
         "hist": 0.5,

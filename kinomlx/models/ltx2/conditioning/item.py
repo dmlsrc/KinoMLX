@@ -1,11 +1,8 @@
 """Protocol for one latent-state conditioning operation."""
 
-from __future__ import annotations
-
 from typing import Protocol
 
-from kinomlx.types import LatentState
-
+from ..types import LatentState
 from .tools import VideoLatentTools
 
 

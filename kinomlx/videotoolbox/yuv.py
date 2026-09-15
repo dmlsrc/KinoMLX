@@ -6,8 +6,6 @@ RGBAHalf buffers. Converting explicitly gives every RGBAHalf path the same
 BT.709 encoder feed.
 """
 
-from __future__ import annotations
-
 from collections.abc import Callable
 from functools import cache
 from typing import cast

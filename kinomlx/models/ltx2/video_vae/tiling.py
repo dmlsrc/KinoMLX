@@ -1,15 +1,15 @@
 """Memory-bounded tiled decoding for the native LTX video VAE."""
 
-from __future__ import annotations
-
 import gc
 import logging
+import math
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from typing import Protocol
 
 import mlx.core as mx
 
+from kinomlx.modeling.memory import capture_decode_memory_budget
 from kinomlx.reporting import NullReporter, Reporter
 from kinomlx.samplers.noise import NoiseStreamState
 from kinomlx.types import DEFAULT_NOISE_BACKEND, NoiseBackend
@@ -41,25 +41,6 @@ def _strict_int(value: object, *, field: str, minimum: int) -> int:
     return value
 
 
-def detect_system_memory_gb() -> float | None:
-    """Return total unified memory in decimal GB when MLX reports it."""
-    try:
-        return float(mx.device_info()["memory_size"]) / (1000**3)
-    except AttributeError, KeyError, RuntimeError, TypeError, ValueError:
-        return None
-
-
-def default_vae_decode_budget_gb(total_memory_gb: float | None = None) -> float:
-    """Choose a conservative native-VAE decode budget from unified memory."""
-    if total_memory_gb is None:
-        total_memory_gb = detect_system_memory_gb()
-    if total_memory_gb is None:
-        return 12.0
-    if total_memory_gb <= 0:
-        raise ValueError("total_memory_gb must be positive")
-    return max(6.0, min(16.0, total_memory_gb * 0.5))
-
-
 def _estimate_native_conv3d_peak_gb(
     height: int,
     width: int,
@@ -70,10 +51,10 @@ def _estimate_native_conv3d_peak_gb(
     """Estimate incremental Conv3d peak above the VAE-entry live set.
 
     The Phase D MLX 0.32.1 sweep covered 512x320, 768x448, and 1024x576
-    at 33 and 65 decoded frames. ``4.2 + 0.36 * frames * area_scale`` is
-    a conservative upper envelope for all six measured BF16 points. FP32
-    doubles that activation/workspace estimate; tiled output assembly is
-    accounted separately in its fixed FP32 dtype.
+    at 33 and 65 decoded frames. The 121-frame 768x448 MLX 0.32.2 check
+    reached 30.02 GB above the entry live set; a coefficient of 0.38 also
+    covers that longer decode. FP32 doubles the activation/workspace
+    estimate; tiled output assembly is accounted separately in FP32.
     """
     if height <= 0 or width <= 0 or tile_frames <= 0:
         raise ValueError("decode dimensions must be positive")
@@ -86,7 +67,7 @@ def _estimate_native_conv3d_peak_gb(
     else:
         raise ValueError(f"unsupported native Conv3d compute dtype {compute_dtype}")
     area_scale = (height * width) / (1024 * 576)
-    return (4.2 + 0.36 * tile_frames * area_scale) * dtype_scale
+    return (4.2 + 0.38 * tile_frames * area_scale) * dtype_scale
 
 
 def _estimate_tiled_assembly_gb(
@@ -104,6 +85,28 @@ def _estimate_tiled_assembly_gb(
     # one FP32 weight plane beside each three-channel decoded buffer.
     channels = 4 if spatial_tiled else 3
     return height * width * tile_frames * channels * 4 * 4 / 1_000_000_000
+
+
+def _estimate_diffusion_peak_gb(
+    height: int,
+    width: int,
+    frames: int,
+    *,
+    compute_dtype: mx.Dtype,
+) -> float:
+    """Bound full-resolution feature liveness plus attention/FF scratch.
+
+    Stage 5 carries 256 channels at quarter spatial resolution. Eight live
+    feature-sized buffers cover context, residuals, normalization, and the
+    temporal QKV partition; 1 GiB covers the bounded attention/FF workspaces.
+    Include the decoder's latent alignment and two trailing context frames.
+    """
+    if compute_dtype not in (mx.bfloat16, mx.float16, mx.float32):
+        raise ValueError(f"unsupported diffusion VAE compute dtype {compute_dtype}")
+    itemsize = 4 if compute_dtype == mx.float32 else 2
+    padded_frames = math.ceil(frames / 8) * 8 + 16
+    feature_bytes = padded_frames * math.ceil(height / 4) * math.ceil(width / 4) * 256 * itemsize
+    return (8 * feature_bytes + 1024**3 * (itemsize // 2)) / 1_000_000_000
 
 
 def compute_trapezoidal_mask_1d(
@@ -226,14 +229,6 @@ class TilingConfig:
         )
 
     @classmethod
-    def default_diffusion(cls) -> TilingConfig:
-        """Return the diffusion decoder's 768/64 and 80/24 tile plan."""
-        return cls(
-            spatial_config=SpatialTilingConfig(768, 64),
-            temporal_config=TemporalChunkConfig(80, 24),
-        )
-
-    @classmethod
     def auto_diffusion(
         cls,
         height: int,
@@ -241,16 +236,64 @@ class TilingConfig:
         num_frames: int,
         *,
         memory_budget_gb: float | None = None,
+        compute_dtype: mx.Dtype = mx.bfloat16,
     ) -> TilingConfig | None:
-        """Select bounded stage-4/stage-5 tiles for the diffusion decoder."""
+        """Choose full or stage-tiled diffusion decode from current headroom."""
         height = _strict_int(height, field="height", minimum=1)
         width = _strict_int(width, field="width", minimum=1)
         num_frames = _strict_int(num_frames, field="num_frames", minimum=1)
-        if memory_budget_gb is not None and memory_budget_gb <= 0:
+        # The official decoder pads to a 3x7x7 latent before its first stage.
+        # Planning tiny requested images must account for that working grid.
+        height = max(224, math.ceil(height / 32) * 32)
+        width = max(224, math.ceil(width / 32) * 32)
+        num_frames = max(17, num_frames)
+        budget_gb = (
+            capture_decode_memory_budget().available_gb
+            if memory_budget_gb is None
+            else memory_budget_gb
+        )
+        if not math.isfinite(budget_gb) or budget_gb <= 0:
             raise ValueError("memory_budget_gb must be positive")
-        if height <= 768 and width <= 768 and num_frames <= 80:
+        full_peak = _estimate_diffusion_peak_gb(
+            height, width, num_frames, compute_dtype=compute_dtype
+        )
+        if full_peak <= budget_gb:
             return None
-        return cls.default_diffusion()
+        # Stage 1-3 context remains resident even when later stages are tiled.
+        context_gb = height * width * (num_frames + 16) * 8 / 1_000_000_000
+        if compute_dtype == mx.float32:
+            context_gb *= 2
+        temporal_candidates = (None, 512, 256, 128, 80, 64, 40, 32, 16)
+        spatial_candidates = (None, 1024, 768, 512, 256, 128, 64)
+        for spatial_size in spatial_candidates:
+            if spatial_size is not None and spatial_size >= max(height, width):
+                continue
+            tile_height = height if spatial_size is None else min(height, spatial_size)
+            tile_width = width if spatial_size is None else min(width, spatial_size)
+            for temporal_size in temporal_candidates:
+                if temporal_size is not None and temporal_size >= num_frames:
+                    continue
+                tile_frames = num_frames if temporal_size is None else temporal_size
+                peak = _estimate_diffusion_peak_gb(
+                    tile_height, tile_width, tile_frames, compute_dtype=compute_dtype
+                )
+                peak += context_gb + _estimate_tiled_assembly_gb(
+                    height, width, tile_frames, spatial_tiled=spatial_size is not None
+                )
+                if peak > budget_gb:
+                    continue
+                temporal = (
+                    None
+                    if temporal_size is None
+                    else TemporalChunkConfig(temporal_size, min(24, temporal_size - 8))
+                )
+                spatial = (
+                    None
+                    if spatial_size is None
+                    else SpatialTilingConfig(spatial_size, min(64, spatial_size - 32))
+                )
+                return cls(spatial_config=spatial, temporal_config=temporal)
+        raise MemoryError("No diffusion VAE tile fits the available decode memory budget")
 
     @classmethod
     def auto(
@@ -258,7 +301,6 @@ class TilingConfig:
         height: int,
         width: int,
         num_frames: int,
-        total_memory_gb: float | None = None,
         memory_budget_gb: float | None = None,
         compute_dtype: mx.Dtype = mx.bfloat16,
     ) -> TilingConfig | None:
@@ -267,7 +309,6 @@ class TilingConfig:
             height,
             width,
             num_frames,
-            total_memory_gb=total_memory_gb,
             memory_budget_gb=memory_budget_gb,
             compute_dtype=compute_dtype,
         )
@@ -279,7 +320,6 @@ class TilingConfig:
         width: int,
         num_frames: int,
         *,
-        total_memory_gb: float | None = None,
         memory_budget_gb: float | None = None,
         compute_dtype: mx.Dtype = mx.bfloat16,
     ) -> TilingConfig | None:
@@ -290,9 +330,9 @@ class TilingConfig:
         budget_gb = (
             memory_budget_gb
             if memory_budget_gb is not None
-            else default_vae_decode_budget_gb(total_memory_gb)
+            else capture_decode_memory_budget().available_gb
         )
-        if budget_gb <= 0:
+        if not math.isfinite(budget_gb) or budget_gb <= 0:
             raise ValueError("memory_budget_gb must be positive")
         full_peak_gb = _estimate_native_conv3d_peak_gb(
             height,
@@ -303,55 +343,46 @@ class TilingConfig:
         if full_peak_gb <= budget_gb:
             return None
 
-        temporal_candidates = (256, 128, 64, 40, 32)
-        for tile_frames in temporal_candidates:
-            if tile_frames >= num_frames:
+        for spatial_tile in (None, 512, 256, 128, 64):
+            if spatial_tile is not None and spatial_tile >= max(height, width):
                 continue
-            peak_gb = _estimate_native_conv3d_peak_gb(
-                height,
-                width,
-                tile_frames,
-                compute_dtype=compute_dtype,
-            ) + _estimate_tiled_assembly_gb(
-                height,
-                width,
-                tile_frames,
-                spatial_tiled=False,
+            effective_h = height if spatial_tile is None else min(height, spatial_tile)
+            effective_w = width if spatial_tile is None else min(width, spatial_tile)
+            temporal_candidates = (
+                (256, 128, 64, 40, 32, 16)
+                if spatial_tile is None
+                else (None, 256, 128, 64, 40, 32, 16)
             )
-            if peak_gb <= budget_gb:
-                return cls.temporal_only(tile_size=tile_frames, overlap=8)
-
-        spatial_tile = 512
-        spatial_overlap = 64
-        effective_h = min(height, spatial_tile)
-        effective_w = min(width, spatial_tile)
-        for tile_frames in temporal_candidates:
-            if tile_frames >= num_frames:
-                continue
-            peak_gb = _estimate_native_conv3d_peak_gb(
-                effective_h,
-                effective_w,
-                tile_frames,
-                compute_dtype=compute_dtype,
-            ) + _estimate_tiled_assembly_gb(
-                height,
-                width,
-                tile_frames,
-                spatial_tiled=True,
-            )
-            if peak_gb <= budget_gb:
-                return cls(
-                    spatial_config=SpatialTilingConfig(
-                        spatial_tile,
-                        spatial_overlap,
-                    ),
-                    temporal_config=TemporalChunkConfig(tile_frames, 8),
+            for tile_frames in temporal_candidates:
+                if tile_frames is not None and tile_frames >= num_frames:
+                    continue
+                # A temporal tile can retain one leading causal-context frame.
+                work_frames = (
+                    num_frames if tile_frames is None else min(num_frames, tile_frames + 1)
                 )
-
-        return cls(
-            spatial_config=SpatialTilingConfig(spatial_tile, spatial_overlap),
-            temporal_config=TemporalChunkConfig(32, 8),
-        )
+                peak_gb = _estimate_native_conv3d_peak_gb(
+                    effective_h,
+                    effective_w,
+                    work_frames,
+                    compute_dtype=compute_dtype,
+                ) + _estimate_tiled_assembly_gb(
+                    height,
+                    width,
+                    work_frames,
+                    spatial_tiled=spatial_tile is not None,
+                )
+                if peak_gb <= budget_gb:
+                    return cls(
+                        spatial_config=(
+                            None
+                            if spatial_tile is None
+                            else SpatialTilingConfig(spatial_tile, min(64, spatial_tile - 32))
+                        ),
+                        temporal_config=(
+                            None if tile_frames is None else TemporalChunkConfig(tile_frames, 8)
+                        ),
+                    )
+        raise MemoryError("No Conv3d VAE tile fits the available decode memory budget")
 
     @classmethod
     def temporal_only(
@@ -963,6 +994,4 @@ __all__ = [
     "compute_trapezoidal_mask_1d",
     "decode_single_pass",
     "decode_streaming",
-    "default_vae_decode_budget_gb",
-    "detect_system_memory_gb",
 ]

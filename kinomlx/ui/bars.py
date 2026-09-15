@@ -26,11 +26,9 @@ Usage::
             prog.advance(stage1)
 """
 
-from __future__ import annotations
-
 import logging
 import math
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from typing import Protocol, cast
 
@@ -55,6 +53,14 @@ _log = logging.getLogger(__name__)
 _ETA_ANCHOR_COMPLETED = "_kinomlx_eta_anchor_completed"
 _ETA_ANCHOR_ELAPSED = "_kinomlx_eta_anchor_elapsed"
 _ETA_SECONDS_PER_UNIT = "_kinomlx_eta_seconds_per_unit"
+
+
+def _plural_unit(unit: str) -> str:
+    if unit == "it":
+        return "iterations"
+    if unit.endswith("s"):
+        return unit
+    return f"{unit}s"
 
 
 class _TaskFieldUpdater(Protocol):
@@ -121,7 +127,7 @@ class WallClockPaceColumn(ProgressColumn):
         unit = task.fields.get("unit", "it")
         if sec_per_unit >= 1.0:
             return Text(f"{sec_per_unit:>6.1f} s/{unit}")
-        return Text(f"{1.0 / sec_per_unit:>6.1f} {unit}/s")
+        return Text(f"{1.0 / sec_per_unit:>6.1f} {_plural_unit(unit)}/s")
 
 
 class WallClockRemainingColumn(ProgressColumn):
@@ -226,6 +232,7 @@ def log_phase_summary(
     *,
     logger: logging.Logger | None = None,
     peak_memory_bytes: int | None = None,
+    elapsed_seconds: float | None = None,
 ) -> None:
     """Log one task's time, progress, pace, and optional peak memory.
 
@@ -239,17 +246,19 @@ def log_phase_summary(
     out = logger or _log
     iters = int(task.completed)
     unit = task.fields.get("unit", "it")
-    elapsed = task.elapsed or 0.0
+    elapsed = (task.elapsed or 0.0) if elapsed_seconds is None else elapsed_seconds
+    duration = f"{elapsed:.1f}s" if elapsed >= 1.0 else f"{elapsed * 1000:.1f}ms"
     memory = (
         ""
         if peak_memory_bytes is None
         else f", peak memory {_human_size(max(0, peak_memory_bytes))}"
     )
     if iters <= 0:
-        out.info(f"{task.description}: completed in {elapsed:.1f}s{memory}")
+        out.info(f"{task.description}: completed in {duration}{memory}")
         return
     out.info(
-        f"{task.description}: {iters} {unit} in {elapsed:.1f}s "
+        f"{task.description}: {iters} "
+        f"{unit if iters == 1 else _plural_unit(unit)} in {duration} "
         f"({elapsed / iters:.3f}s/{unit}){memory}"
     )
 
@@ -271,18 +280,23 @@ class RichReporter:
         *,
         progress: Progress | None = None,
         disable: bool | None = None,
+        phase_labels: Mapping[str, str] | None = None,
     ) -> None:
         if progress is not None and disable is not None:
             raise ValueError("pass either progress or disable, not both")
         self._progress = progress if progress is not None else make_progress(disable=disable)
+        self._phase_labels = dict(phase_labels or {})
         self._tasks: dict[str, TaskID] = {}
         self._phase_peaks: dict[str, int] = {}
+        self._aggregate_elapsed: dict[str, float] = {}
+        self._aggregate_started: dict[str, float] = {}
 
     def __enter__(self) -> RichReporter:
         self._progress.start()
         return self
 
     def __exit__(self, *_exc_info: object) -> None:
+        self._flush_aggregates()
         self._progress.stop()
 
     def phase_start(
@@ -291,30 +305,57 @@ class RichReporter:
         *,
         total: float | None = None,
         unit: str = "it",
+        aggregate_total: float | None = None,
     ) -> None:
+        if aggregate_total is not None or phase in self._aggregate_elapsed:
+            self._aggregate_elapsed.setdefault(phase, 0.0)
+            self._aggregate_started[phase] = self._progress.get_time()
+            if phase in self._tasks:
+                if aggregate_total is None and total is not None:
+                    task = next(t for t in self._progress.tasks if t.id == self._tasks[phase])
+                    self._progress.update(task.id, total=(task.total or 0) + total)
+                return
+            total = aggregate_total
         self._phase_peaks.pop(phase, None)
-        self._tasks[phase] = self._progress.add_task(phase, total=total, unit=unit)
+        self._tasks[phase] = self._progress.add_task(
+            self._phase_labels.get(phase, phase), total=total, unit=unit
+        )
+
+    def _flush_aggregates(self) -> None:
+        for phase, elapsed in list(self._aggregate_elapsed.items()):
+            task_id = self._tasks.pop(phase)
+            peak = self._phase_peaks.pop(phase, None)
+            self._progress.stop_task(task_id)
+            try:
+                log_phase_summary(
+                    self._progress, task_id, peak_memory_bytes=peak, elapsed_seconds=elapsed
+                )
+            finally:
+                self._progress.remove_task(task_id)
+        self._aggregate_elapsed.clear()
+        self._aggregate_started.clear()
 
     def phase_advance(self, phase: str, advance: float = 1.0) -> None:
+        if phase not in self._aggregate_elapsed:
+            self._flush_aggregates()
         task_id = self._tasks.get(phase)
         if task_id is not None:
             self._progress.advance(task_id, advance)
 
     def phase_end(self, phase: str) -> None:
+        if phase in self._aggregate_elapsed:
+            started = self._aggregate_started.pop(phase, None)
+            if started is not None:
+                self._aggregate_elapsed[phase] += self._progress.get_time() - started
+            return
+        self._flush_aggregates()
         task_id = self._tasks.pop(phase, None)
         peak_memory_bytes = self._phase_peaks.pop(phase, None)
         if task_id is not None:
             self._progress.stop_task(task_id)
             try:
-                log_phase_summary(
-                    self._progress,
-                    task_id,
-                    peak_memory_bytes=peak_memory_bytes,
-                )
+                log_phase_summary(self._progress, task_id, peak_memory_bytes=peak_memory_bytes)
             finally:
-                # Rich retains tasks until explicitly removed. Reporter phases
-                # are live state, while the INFO summary is their durable
-                # history, so completed rows must leave the active stack.
                 self._progress.remove_task(task_id)
 
     def phase_peak_memory(self, phase: str, peak_memory_bytes: int) -> None:

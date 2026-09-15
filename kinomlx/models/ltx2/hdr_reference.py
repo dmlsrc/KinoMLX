@@ -1,7 +1,5 @@
 """SDR reference-video preprocessing for the HDR IC-LoRA recipe."""
 
-from __future__ import annotations
-
 from pathlib import Path
 
 import mlx.core as mx

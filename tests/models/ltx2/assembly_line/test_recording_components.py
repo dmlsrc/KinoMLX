@@ -1,7 +1,5 @@
 """Recording provider and default/injected call-graph contracts."""
 
-from __future__ import annotations
-
 from ._contracts import (
     AdapterSpec,
     ContractResources,

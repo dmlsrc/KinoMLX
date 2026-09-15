@@ -1,7 +1,5 @@
 """Native scene-linear RGB to BT.2020/HLG P010 conversion."""
 
-from __future__ import annotations
-
 import Foundation
 import mlx.core as mx
 import objc

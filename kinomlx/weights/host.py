@@ -1,12 +1,42 @@
 """Shared CLI host services for generic and model-specific converters."""
 
-from __future__ import annotations
-
 import argparse
-from contextlib import ExitStack
 
-from kinomlx.reporting import Reporter, TimingReporter
-from kinomlx.settings import Settings, settings_from_args
+from kinomlx.settings import Settings, add_argparse_args, settings_from_args
+
+
+def add_conversion_arguments(parser: argparse.ArgumentParser) -> None:
+    """Expose infrastructure controls used by conversion."""
+    add_argparse_args(parser, skip={"check_adapter_weights"})
+
+
+def add_checkpoint_safety_arguments(parser: argparse.ArgumentParser) -> None:
+    """Expose the scan and overwrite decisions every converter has to offer."""
+    parser.add_argument(
+        "--allow-suspicious-globals",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Proceed past static-scan findings for a trusted file; the restricted "
+            "unpickler still refuses non-allowlisted globals."
+        ),
+    )
+    parser.add_argument(
+        "--force",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Replace an existing regular output; otherwise refuse before loading.",
+    )
+
+
+def bootstrap_json_output(options: object) -> bool:
+    """Select machine output before settings compose, so errors can honor it."""
+    try:
+        base = Settings.from_env_fields("json_output")
+    except TypeError, ValueError:
+        base = Settings()
+    explicit = getattr(options, "json_output", None)
+    return base.json_output if explicit is None else bool(explicit)
 
 
 def resolve_conversion_settings(options: argparse.Namespace) -> Settings:
@@ -16,40 +46,6 @@ def resolve_conversion_settings(options: argparse.Namespace) -> Settings:
     return settings
 
 
-def conversion_reporter(stack: ExitStack, settings: Settings) -> TimingReporter:
-    """Build the normal Rich, signpost, timing, and allocator reporter stack."""
-    from kinomlx.debug import create_mlx_memory_sampler
-    from kinomlx.ui import RichReporter
-
-    presentation = stack.enter_context(RichReporter(disable=settings.quiet))
-    presentation_reporter: Reporter = presentation
-    if settings.profile_signposts:
-        from kinomlx.profiling import SignpostReporter
-
-        presentation_reporter = stack.enter_context(
-            SignpostReporter(
-                presentation,
-                log_path=settings.profile_signpost_log,
-                build_dir=settings.cache_dir / "_native" / "signpost",
-            )
-        )
-    return TimingReporter(
-        presentation_reporter,
-        memory_sampler=create_mlx_memory_sampler(),
-    )
-
-
-def apply_mlx_cache_limit(settings: Settings) -> None:
-    """Apply the resolved allocator cache limit immediately before conversion."""
-    if settings.mlx_cache_limit_gb is None:
-        return
-    import mlx.core as mx
-
-    mx.set_cache_limit(int(settings.mlx_cache_limit_gb * 1024**3))
-
-
 __all__ = [
-    "apply_mlx_cache_limit",
-    "conversion_reporter",
     "resolve_conversion_settings",
 ]

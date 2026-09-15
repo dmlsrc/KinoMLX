@@ -1,7 +1,5 @@
 """HDR IC-LoRA reference preprocessing and appended-token semantics."""
 
-from __future__ import annotations
-
 import mlx.core as mx
 import pytest
 

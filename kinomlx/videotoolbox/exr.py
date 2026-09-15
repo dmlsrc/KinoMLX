@@ -1,7 +1,5 @@
 """Native half-float OpenEXR frame I/O through ImageIO."""
 
-from __future__ import annotations
-
 import json
 from pathlib import Path
 

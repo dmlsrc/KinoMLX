@@ -1,7 +1,5 @@
 """Checkpoint-derived LTX audio VAE architecture configuration."""
 
-from __future__ import annotations
-
 import json
 from dataclasses import dataclass
 from pathlib import Path

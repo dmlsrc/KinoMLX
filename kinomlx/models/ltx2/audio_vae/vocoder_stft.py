@@ -1,7 +1,5 @@
 """Checkpoint-backed causal STFT used by LTX bandwidth extension."""
 
-from __future__ import annotations
-
 import mlx.core as mx
 
 import kinomlx._mlx_nn as nn

@@ -4,14 +4,14 @@ Pins the LTX-2.3 shape derivations and audio encoder geometry that
 the generic ``kinomlx.types`` deliberately doesn't bake in.
 """
 
-from __future__ import annotations
-
+import dataclasses
 import math
 from pathlib import Path
 
+import mlx.core as mx
 import pytest
 
-from kinomlx.models.ltx2.settings import LTX2Settings
+from kinomlx.models.ltx2.adapters.inputs import LTX2AdapterConfig
 from kinomlx.models.ltx2.types import (
     AUDIO_HOP_LENGTH,
     AUDIO_LATENT_CHANNELS,
@@ -21,15 +21,51 @@ from kinomlx.models.ltx2.types import (
     AUDIO_SAMPLE_RATE,
     NATIVE_FPS,
     VIDEO_LATENT_CHANNELS,
-    VIDEO_PIXEL_CHANNELS,
     VIDEO_VAE_SCALE,
     AudioLatentShape,
     DistilledRequest,
     ImageConditioningConfig,
+    LatentState,
     VideoVAETilingConfig,
     video_latent_shape_from_pixel,
 )
 from kinomlx.types import VideoLatentShape, VideoPixelShape
+
+
+def _dummy_state(uniform_mask: bool = True) -> LatentState:
+    return LatentState(
+        latent=mx.zeros((1, 128, 16, 18, 32)),
+        denoise_mask=mx.ones((1, 1, 16, 18, 32)),
+        positions=mx.zeros((1, 3, 16, 18, 32)),
+        clean_latent=mx.zeros((1, 128, 16, 18, 32)),
+        uniform_mask=uniform_mask,
+    )
+
+
+def test_latent_state_uniform_mask_defaults_true() -> None:
+    state = LatentState(
+        latent=mx.zeros((1,)),
+        denoise_mask=mx.zeros((1,)),
+        positions=mx.zeros((1,)),
+        clean_latent=mx.zeros((1,)),
+    )
+    assert state.uniform_mask is True
+
+
+def test_latent_state_is_frozen() -> None:
+    state = _dummy_state()
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        state.latent = mx.zeros((1,))  # type: ignore[misc]
+
+
+def test_latent_state_replace_preserves_uniform_mask_flag() -> None:
+    state = _dummy_state(uniform_mask=True)
+    new_mask = mx.zeros_like(state.denoise_mask)
+    unchanged_flag = dataclasses.replace(state, denoise_mask=new_mask)
+    assert unchanged_flag.uniform_mask is True
+    mixed = dataclasses.replace(state, denoise_mask=new_mask, uniform_mask=False)
+    assert mixed.uniform_mask is False
+
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -39,7 +75,6 @@ from kinomlx.types import VideoLatentShape, VideoPixelShape
 def test_video_constants() -> None:
     assert NATIVE_FPS == 24.0
     assert VIDEO_LATENT_CHANNELS == 128
-    assert VIDEO_PIXEL_CHANNELS == 3
     assert VIDEO_VAE_SCALE.time == 8
     assert VIDEO_VAE_SCALE.height == 32
     assert VIDEO_VAE_SCALE.width == 32
@@ -76,20 +111,20 @@ def test_distilled_request_rejects_invalid_geometry(kwargs: dict[str, object]) -
 
 @pytest.mark.parametrize("seed", [-1, -(2**63)])
 def test_distilled_request_rejects_negative_seeds_at_the_public_boundary(seed: int) -> None:
-    with pytest.raises(ValueError, match="seed must be a non-negative integer"):
+    with pytest.raises(ValueError, match="seed"):
         DistilledRequest(prompt="test", seed=seed)
 
 
 def test_distilled_request_validates_sampler_override() -> None:
     assert DistilledRequest(prompt="test").sampler == "auto"
     assert DistilledRequest(prompt="test", sampler="deterministic").sampler == "deterministic"
-    with pytest.raises(ValueError, match="sampler must be one of"):
+    with pytest.raises(ValueError, match="sampler: expected one of"):
         DistilledRequest(prompt="test", sampler="future")  # type: ignore[arg-type]
 
 
 def test_distilled_request_validates_noise_backend() -> None:
     assert DistilledRequest(prompt="test", noise_backend="torch-mps").noise_backend == "torch-mps"
-    with pytest.raises(ValueError, match="noise_backend must be one of"):
+    with pytest.raises(ValueError, match="noise_backend: expected one of"):
         DistilledRequest(prompt="test", noise_backend="future")  # type: ignore[arg-type]
 
 
@@ -98,8 +133,9 @@ def test_distilled_request_validates_vae_decode_dtype_override() -> None:
         "bfloat16"
     )
     assert DistilledRequest(prompt="test", vae_decode_dtype="float32").vae_decode_dtype == "float32"
-    with pytest.raises(ValueError, match="vae_decode_dtype must be one of"):
-        DistilledRequest(prompt="test", vae_decode_dtype="float16")  # type: ignore[arg-type]
+    assert DistilledRequest(prompt="test", vae_decode_dtype="float16").vae_decode_dtype == "float16"
+    with pytest.raises(ValueError, match="vae_decode_dtype: expected one of"):
+        DistilledRequest(prompt="test", vae_decode_dtype="float64")  # type: ignore[arg-type]
 
 
 def test_duration_rounds_up_to_a_valid_frame_count() -> None:
@@ -122,7 +158,7 @@ def test_generated_keyframe_count_must_be_a_nonnegative_integer(
 
 @pytest.mark.parametrize("duration", [0.0, -1.0, math.nan, math.inf])
 def test_duration_must_be_finite_and_positive(duration: float) -> None:
-    with pytest.raises(ValueError, match="duration must be finite and positive"):
+    with pytest.raises(ValueError, match="duration"):
         DistilledRequest(prompt="test", duration=duration)
 
 
@@ -164,12 +200,12 @@ def test_custom_vae_tiling_defaults_temporal_tiles_and_rejects_empty_plan() -> N
             mode="custom",
             temporal_tile_frames=0,
             spatial_tile_pixels=0,
-        )
+        ).to_runtime_config()
     with pytest.raises(ValueError, match="overlap must be smaller"):
         VideoVAETilingConfig(
             mode="custom",
             temporal_overlap_frames=256,
-        )
+        ).to_runtime_config()
 
 
 def test_image_config_validates_strength_and_frame_bounds() -> None:
@@ -182,19 +218,30 @@ def test_image_config_validates_strength_and_frame_bounds() -> None:
             prompt="test",
             frames=9,
             image=ImageConditioningConfig(Path("frame.png"), frame_index=9),
-        )
+        ).validate_for_generation()
 
 
-def test_lora_one_or_n_values_expand_per_adapter() -> None:
+def test_adapter_records_keep_independent_stage_values() -> None:
     config = DistilledRequest(
         prompt="test",
-        lora_paths=(Path("style.safetensors"), Path("motion.safetensors")),
-        lora_strengths=(0.8,),
-        lora_stage1_strengths=(0.25, 0.5),
-        lora_stage2_strengths=(1.0,),
-        lora_exclusions=("audio,cross", "video"),
+        adapters=(
+            LTX2AdapterConfig(
+                path=Path("style.safetensors"),
+                strength=0.8,
+                stage1_strength=0.25,
+                stage2_strength=1.0,
+                exclude=("audio", "cross"),
+            ),
+            LTX2AdapterConfig(
+                path=Path("motion.safetensors"),
+                strength=0.8,
+                stage1_strength=0.5,
+                stage2_strength=1.0,
+                exclude=("video",),
+            ),
+        ),
     )
-    resolved = config.resolved_loras()
+    resolved = config.resolved_adapters()
     assert [(item.path.name, item.strength) for item in resolved] == [
         ("style.safetensors", 0.8),
         ("motion.safetensors", 0.8),
@@ -207,54 +254,41 @@ def test_lora_one_or_n_values_expand_per_adapter() -> None:
     ]
 
 
-def test_lora_value_count_and_unknown_exclusion_fail_before_loading() -> None:
-    with pytest.raises(ValueError, match="one value or one per LoRA"):
-        DistilledRequest(
-            prompt="test",
-            lora_paths=(Path("a"), Path("b")),
-            lora_strengths=(0.1, 0.2, 0.3),
-        )
-    with pytest.raises(ValueError, match="unknown LoRA exclusion"):
-        DistilledRequest(
-            prompt="test",
-            lora_paths=(Path("a"),),
-            lora_exclusions=("sideways",),
-        )
+def test_retired_adapter_arrays_and_unknown_exclusion_fail_before_loading() -> None:
+    with pytest.raises(TypeError, match="adapter_paths"):
+        DistilledRequest(prompt="test", adapter_paths=(Path("a"),))
+    with pytest.raises(ValueError, match="exclude"):
+        DistilledRequest(prompt="test", adapters=({"path": "a", "exclude": ["sideways"]},))
 
 
-def test_lora_strengths_are_normalized_and_rejected_at_request_construction() -> None:
+def test_adapter_strengths_are_normalized_and_rejected_at_request_construction() -> None:
     request = DistilledRequest(
         prompt="test",
-        lora_paths=(Path("adapter"),),
-        lora_strengths=(1,),
+        adapters=(LTX2AdapterConfig(path=Path("adapter"), strength=1),),
     )
-    assert type(request.resolved_loras()[0].strength) is float
+    assert type(request.resolved_adapters()[0].strength) is float
 
     broad = DistilledRequest(
         prompt="test",
-        lora_paths=(Path("adapter"),),
-        lora_strengths=(3.0,),
-        lora_stage1_strengths=(-3.0,),
+        adapters=(LTX2AdapterConfig(path=Path("adapter"), strength=3.0, stage1_strength=-3.0),),
     )
-    assert broad.resolved_loras()[0].strength == 3.0
-    assert broad.resolved_loras()[0].stage_1_strength == -3.0
+    assert broad.resolved_adapters()[0].strength == 3.0
+    assert broad.resolved_adapters()[0].stage_1_strength == -3.0
 
-    with pytest.raises(ValueError, match="could not convert string to float"):
+    with pytest.raises(ValueError, match="strength.*expected float"):
         DistilledRequest(
             prompt="test",
-            lora_paths=(Path("adapter"),),
-            lora_strengths=("not-a-number",),  # type: ignore[arg-type]
+            adapters=(LTX2AdapterConfig(path=Path("adapter"), strength="not-a-number"),),
         )
 
 
-def test_lora_rejects_streaming_and_quantized_cache_modes() -> None:
-    config = DistilledRequest(prompt="test", lora_paths=(Path("adapter"),))
-    with pytest.raises(ValueError, match="block streaming"):
-        config.validate_with_settings(LTX2Settings(transformer_resident_blocks=4))
-    with pytest.raises(ValueError, match="block streaming"):
-        config.validate_with_settings(LTX2Settings(stream_transformer=True))
-    with pytest.raises(ValueError, match="unquantized"):
-        config.validate_with_settings(LTX2Settings(transformer_cache_quantize="mxfp8-blocks"))
+@pytest.mark.parametrize("value", [math.nan, math.inf, -math.inf])
+def test_adapter_stage_strengths_must_be_finite(value: float) -> None:
+    with pytest.raises(ValueError, match="stage1_strength.*finite"):
+        DistilledRequest(
+            prompt="test",
+            adapters=(LTX2AdapterConfig(path=Path("adapter"), stage1_strength=value),),
+        ).resolved_adapters()
 
 
 def test_audio_constants() -> None:

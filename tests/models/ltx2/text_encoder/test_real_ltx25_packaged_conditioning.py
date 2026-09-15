@@ -1,7 +1,5 @@
 """Opt-in parity for the packaged 2.5 projection and connector sources."""
 
-from __future__ import annotations
-
 import gc
 import hashlib
 import os
@@ -15,8 +13,8 @@ from kinomlx.models.ltx2.text_encoder import (
     AVTextEncoderConfig,
     GemmaTokenizer,
     create_av_text_encoder_v2,
+    derive_tokenizer,
     encode_prompt,
-    ensure_tokenizer_cache,
     load_av_text_encoder_v2_weights,
     norm_and_concat_per_token_rms,
 )
@@ -195,7 +193,7 @@ def _check_connector(
     _assert_boundary(f"{prefix}.output.local", final, references[f"{prefix}.output"])
 
 
-@pytest.mark.requires_weights
+@pytest.mark.heavy
 def test_real_ltx25_packaged_projection_and_connectors_match_reference() -> None:
     text_checkpoint = _required_path("KINO_LTX25_TEXT_ENCODER_PATH")
     transformer_checkpoint = _required_path("KINO_LTX25_TRANSFORMER_PATH")
@@ -268,7 +266,7 @@ def test_real_ltx25_packaged_projection_and_connectors_match_reference() -> None
         mx.clear_cache()
 
 
-@pytest.mark.requires_weights
+@pytest.mark.heavy
 def test_real_ltx25_prompt_station_matches_packaged_context(tmp_path: Path) -> None:
     text_checkpoint = _required_path("KINO_LTX25_TEXT_ENCODER_PATH")
     transformer_checkpoint = _required_path("KINO_LTX25_TRANSFORMER_PATH")
@@ -276,7 +274,9 @@ def test_real_ltx25_prompt_station_matches_packaged_context(tmp_path: Path) -> N
     references = mx.load(str(fixture_dir / "packaged-conditioning.safetensors"))
     output = None
     try:
-        tokenizer_cache = ensure_tokenizer_cache(text_checkpoint, cache_root=tmp_path)
+        tokenizer_cache = derive_tokenizer(
+            text_checkpoint,
+        )
         output = encode_prompt(
             "A lighthouse in sea mist",
             gemma_path=text_checkpoint,
@@ -284,7 +284,7 @@ def test_real_ltx25_prompt_station_matches_packaged_context(tmp_path: Path) -> N
             connector_path=transformer_checkpoint,
             config_path=transformer_checkpoint,
             model_generation="2.5",
-            tokenizer_cache=tokenizer_cache,
+            tokenizer=tokenizer_cache,
             max_length=8,
             pad_prompt_to_max=True,
         )
@@ -305,7 +305,7 @@ def test_real_ltx25_prompt_station_matches_packaged_context(tmp_path: Path) -> N
         mx.clear_cache()
 
 
-@pytest.mark.requires_weights
+@pytest.mark.heavy
 def test_real_ltx25_prompt_corpus_matches_reference(tmp_path: Path) -> None:
     text_checkpoint = _required_path("KINO_LTX25_TEXT_ENCODER_PATH")
     transformer_checkpoint = _required_path("KINO_LTX25_TRANSFORMER_PATH")
@@ -316,7 +316,9 @@ def test_real_ltx25_prompt_corpus_matches_reference(tmp_path: Path) -> None:
     assert _sha256(fixture_path) == _PROMPT_CORPUS_SHA256
 
     references = mx.load(str(fixture_path))
-    tokenizer_cache = ensure_tokenizer_cache(text_checkpoint, cache_root=tmp_path)
+    tokenizer_cache = derive_tokenizer(
+        text_checkpoint,
+    )
     tokenizer = GemmaTokenizer(tokenizer_cache)
     output = None
     try:
@@ -346,7 +348,7 @@ def test_real_ltx25_prompt_corpus_matches_reference(tmp_path: Path) -> None:
                 connector_path=transformer_checkpoint,
                 config_path=transformer_checkpoint,
                 model_generation="2.5",
-                tokenizer_cache=tokenizer_cache,
+                tokenizer=tokenizer_cache,
                 max_length=8,
                 pad_prompt_to_max=pad_to_max,
             )
@@ -374,7 +376,7 @@ def test_real_ltx25_prompt_corpus_matches_reference(tmp_path: Path) -> None:
         mx.clear_cache()
 
 
-@pytest.mark.requires_weights
+@pytest.mark.heavy
 def test_real_ltx25_default_padding_geometry_matches_reference(tmp_path: Path) -> None:
     text_checkpoint = _required_path("KINO_LTX25_TEXT_ENCODER_PATH")
     transformer_checkpoint = _required_path("KINO_LTX25_TRANSFORMER_PATH")
@@ -387,7 +389,9 @@ def test_real_ltx25_default_padding_geometry_matches_reference(tmp_path: Path) -
     references = mx.load(str(fixture_path))
     output = None
     try:
-        tokenizer_cache = ensure_tokenizer_cache(text_checkpoint, cache_root=tmp_path)
+        tokenizer_cache = derive_tokenizer(
+            text_checkpoint,
+        )
         output = encode_prompt(
             "A lighthouse in sea mist",
             gemma_path=text_checkpoint,
@@ -395,7 +399,7 @@ def test_real_ltx25_default_padding_geometry_matches_reference(tmp_path: Path) -
             connector_path=transformer_checkpoint,
             config_path=transformer_checkpoint,
             model_generation="2.5",
-            tokenizer_cache=tokenizer_cache,
+            tokenizer=tokenizer_cache,
         )
         _assert_accumulated_boundary(
             "default-padding.video",

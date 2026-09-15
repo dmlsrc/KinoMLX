@@ -1,48 +1,37 @@
 """Opt-in end-to-end prompt encoding with official local weights."""
 
-from __future__ import annotations
-
 import gc
 
 import mlx.core as mx
 import pytest
 
-from kinomlx.models.ltx2.cache import ensure_weight_family_caches
-from kinomlx.models.ltx2.settings import LTX2Settings
+from kinomlx.models.ltx2.resources import ComponentKind
 from kinomlx.models.ltx2.text_encoder import encode_prompt
-from kinomlx.settings import Settings
+from tests.models.ltx2._source_weights import (
+    NO_LTX23_CHECKPOINT,
+    ltx2_resources,
+    ltx23_checkpoint,
+)
 
 
-def _gemma_snapshot(settings: Settings):
-    root = settings.hf_home / "hub/models--google--gemma-3-12b-it/snapshots"
-    if not root.is_dir():
+def _gemma_snapshot():
+    """The Gemma weights directory the product selects for LTX-2.3, or None."""
+    resources = ltx2_resources()
+    encoder = None if resources is None else resources.optional(ComponentKind.TEXT_ENCODER)
+    if encoder is None or not tuple(encoder.source_path.glob("model-*.safetensors")):
         return None
-    return next(
-        (
-            path
-            for path in sorted(root.iterdir())
-            if (path / "tokenizer.model").is_file() and tuple(path.glob("model-*.safetensors"))
-        ),
-        None,
-    )
+    return encoder.source_path
 
 
-@pytest.mark.requires_weights
+@pytest.mark.heavy
 def test_real_ltx23_prompt_encoding() -> None:
-    settings = Settings.from_env()
-    checkpoint = LTX2Settings.from_env().weights_path
-    gemma = _gemma_snapshot(settings)
-    if checkpoint is None or not checkpoint.is_file():
-        pytest.skip("KINO_WEIGHTS_PATH is not configured")
+    checkpoint = ltx23_checkpoint()
+    if checkpoint is None:
+        pytest.skip(NO_LTX23_CHECKPOINT)
+    gemma = _gemma_snapshot()
     if gemma is None:
-        pytest.skip("Gemma 3 12B weights are not cached under HF_HOME")
-    connector = ensure_weight_family_caches(
-        checkpoint,
-        families=("connector",),
-        cache_mode="auto",
-        cache_root=settings.cache_dir,
-    ).cache_paths["connector"]
-
+        pytest.skip("the product selects no cached Gemma 3 12B weights")
+    connector = checkpoint
     output = None
     try:
         output = encode_prompt(

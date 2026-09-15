@@ -10,11 +10,10 @@ scheduling, the generic scheduler module lands in
 ``kinomlx/samplers/`` at that time; it is deferred until then.
 """
 
-from __future__ import annotations
-
 import struct
+from collections.abc import Sequence
 
-import mlx.core as mx
+from kinomlx.samplers.sigmas import resolved_sigmas
 
 
 def _float32(value: float) -> float:
@@ -42,7 +41,6 @@ DISTILLED_STAGE_1_SIGMAS: tuple[float, ...] = tuple(
 # three values mirror the tail of stage 1; the final ``0.0`` ends
 # the denoise. Keep this independent literal pin: deriving it from stage 1
 # would let an accidental change to both schedules validate itself.
-DISTILLED_STAGE_2_START_INDEX = 5
 DISTILLED_STAGE_2_SIGMAS: tuple[float, ...] = tuple(
     _float32(value)
     for value in (
@@ -54,11 +52,20 @@ DISTILLED_STAGE_2_SIGMAS: tuple[float, ...] = tuple(
 )
 
 
-def distilled_stage_1_sigmas() -> mx.array:
-    """Stage-1 sigma schedule as an ``mx.array`` (float32)."""
-    return mx.array(DISTILLED_STAGE_1_SIGMAS, dtype=mx.float32)
+def stage_sigmas(
+    stage_1: Sequence[float] = (), stage_2: Sequence[float] = ()
+) -> tuple[tuple[float, ...], tuple[float, ...]]:
+    """Resolve both stage schedules, preferring supplied values over the pins.
 
-
-def distilled_stage_2_sigmas() -> mx.array:
-    """Stage-2 sigma schedule as an ``mx.array`` (float32)."""
-    return mx.array(DISTILLED_STAGE_2_SIGMAS, dtype=mx.float32)
+    LTX-2 denoises in two stages with independent schedules, so each is overridden
+    on its own. Stage 2 legitimately starts below one: it continues from stage 1's
+    tail after the spatial upscaler.
+    """
+    return (
+        resolved_sigmas(
+            stage_1, lambda: DISTILLED_STAGE_1_SIGMAS, label="LTX-2 stage 1 schedule"
+        ).values,
+        resolved_sigmas(
+            stage_2, lambda: DISTILLED_STAGE_2_SIGMAS, label="LTX-2 stage 2 schedule"
+        ).values,
+    )

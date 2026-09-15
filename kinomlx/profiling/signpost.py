@@ -13,8 +13,6 @@ means read-only wheels remain profileable and no architecture-specific binary
 needs to be checked into the source tree.
 """
 
-from __future__ import annotations
-
 import ctypes
 import hashlib
 import json
@@ -288,13 +286,14 @@ class SignpostReporter:
         *,
         total: float | None = None,
         unit: str = "it",
+        aggregate_total: float | None = None,
     ) -> None:
         previous = self._active.pop(phase, None)
         if previous is not None:
             self._emitter.end(previous.token, completed=previous.completed, status="restarted")
         token = self._emitter.begin(phase, total=total, unit=unit)
         self._active[phase] = _ActivePhase(token)
-        self._delegate.phase_start(phase, total=total, unit=unit)
+        self._delegate.phase_start(phase, total=total, unit=unit, aggregate_total=aggregate_total)
 
     def phase_advance(self, phase: str, advance: float = 1.0) -> None:
         active = self._active.get(phase)

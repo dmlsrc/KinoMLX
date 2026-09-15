@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import json
 
 import mlx.core as mx
@@ -15,7 +13,8 @@ from kinomlx.models.ltx2.upscaler import (
     upsample_video,
 )
 from kinomlx.models.ltx2.video_vae.ops import PerChannelStatistics
-from kinomlx.reporting import RecordingReporter, Reporter
+from kinomlx.reporting import Reporter
+from tests._reporting import RecordingReporter
 
 
 def _small_model() -> SpatialUpscaler:
@@ -233,3 +232,22 @@ def test_weight_loader_preflights_every_shape_before_mutation(tmp_path) -> None:
         load_spatial_upscaler_weights(target, path)
 
     assert target.initial_conv.bias is original_initial_bias
+
+
+def test_spatial_loader_defers_evaluation_until_use(tmp_path, monkeypatch) -> None:
+    source = _small_model()
+    path = tmp_path / "upscaler.safetensors"
+    mx.save_safetensors(str(path), _checkpoint_weights(source))
+    target = _small_model()
+
+    def unexpected_eval(*args, **kwargs):
+        raise AssertionError("loader must not eagerly evaluate weights")
+
+    with monkeypatch.context() as context:
+        context.setattr(mx, "eval", unexpected_eval)
+        load_spatial_upscaler_weights(target, path)
+
+    x = mx.ones((1, 2, 1, 2, 2))
+    expected, actual = source(x), target(x)
+    mx.eval(expected, actual)
+    assert mx.allclose(actual, expected).item()

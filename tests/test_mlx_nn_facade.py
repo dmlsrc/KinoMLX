@@ -1,6 +1,4 @@
-"""Installed-MLX compatibility contract for the typed neural-network facade."""
-
-from __future__ import annotations
+"""Installed-MLX identity and typing contract for the neural-network facade."""
 
 import inspect
 

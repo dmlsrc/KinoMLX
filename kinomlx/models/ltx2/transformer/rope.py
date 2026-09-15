@@ -1,7 +1,5 @@
 """Split rotary embeddings for LTX-2 video and audio tokens."""
 
-from __future__ import annotations
-
 import math
 from enum import Enum
 from functools import lru_cache

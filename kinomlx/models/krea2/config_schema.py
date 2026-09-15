@@ -1,0 +1,953 @@
+"""Data-only Krea 2 contribution to the global configuration registry."""
+
+from dataclasses import replace
+from pathlib import Path
+
+from kinomlx.adapters.schedule import parse_step_strengths
+from kinomlx.api_boundaries import APIBoundary, configuration, runtime
+from kinomlx.cli.config_schema import settings_table
+from kinomlx.cli.image_schema import (
+    RESTART_PHASE_CLI,
+    RESTART_RUN_CLI,
+    SIGMAS_CLI,
+    SOURCE_ASPECT_CLI,
+    SOURCE_IMAGE_CLI,
+    image_output_table,
+)
+from kinomlx.cli.prompt_arguments import prompt_unconditional_field
+from kinomlx.cli.seed_arguments import seed_fields
+from kinomlx.config import (
+    CliBinding,
+    ConfigFieldSpec,
+    ConfigGroup,
+    ConfigImplication,
+    ConfigTableSpec,
+    ModelConfigSpec,
+)
+from kinomlx.config.source_rules import PROMPT_FILE
+from kinomlx.config.stations import StationPolicy
+from kinomlx.config_bindings import argument_value
+from kinomlx.config_constraints import field_choices
+from kinomlx.config_surfaces import CONFIG_SURFACES, MODEL_SURFACES, SOURCE_SURFACES
+from kinomlx.invocation_controls import MODEL_CONTROL
+from kinomlx.settings import Settings
+
+from .adapters.config_schema import ADAPTERS
+from .output_policies import OUTPUT_POLICIES
+from .pipelines.image_edit import generate_krea2_edit
+from .pipelines.restart import restart_krea2
+from .pipelines.text_to_image import generate_krea2
+from .resources import prepare_resources
+from .restart import RESTART_PHASE_CHOICES, RestartConfig
+from .runner import API_BOUNDARIES as RUNNER_API_BOUNDARIES
+from .settings import Krea2Settings
+from .types import Krea2GenerateConfig, Krea2Request
+
+F = ConfigFieldSpec
+
+_LOCKED = (
+    StationPolicy(
+        "denoise", "locked", reason="This input belongs to completed source or text preparation."
+    ),
+    StationPolicy(
+        "decode", "locked", reason="Decoding cannot change completed source or denoise input."
+    ),
+)
+_DENOISE = (
+    StationPolicy("denoise", "mutable", reason="A denoise restart reruns this input's station."),
+    StationPolicy("decode", "locked", reason="Decoding cannot change an earlier denoise input."),
+)
+_DECODE = (
+    StationPolicy("denoise", "mutable", reason="A denoise restart will run the decoder again."),
+    StationPolicy("decode", "mutable", reason="A decode restart can select a new decoder input."),
+)
+_SOURCE_IDENTITY = (
+    StationPolicy("denoise", "locked", reason="The saved run fixes this model source identity."),
+    StationPolicy("decode", "locked", reason="The saved run fixes this model source identity."),
+)
+_DENOISER_SETTING = (
+    StationPolicy(
+        "denoise", "mutable", reason="The new denoise execution may choose this setting."
+    ),
+    StationPolicy(
+        "decode", "locked", reason="Decode cannot change the source denoiser's execution setting."
+    ),
+)
+_RESTART_SELECTOR = (
+    StationPolicy(
+        "denoise", "mutable", reason="This selector belongs to the current restart invocation."
+    ),
+    StationPolicy(
+        "decode", "mutable", reason="This selector belongs to the current restart invocation."
+    ),
+)
+_RESTART_LATENTS = (
+    StationPolicy(
+        "denoise",
+        "irrelevant",
+        reason="Denoise consumes text conditioning, not final latents.",
+        irrelevant_action="reject",
+    ),
+    StationPolicy(
+        "decode", "mutable", reason="The current decode invocation may substitute final latents."
+    ),
+)
+
+
+DIRECT_API_BOUNDARIES = (
+    APIBoundary(
+        "krea2",
+        prepare_resources,
+        (
+            configuration("settings", Krea2Settings, "model_settings"),
+            configuration("infrastructure", Settings, "settings"),
+        ),
+    ),
+    APIBoundary(
+        "krea2",
+        generate_krea2,
+        (
+            configuration("request", Krea2GenerateConfig, "generate", projection=True),
+            runtime("resources", "prepared resource inventory"),
+            runtime("components", "component provider"),
+            runtime("text_conditioner", "text-conditioning provider"),
+            runtime("reporter", "progress reporter"),
+            runtime("checkpoint", "cancellation checkpoint callback"),
+            runtime("text_replay_policy", "saved-conditioning identity policy"),
+            runtime("on_image", "image callback"),
+            runtime("leading_adapters", "adapter selections applied before the request's own"),
+        ),
+    ),
+    APIBoundary(
+        "krea2",
+        generate_krea2_edit,
+        (
+            configuration("request", Krea2GenerateConfig, "generate", projection=True),
+            runtime("resources", "prepared resource inventory"),
+            runtime("components", "component provider"),
+            runtime("text_conditioner", "text-conditioning provider"),
+            runtime("reporter", "progress reporter"),
+            runtime("checkpoint", "cancellation checkpoint callback"),
+            runtime("on_image", "image callback"),
+        ),
+    ),
+    APIBoundary(
+        "krea2",
+        restart_krea2,
+        (
+            configuration("request", Krea2GenerateConfig, "generate", projection=True),
+            runtime("resources", "prepared resource inventory"),
+            runtime("restart", "prepared station handoff"),
+            runtime("components", "component provider"),
+            runtime("text_conditioner", "text-conditioning provider"),
+            runtime("reporter", "progress reporter"),
+            runtime("checkpoint", "cancellation checkpoint callback"),
+            runtime("on_image", "image callback"),
+        ),
+    ),
+)
+
+
+CONFIG_SCHEMA = ModelConfigSpec(
+    model="krea2",
+    restart_stations=RESTART_PHASE_CHOICES,
+    api_boundaries=(*RUNNER_API_BOUNDARIES, *DIRECT_API_BOUNDARIES),
+    title="KinoMLX Krea 2 generation and station-restart configuration",
+    introduction=(
+        "Generate Krea 2 Raw or Turbo still images from local model resources.",
+        (
+            "Use the path-free Turbo default, select Raw, or point the baseline and any "
+            "independent component overrides at ordinary local paths."
+        ),
+    ),
+    root_fields=(
+        F(
+            persistence="intent",
+            name="model",
+            cli=MODEL_CONTROL.binding,
+            purpose="Select the invocation schema",
+            valid="",
+            choices=("krea2",),
+            example="krea2",
+            starter="krea2",
+            cli_dest="model",
+            virtual=True,
+            default="krea2",
+            surfaces=MODEL_SURFACES,
+        ),
+    ),
+    tables=(
+        ConfigTableSpec(
+            path=("generate",),
+            cli_generated=True,
+            record=Krea2GenerateConfig,
+            stations=RESTART_PHASE_CHOICES,
+            station_record=Krea2Request,
+            fields=(
+                *(
+                    replace(
+                        field,
+                        station_policies={
+                            "seed": _DENOISE,
+                            "seeds": _LOCKED,
+                            "seed_mode": _LOCKED,
+                        }[field.name],
+                    )
+                    for field in seed_fields(image=True)
+                ),
+                replace(prompt_unconditional_field(), station_policies=_LOCKED),
+                F(
+                    persistence="intent",
+                    name="turbo_4step_exclusions",
+                    station_policies=_DENOISE,
+                    purpose="Set excluded target categories for the four-step Turbo adapter only",
+                    valid="a comma-separated category string; none disables exclusions; requires turbo_4step",
+                    example="output",
+                    cli_dest="turbo_4step_exclusions",
+                    cli=CliBinding("Krea 2 generation", flags=("--turbo-4step-exclude",)),
+                    surfaces=CONFIG_SURFACES,
+                ),
+                F(
+                    persistence="intent",
+                    name="turbo_sda",
+                    station_policies=_DENOISE,
+                    purpose="Apply the community SDA diversity adapter, gated to its training band",
+                    valid="a boolean",
+                    example=True,
+                    cli_dest="turbo_sda",
+                    cli=CliBinding("Krea 2 generation", action="boolean"),
+                    notes=(
+                        "Restores sampling diversity the Turbo distillation removed. Gated "
+                        "by default to the band the adapter records, which reproduces its "
+                        "model card's recipe on the stock eight-step schedule.",
+                    ),
+                    surfaces=CONFIG_SURFACES,
+                ),
+                F(
+                    persistence="intent",
+                    name="turbo_sda_strength",
+                    station_policies=_DENOISE,
+                    purpose="Set the SDA diversity adapter strength",
+                    valid="a finite number; requires turbo_sda",
+                    example=1.0,
+                    cli_dest="turbo_sda_strength",
+                    cli=CliBinding("Krea 2 generation"),
+                    surfaces=CONFIG_SURFACES,
+                ),
+                F(
+                    persistence="intent",
+                    name="turbo_sda_exclusions",
+                    station_policies=_DENOISE,
+                    purpose="Set excluded target categories for the SDA adapter only",
+                    valid="a comma-separated category string; none disables exclusions; requires turbo_sda",
+                    example="text_fusion",
+                    cli_dest="turbo_sda_exclusions",
+                    cli=CliBinding("Krea 2 generation", flags=("--turbo-sda-exclude",)),
+                    surfaces=CONFIG_SURFACES,
+                ),
+                F(
+                    persistence="intent",
+                    name="turbo_4step_step_strengths",
+                    station_policies=_DENOISE,
+                    purpose="Schedule the four-step Turbo adapter strength per denoise step",
+                    valid="one finite value per resolved step; requires turbo_4step",
+                    example=(1.0, 1.0, 0.0, 0.0),
+                    cli_dest="turbo_4step_step_strengths",
+                    cli=CliBinding(
+                        "Krea 2 generation",
+                        parse=argument_value(parse_step_strengths, "turbo 4step step strengths"),
+                    ),
+                    surfaces=CONFIG_SURFACES,
+                ),
+                F(
+                    persistence="intent",
+                    name="turbo_4step_sigma_window",
+                    station_policies=_DENOISE,
+                    purpose="Activate the four-step Turbo adapter only inside a noise-level window",
+                    valid=(
+                        'one "low" or "low:high" band, optionally "@strength", '
+                        "comma-separated for several; requires turbo_4step"
+                    ),
+                    example="0.93",
+                    cli_dest="turbo_4step_sigma_window",
+                    cli=CliBinding("Krea 2 generation"),
+                    surfaces=CONFIG_SURFACES,
+                ),
+                F(
+                    persistence="intent",
+                    name="turbo_sda_step_strengths",
+                    station_policies=_DENOISE,
+                    purpose="Schedule the SDA diversity adapter strength per denoise step",
+                    valid="one finite value per resolved step; requires turbo_sda",
+                    example=(1.0, 1.0, 0.0, 0.0),
+                    cli_dest="turbo_sda_step_strengths",
+                    cli=CliBinding(
+                        "Krea 2 generation",
+                        parse=argument_value(parse_step_strengths, "turbo sda step strengths"),
+                    ),
+                    surfaces=CONFIG_SURFACES,
+                ),
+                F(
+                    persistence="intent",
+                    name="turbo_sda_sigma_window",
+                    station_policies=_DENOISE,
+                    purpose="Activate the SDA diversity adapter only inside a noise-level window",
+                    valid=(
+                        'one "low" or "low:high" band, optionally "@strength", '
+                        "comma-separated for several; requires turbo_sda"
+                    ),
+                    example="0.93",
+                    cli_dest="turbo_sda_sigma_window",
+                    cli=CliBinding("Krea 2 generation"),
+                    surfaces=CONFIG_SURFACES,
+                ),
+                F(
+                    persistence="intent",
+                    name="turbo_4step",
+                    station_policies=_DENOISE,
+                    purpose="Use the cached community four-step Turbo LoRA recipe",
+                    valid="a boolean; four steps, no CFG, mu 1.15; Raw also needs a standard 8-step Turbo LoRA",
+                    example=True,
+                    cli_dest="turbo_4step",
+                    groups=frozenset({ConfigGroup.SOURCE_SELECTOR}),
+                    cli=CliBinding("Krea 2 generation", action="boolean"),
+                    surfaces=CONFIG_SURFACES,
+                ),
+                F(
+                    persistence="intent",
+                    name="turbo_4step_strength",
+                    station_policies=_DENOISE,
+                    purpose="Set the four-step Turbo adapter strength",
+                    valid="a finite positive number; requires turbo_4step",
+                    example=0.75,
+                    cli_dest="turbo_4step_strength",
+                    cli=CliBinding("Krea 2 generation"),
+                    surfaces=CONFIG_SURFACES,
+                ),
+                F(
+                    persistence="source",
+                    name="prompt_file",
+                    purpose="Load one complete prompt from a UTF-8 text file",
+                    valid="a path to a nonempty UTF-8 file; exclusive with prompt in the same layer",
+                    example=Path("prompt.txt"),
+                    cli_dest="prompt_file",
+                    input_annotation=Path | None,
+                    layer_transforms=(PROMPT_FILE,),
+                    cli=CliBinding("Generation", parse=Path),
+                    virtual=True,
+                    default=None,
+                    surfaces=SOURCE_SURFACES,
+                ),
+                F(
+                    persistence="intent",
+                    name="prompt",
+                    station_policies=(
+                        StationPolicy(
+                            "denoise",
+                            "locked",
+                            "prompts",
+                            reason="Saved Qwen conditioning fixes the resolved prompt rows.",
+                        ),
+                        StationPolicy(
+                            "decode",
+                            "locked",
+                            "prompts",
+                            reason="Saved latents fix the resolved prompt rows.",
+                        ),
+                    ),
+                    purpose="Set one prompt or an ordered prompt array",
+                    valid="a nonempty string or array of nonempty strings",
+                    example="A cinematic portrait in afternoon light",
+                    starter="A cinematic portrait in afternoon light",
+                    cli_dest="prompt",
+                    cli=CliBinding("Generation", action="append"),
+                    surfaces=CONFIG_SURFACES,
+                ),
+                F(
+                    persistence="intent",
+                    name="system_prompt",
+                    station_policies=_LOCKED,
+                    purpose="Override the regular Qwen system instruction",
+                    valid="a string, including empty; omit for the training default; regular text only",
+                    example="Describe the visible objects and their spatial relationships.",
+                    cli_dest="system_prompt",
+                    cli=CliBinding("Krea 2 generation"),
+                    surfaces=CONFIG_SURFACES,
+                ),
+                F(
+                    persistence="intent",
+                    name="negative_prompt",
+                    station_policies=(
+                        StationPolicy(
+                            "denoise",
+                            "locked",
+                            "negative_prompts",
+                            reason="Saved Qwen conditioning fixes the negative rows.",
+                        ),
+                        StationPolicy(
+                            "decode",
+                            "locked",
+                            "negative_prompts",
+                            reason="Saved latents fix the negative rows.",
+                        ),
+                    ),
+                    purpose="Set one negative prompt or one per positive prompt",
+                    valid="a string or array matching the prompt batch",
+                    example="blurry, low contrast",
+                    cli_dest="negative_prompt",
+                    cli=CliBinding("Generation", action="append"),
+                    surfaces=CONFIG_SURFACES,
+                ),
+                F(
+                    persistence="intent",
+                    name="width",
+                    station_policies=_DENOISE,
+                    purpose="Set requested output width before Krea alignment and crop",
+                    valid="a positive pixel count",
+                    example=1024,
+                    cli_dest="width",
+                    cli=CliBinding("Generation"),
+                    surfaces=CONFIG_SURFACES,
+                ),
+                F(
+                    persistence="intent",
+                    name="height",
+                    station_policies=_DENOISE,
+                    purpose="Set requested output height before Krea alignment and crop",
+                    valid="a positive pixel count",
+                    example=1024,
+                    cli_dest="height",
+                    cli=CliBinding("Generation"),
+                    surfaces=CONFIG_SURFACES,
+                ),
+                F(
+                    persistence="intent",
+                    name="steps",
+                    station_policies=_DENOISE,
+                    purpose="Override the selected variant's denoise step count",
+                    valid="a positive integer",
+                    example=8,
+                    cli_dest="steps",
+                    cli=CliBinding("Generation"),
+                    default_text="8 for Turbo; 52 for Raw",
+                    surfaces=CONFIG_SURFACES,
+                ),
+                F(
+                    persistence="intent",
+                    name="guidance",
+                    station_policies=_DENOISE,
+                    purpose="Override Krea conditional-offset guidance",
+                    valid="a finite nonnegative number",
+                    example=3.5,
+                    cli_dest="guidance",
+                    cli=CliBinding("Generation"),
+                    default_text="0.0 for Turbo; 3.5 for Raw",
+                    surfaces=CONFIG_SURFACES,
+                ),
+                F(
+                    persistence="intent",
+                    name="mu",
+                    station_policies=_DENOISE,
+                    purpose="Override the scheduler shift and disable dynamic resolution shift",
+                    valid="a finite number",
+                    example=1.15,
+                    cli_dest="mu",
+                    cli=CliBinding("Krea 2 generation"),
+                    default_text="1.15 for Turbo; dynamic by resolution for Raw",
+                    surfaces=CONFIG_SURFACES,
+                ),
+                F(
+                    persistence="intent",
+                    name="sigmas",
+                    station_policies=_DENOISE,
+                    purpose="Set the denoise schedule explicitly instead of shifting a uniform one",
+                    valid=(
+                        "an array of numbers between 0 and 1 in strictly decreasing order; "
+                        "one more value than the steps it drives"
+                    ),
+                    example=(1.0, 0.75, 0.5, 0.0),
+                    cli_dest="sigmas",
+                    cli=SIGMAS_CLI,
+                    notes=(
+                        "The array fixes the step count; a steps or mu value supplied "
+                        "alongside it is not used.",
+                    ),
+                    surfaces=CONFIG_SURFACES,
+                ),
+                F(
+                    persistence="intent",
+                    name="images_per_prompt",
+                    station_policies=_LOCKED,
+                    purpose="Generate this many independently seeded images per prompt",
+                    valid="a positive integer",
+                    example=1,
+                    cli_dest="images_per_prompt",
+                    cli=CliBinding("Generation"),
+                    surfaces=CONFIG_SURFACES,
+                ),
+                F(
+                    persistence="intent",
+                    name="noise_backend",
+                    station_policies=_DENOISE,
+                    purpose="Select native MLX noise or the PyTorch MPS normal-noise stream",
+                    valid="",
+                    choices=field_choices(Krea2GenerateConfig, "noise_backend"),
+                    choice_help=(
+                        ("mlx", "Use KinoMLX-native deterministic normal noise"),
+                        ("torch-mps", "Match the pinned PyTorch MPS normal-noise stream"),
+                    ),
+                    example="mlx",
+                    cli_dest="noise_backend",
+                    cli=CliBinding("Generation"),
+                    surfaces=CONFIG_SURFACES,
+                ),
+                F(
+                    persistence="intent",
+                    name="text_conditioning",
+                    station_policies=_DENOISE,
+                    purpose="Load saved prompt tensors instead of running Qwen",
+                    valid="a path to a compatible Krea 2 safetensors file",
+                    example=Path("prompt_text.safetensors"),
+                    cli_dest="text_conditioning",
+                    cli=CliBinding("Generation"),
+                    surfaces=CONFIG_SURFACES,
+                ),
+                F(
+                    persistence="intent",
+                    name="vae_tiling",
+                    station_policies=_DECODE,
+                    purpose="Select automatic, full-image, or custom VAE decoding",
+                    valid="",
+                    choices=field_choices(Krea2GenerateConfig, "vae_tiling"),
+                    choice_help=(
+                        ("auto", "Use the available Metal memory budget"),
+                        ("single", "Decode the whole image without tiling"),
+                        ("custom", "Use the explicit tile size and stride"),
+                    ),
+                    example="auto",
+                    cli_dest="vae_tiling",
+                    cli=CliBinding("Generation"),
+                    surfaces=CONFIG_SURFACES,
+                ),
+                F(
+                    persistence="intent",
+                    name="vae_tile_size",
+                    station_policies=_DECODE,
+                    purpose="Set the custom VAE tile size in decoded pixels",
+                    valid="a positive integer larger than the stride",
+                    example=256,
+                    cli_dest="vae_tile_size",
+                    cli=CliBinding("Generation"),
+                    surfaces=CONFIG_SURFACES,
+                ),
+                F(
+                    persistence="intent",
+                    name="vae_tile_stride",
+                    station_policies=_DECODE,
+                    purpose="Set the custom VAE tile stride in decoded pixels",
+                    valid="a positive integer smaller than the tile size",
+                    example=192,
+                    cli_dest="vae_tile_stride",
+                    cli=CliBinding("Generation"),
+                    surfaces=CONFIG_SURFACES,
+                ),
+                replace(ADAPTERS, station_policies=_DENOISE),
+                F(
+                    persistence="intent",
+                    name="source_images",
+                    station_policies=_LOCKED,
+                    purpose="Use one or two reference images in scene/subject order for editing",
+                    valid="an array of image paths",
+                    example=(Path("reference.png"),),
+                    cli_dest="source_images",
+                    cli=SOURCE_IMAGE_CLI,
+                    surfaces=CONFIG_SURFACES,
+                ),
+                F(
+                    persistence="intent",
+                    name="match_source_aspect",
+                    station_policies=_LOCKED,
+                    purpose=(
+                        "Keep the source image's aspect ratio; the named dimension is pinned "
+                        "to the one size you pass (default 1024) and the other follows the source"
+                    ),
+                    valid="",
+                    choices=field_choices(Krea2GenerateConfig, "match_source_aspect"),
+                    choice_help=(
+                        (
+                            "long",
+                            "Pin the source's longer side; --width or --height gives the size",
+                        ),
+                        (
+                            "short",
+                            "Pin the source's shorter side; --width or --height gives the size",
+                        ),
+                        ("width", "Pin --width and derive the height"),
+                        ("height", "Pin --height and derive the width"),
+                    ),
+                    example="long",
+                    cli_dest="match_source_aspect",
+                    cli=SOURCE_ASPECT_CLI,
+                    surfaces=CONFIG_SURFACES,
+                ),
+                F(
+                    persistence="intent",
+                    name="edit_adapter_path",
+                    station_policies=_LOCKED,
+                    purpose="Select the edit adapter independently of additional adapters",
+                    valid="a local safetensors path; omitted resolves the default from the HF cache",
+                    example=Path("edit.safetensors"),
+                    cli_dest="edit_adapter_path",
+                    cli=CliBinding("Krea 2 editing", flags=("--edit-adapter",)),
+                    surfaces=CONFIG_SURFACES,
+                ),
+                F(
+                    persistence="intent",
+                    name="edit_adapter_strength",
+                    station_policies=_LOCKED,
+                    purpose="Set the edit adapter strength independently of additional adapters",
+                    valid="a finite nonzero number",
+                    example=1.0,
+                    cli_dest="edit_adapter_strength",
+                    cli=CliBinding("Krea 2 editing"),
+                    surfaces=CONFIG_SURFACES,
+                ),
+                F(
+                    persistence="intent",
+                    name="edit_adapter_exclusions",
+                    station_policies=_LOCKED,
+                    purpose="Set excluded target categories for the edit adapter only",
+                    valid="a comma-separated category string; none disables exclusions",
+                    example="text_fusion",
+                    cli_dest="edit_adapter_exclusions",
+                    cli=CliBinding("Krea 2 editing", flags=("--edit-adapter-exclude",)),
+                    surfaces=CONFIG_SURFACES,
+                ),
+                F(
+                    persistence="intent",
+                    name="reference_fit",
+                    station_policies=_LOCKED,
+                    valid="",
+                    purpose="Choose how reference pixels fit the output grid",
+                    choices=field_choices(Krea2GenerateConfig, "reference_fit"),
+                    choice_help=(
+                        ("fit", "Preserve aspect ratio at a centered reference offset"),
+                        ("crop", "Fill the target with a centered crop for legacy adapters"),
+                    ),
+                    example="fit",
+                    cli_dest="reference_fit",
+                    cli=CliBinding("Image editing"),
+                    surfaces=CONFIG_SURFACES,
+                ),
+                F(
+                    persistence="intent",
+                    name="grounding_system_prompt",
+                    station_policies=_LOCKED,
+                    purpose="Override the system instruction for image-grounded conditioning",
+                    valid="text; empty uses the training default",
+                    example="Describe facial identity and clothing details.",
+                    cli_dest="grounding_system_prompt",
+                    cli=CliBinding("Krea 2 editing"),
+                    surfaces=CONFIG_SURFACES,
+                ),
+                F(
+                    persistence="intent",
+                    name="reference_boost_regions",
+                    station_policies=_LOCKED,
+                    purpose="Select reference boost regions by percentage coordinates; repeat to combine",
+                    valid="rect:left,top,right,bottom; circle:x,y,radius; ellipse:x,y,rx,ry; polygon:x,y;x,y;x,y (percentages, optional %)",
+                    example=("rect:35,15,65,55",),
+                    cli_dest="reference_boost_regions",
+                    cli=CliBinding(
+                        "Krea 2 editing", flags=("--reference-boost-region",), action="append"
+                    ),
+                    surfaces=CONFIG_SURFACES,
+                ),
+                F(
+                    persistence="intent",
+                    name="reference_boost_mask",
+                    station_policies=_LOCKED,
+                    purpose="Apply the last reference attention boost only to white mask regions",
+                    valid="a grayscale image path; resized to the reference token grid",
+                    example="subject-mask.png",
+                    cli_dest="reference_boost_mask",
+                    cli=CliBinding("Krea 2 editing"),
+                    surfaces=CONFIG_SURFACES,
+                ),
+                F(
+                    persistence="intent",
+                    name="grounding_px",
+                    station_policies=_LOCKED,
+                    purpose="Set the longest side used for semantic image grounding",
+                    valid="a nonnegative integer; zero keeps native size",
+                    example=768,
+                    cli_dest="grounding_px",
+                    cli=CliBinding("Krea 2 editing"),
+                    surfaces=CONFIG_SURFACES,
+                ),
+                F(
+                    persistence="intent",
+                    name="reference_strength",
+                    station_policies=_LOCKED,
+                    purpose="Set target attention strength toward the last reference",
+                    valid="a finite nonnegative number",
+                    example=1.0,
+                    cli_dest="reference_strength",
+                    cli=CliBinding("Krea 2 editing"),
+                    surfaces=CONFIG_SURFACES,
+                ),
+                F(
+                    persistence="intent",
+                    name="scene_reference_strength",
+                    station_policies=_LOCKED,
+                    purpose="Set target attention strength toward the first of two references",
+                    valid="a finite nonnegative number",
+                    example=1.0,
+                    cli_dest="scene_reference_strength",
+                    cli=CliBinding("Krea 2 editing"),
+                    surfaces=CONFIG_SURFACES,
+                ),
+            ),
+        ),
+        image_output_table(
+            "krea2",
+            output_policies=OUTPUT_POLICIES,
+            stations=RESTART_PHASE_CHOICES,
+            noise_help="Save the generated unpacked noise as safetensors",
+            latents_help="Save the final unpacked VAE latents as safetensors",
+            conditioning_help="Save positive and optional negative Qwen output tensors",
+        ),
+        settings_table(
+            stations=RESTART_PHASE_CHOICES,
+            adapter_weight_check_stations=frozenset({"denoise"}),
+        ),
+        ConfigTableSpec(
+            path=("model_settings",),
+            cli_generated=True,
+            cli_group="Krea 2 settings (override env vars)",
+            record=Krea2Settings,
+            stations=RESTART_PHASE_CHOICES,
+            station_record=Krea2Settings,
+            fields=(
+                F(
+                    persistence="intent",
+                    name="variant",
+                    station_policies=_SOURCE_IDENTITY,
+                    purpose="Select the Raw or Turbo Krea 2 recipe family",
+                    valid="",
+                    choices=field_choices(Krea2Settings, "variant"),
+                    choice_help=(
+                        ("raw", "Use the base CFG checkpoint and Raw recipe identity"),
+                        ("turbo", "Use the distilled checkpoint and Turbo recipe identity"),
+                    ),
+                    example="turbo",
+                    cli_dest="variant",
+                    default_text="turbo when no explicit source selects a variant",
+                    surfaces=CONFIG_SURFACES,
+                ),
+                F(
+                    persistence="intent",
+                    name="source_path",
+                    station_policies=_SOURCE_IDENTITY,
+                    purpose="Set a local baseline snapshot or component-pack directory",
+                    valid="a compatible local directory",
+                    example=Path("Krea-2-Turbo"),
+                    cli_dest="source_path",
+                    surfaces=CONFIG_SURFACES,
+                ),
+                F(
+                    persistence="intent",
+                    name="tokenizer_path",
+                    station_policies=_SOURCE_IDENTITY,
+                    purpose="Override only the tokenizer source",
+                    valid="a tokenizer directory or tokenizer.json path",
+                    example=Path("components/tokenizer"),
+                    cli_dest="tokenizer_path",
+                    surfaces=CONFIG_SURFACES,
+                ),
+                F(
+                    persistence="intent",
+                    name="text_encoder_path",
+                    station_policies=_SOURCE_IDENTITY,
+                    purpose="Override only the Qwen text-encoder source",
+                    valid="a component directory or safetensors path",
+                    example=Path("components/text_encoder"),
+                    cli_dest="text_encoder_path",
+                    surfaces=CONFIG_SURFACES,
+                ),
+                F(
+                    persistence="intent",
+                    name="transformer_path",
+                    station_policies=_SOURCE_IDENTITY,
+                    purpose="Override only the Krea transformer source",
+                    valid="a component directory, index, or safetensors path",
+                    example=Path("components/transformer"),
+                    cli_dest="transformer_path",
+                    surfaces=CONFIG_SURFACES,
+                ),
+                F(
+                    persistence="intent",
+                    name="vae_path",
+                    station_policies=_DECODE,
+                    purpose="Override the VAE source and autodetect its supported decoder profile",
+                    valid="a component directory or safetensors path",
+                    example=Path("components/vae"),
+                    cli_dest="vae_path",
+                    groups=frozenset({ConfigGroup.SOURCE_SELECTOR}),
+                    surfaces=CONFIG_SURFACES,
+                ),
+                F(
+                    persistence="intent",
+                    name="vae_decoder",
+                    station_policies=_DECODE,
+                    purpose="Select the stock Qwen or cached aesthetic 2x decoder",
+                    valid="",
+                    choices=field_choices(Krea2Settings, "vae_decoder"),
+                    choice_help=(
+                        ("qwen", "Use the stock Krea Qwen Image decoder"),
+                        (
+                            "upscale2x",
+                            "Use the cached spacepxl image-only decoder and emit 2x dimensions",
+                        ),
+                    ),
+                    example="upscale2x",
+                    cli_dest="vae_decoder",
+                    default_text="qwen unless an explicit VAE path is autodetected",
+                    surfaces=CONFIG_SURFACES,
+                ),
+                F(
+                    persistence="intent",
+                    name="transformer_dtype",
+                    station_policies=_DENOISER_SETTING,
+                    purpose="Select the transformer execution dtype",
+                    valid="",
+                    choices=field_choices(Krea2Settings, "transformer_dtype"),
+                    choice_help=(
+                        ("bfloat16", "Preserve the default Krea transformer precision"),
+                        ("float16", "Use FP16 with compact denoising; blocked in reference mode"),
+                        ("float32", "Use FP32 transformer weights"),
+                    ),
+                    example="bfloat16",
+                    cli_dest="transformer_dtype",
+                    surfaces=CONFIG_SURFACES,
+                ),
+                F(
+                    persistence="intent",
+                    name="reference_denoise",
+                    station_policies=_DENOISER_SETTING,
+                    purpose="Use padded, masked denoising with original weight layouts",
+                    valid="true or false; true requires BF16 or FP32 because padding can overflow FP16",
+                    example=False,
+                    cli_dest="reference_denoise",
+                    negative_purpose="Use compact, mask-free denoising with pretransposed FF-down weights",
+                    surfaces=CONFIG_SURFACES,
+                ),
+                F(
+                    persistence="intent",
+                    name="vae_dtype",
+                    station_policies=_DECODE,
+                    purpose="Select the VAE decode dtype",
+                    valid="",
+                    choices=field_choices(Krea2Settings, "vae_dtype"),
+                    choice_help=(
+                        ("bfloat16", "Match the default Krea image-decoder precision"),
+                        ("float16", "Build and run an FP16 VAE decoder"),
+                        ("float32", "Build and run an FP32 VAE decoder"),
+                    ),
+                    example="bfloat16",
+                    cli_dest="vae_dtype",
+                    surfaces=CONFIG_SURFACES,
+                ),
+            ),
+        ),
+        ConfigTableSpec(
+            path=("restart",),
+            cli_generated=True,
+            record=RestartConfig,
+            stations=RESTART_PHASE_CHOICES,
+            station_record=RestartConfig,
+            default_present=False,
+            fields=(
+                F(
+                    persistence="intent",
+                    name="run",
+                    station_policies=_RESTART_SELECTOR,
+                    purpose="Load a prior Krea run record",
+                    valid="a completed KinoMLX Krea run-log path",
+                    example=Path("previous_run.json"),
+                    cli_dest="restart_run",
+                    environment_key="restart_run",
+                    groups=frozenset({ConfigGroup.SOURCE_SELECTOR}),
+                    cli=RESTART_RUN_CLI,
+                    notes=("Omit the whole [restart] table to start a fresh run.",),
+                    surfaces=CONFIG_SURFACES,
+                ),
+                F(
+                    persistence="intent",
+                    name="phase",
+                    station_policies=_RESTART_SELECTOR,
+                    purpose="Select the first Krea station to repeat",
+                    valid="",
+                    choices=field_choices(RestartConfig, "phase"),
+                    choice_help=(
+                        ("decode", "Decode an already generated final latent"),
+                        ("denoise", "Resume after Qwen from saved text conditioning"),
+                    ),
+                    example="denoise",
+                    cli_dest="restart_phase",
+                    environment_key="restart_phase",
+                    groups=frozenset({ConfigGroup.SOURCE_SELECTOR}),
+                    cli=RESTART_PHASE_CLI,
+                    surfaces=CONFIG_SURFACES,
+                ),
+                F(
+                    persistence="intent",
+                    name="latents",
+                    station_policies=_RESTART_LATENTS,
+                    purpose="Substitute the final-latent artifact",
+                    valid="a compatible KinoMLX Krea safetensors file",
+                    example=Path("edited.safetensors"),
+                    cli_dest="restart_latents",
+                    environment_key="restart_latents",
+                    groups=frozenset({ConfigGroup.SOURCE_SELECTOR}),
+                    cli=CliBinding("Restart"),
+                    default_text="the final_latents artifact recorded in the run log",
+                    surfaces=CONFIG_SURFACES,
+                ),
+                F(
+                    persistence="intent",
+                    name="index",
+                    station_policies=_RESTART_SELECTOR,
+                    purpose="Select which image of a multi-image source run to resume",
+                    valid="a one-based output index within the source run's image count",
+                    example=2,
+                    cli_dest="restart_index",
+                    environment_key="restart_index",
+                    groups=frozenset({ConfigGroup.SOURCE_SELECTOR}),
+                    cli=CliBinding("Restart"),
+                    default_text="the only image, which a single-image source run implies",
+                    surfaces=CONFIG_SURFACES,
+                ),
+            ),
+        ),
+    ),
+    implications=(
+        ConfigImplication(
+            trigger=("output", "save_all_sidecars"),
+            trigger_value=True,
+            implied=(
+                (("output", "save_initial_noise"), True),
+                (("output", "save_final_latents"), True),
+                (("output", "save_text_conditioning"), True),
+                (("output", "save_run_log"), True),
+                (("output", "save_console_log"), True),
+                (("output", "save_effective_config"), True),
+            ),
+            expand_in_layers=True,
+            coverage_group=ConfigGroup.SAVE_ALL_CANDIDATE,
+        ),
+    ),
+)
+
+
+__all__ = ["CONFIG_SCHEMA"]

@@ -6,8 +6,6 @@ as compatibility gates. Source-wide tensor schemas are deliberately not load
 gates: each loader owns complete coverage of the logical targets it consumes.
 """
 
-from __future__ import annotations
-
 import hashlib
 import json
 from collections.abc import Mapping, Sequence
@@ -15,12 +13,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
 
-from kinomlx._typing import JsonObject, JsonValue
+from kinomlx._json import JsonObject, JsonValue
 from kinomlx.io.safetensors import read_header, read_metadata
 
 from .audio_vae.config import AudioVAEConfig
 from .audio_vae.vocoder import BWEVocoderConfig
 from .transformer.graph import convert_checkpoint_key, transformer_parameter_shapes
+from .transformer_config import TransformerConstructorConfig
 from .video_vae.config import VideoVAEConfig
 
 _MISSING = object()
@@ -303,56 +302,6 @@ def _effective_transformer_variant(
         ),
         mixed_prompt_adaln,
     )
-
-
-@dataclass(frozen=True)
-class TransformerConstructorConfig:
-    """Immutable constructor facts shared by resource and cache preparation."""
-
-    model_generation: str
-    declared_model_version: str | None
-    num_layers: int
-    video_in_channels: int
-    video_out_channels: int
-    video_heads: int
-    video_head_dim: int
-    audio_heads: int
-    audio_head_dim: int
-    audio_out_channels: int
-    video_context_dim: int
-    audio_context_dim: int
-    caption_channels: int
-    video_max_pos: tuple[int, int, int]
-    audio_max_pos: tuple[int]
-    positional_embedding_theta: float
-    timestep_scale_multiplier: float
-    av_ca_timestep_scale_multiplier: float
-    norm_eps: float
-    ff_bias: bool
-    audio_ff_bias: bool
-    use_keyframes_abs_pos_embedding: bool
-    use_prompt_adaln_single: bool
-    config_digest: str
-    inferred_fields: tuple[str, ...] = ()
-
-    @property
-    def video_hidden_dim(self) -> int:
-        return self.video_heads * self.video_head_dim
-
-    @property
-    def audio_hidden_dim(self) -> int:
-        return self.audio_heads * self.audio_head_dim
-
-    def cache_identity(self) -> tuple[tuple[str, str], ...]:
-        """Return graph-changing facts in a stable string-only representation."""
-        return (
-            ("audio_ff_bias", str(self.audio_ff_bias).lower()),
-            ("config_digest", self.config_digest),
-            ("ff_bias", str(self.ff_bias).lower()),
-            ("generation", self.model_generation),
-            ("keyframes_abs_pos", str(self.use_keyframes_abs_pos_embedding).lower()),
-            ("prompt_adaln", str(self.use_prompt_adaln_single).lower()),
-        )
 
 
 @dataclass(frozen=True)
@@ -1195,7 +1144,6 @@ __all__ = [
     "LatentUpscalerConfig",
     "TextEncoderHeaderConfig",
     "TextProjectionHeaderConfig",
-    "TransformerConstructorConfig",
     "checkpoint_config",
     "generation_label",
     "inspect_audio_vae",
@@ -1205,5 +1153,6 @@ __all__ = [
     "inspect_text_encoder",
     "inspect_text_projection",
     "inspect_video_vae",
+    "transformer_parameter_shapes",
     "validate_transformer_header",
 ]

@@ -1,11 +1,11 @@
 """Focused static contracts for the model-neutral configuration boundary."""
 
-from __future__ import annotations
-
+import argparse
 from dataclasses import dataclass
 from pathlib import Path
 
 from kinomlx.config import (
+    CliBinding,
     apply_set_overrides,
     coerce_dataclass_fields,
     dataclass_from_mapping,
@@ -34,3 +34,9 @@ typed: ExampleConfig = dataclass_from_mapping(
     table="[sample]",
 )
 serialized: dict[str, object] = dataclass_to_mapping(typed)
+
+
+binding = CliBinding("Example")
+argument: argparse.Action = binding.add_argument(
+    argparse.ArgumentParser(), destination="count", annotation=int, help="Set count"
+)

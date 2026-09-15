@@ -1,7 +1,5 @@
 """Patch packing and latent-statistics tests."""
 
-from __future__ import annotations
-
 import mlx.core as mx
 import pytest
 
@@ -53,7 +51,7 @@ def test_patchify_matches_upstream_channel_order() -> None:
     assert packed.reshape(-1).tolist() == [0.0, 2.0, 1.0, 3.0]
 
 
-def test_patch_compilation_is_lazy_and_cached() -> None:
+def test_patch_compilation_is_lazy_and_weightsd() -> None:
     _compiled_patchify.cache_clear()
     _compiled_unpatchify.cache_clear()
     assert _compiled_patchify.cache_info().currsize == 0

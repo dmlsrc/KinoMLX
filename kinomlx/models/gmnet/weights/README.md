@@ -14,9 +14,10 @@ collection (`weights-src/gmnet/`, upstream filenames, verify the SHA-256),
 then convert from the repo root - published checkpoints are recognized
 by their SHA-256. In an editable Git checkout, they land in this directory
 under their canonical names. A non-checkout install uses
-`$KINO_CACHE_DIR/weights/gmnet/` instead so conversion never assumes the
+`$KINO_APP_CACHE_DIR/weights/gmnet/` (by default,
+`~/Library/Caches/KinoMLX/weights/gmnet/`) instead so conversion never assumes the
 installed package is writable. An explicit converter `--output` or runtime
-`KINO_GMNET_WEIGHTS` override wins in either layout:
+`KINO_GMNET_WEIGHTS_PATH` override wins in either layout:
 
 ```bash
 mkdir -p weights-src/gmnet

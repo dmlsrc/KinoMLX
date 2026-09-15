@@ -1,7 +1,5 @@
 """No-clobber reservation shared by generic and model-specific converters."""
 
-from __future__ import annotations
-
 import logging
 import stat
 from collections.abc import Iterator

@@ -1,7 +1,5 @@
 """Recursive config merge: tables merge, scalars and arrays replace."""
 
-from __future__ import annotations
-
 from collections.abc import Mapping
 from typing import cast
 
@@ -25,22 +23,19 @@ def merge_configs(*configs: Mapping[str, object]) -> dict[str, object]:
     return merged
 
 
-def normalize_output_selection(config: Mapping[str, object]) -> dict[str, object]:
-    """Make one precedence layer choose exact-path or generated-path mode.
-
-    A directory or prefix in a higher-precedence layer must be able to replace
-    an exact path selected below it. Within one layer, a non-``None`` exact
-    path still wins over directory/prefix fields supplied beside it.
-    """
-    result = dict(config)
-    output = result.get("output")
-    if not isinstance(output, Mapping):
-        return result
-    normalized = dict(cast(Mapping[str, object], output))
-    if normalized.get("path") is None and ({"directory", "prefix"} & normalized.keys()):
-        normalized["path"] = None
-    result["output"] = normalized
-    return result
+def field_paths(
+    config: Mapping[str, object], prefix: tuple[str, ...] = ()
+) -> frozenset[tuple[str, ...]]:
+    """Return present leaf identities; an empty group supplies no member assignment."""
+    return frozenset(
+        path
+        for name, value in config.items()
+        for path in (
+            field_paths(cast(Mapping[str, object], value), (*prefix, name))
+            if isinstance(value, Mapping)
+            else ((*prefix, name),)
+        )
+    )
 
 
-__all__ = ["merge_configs", "normalize_output_selection"]
+__all__ = ["field_paths", "merge_configs"]

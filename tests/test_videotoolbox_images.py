@@ -5,8 +5,6 @@ encode, Lanczos resize, and text annotation - all MLX in, MLX out, no Pillow.
 Tagged ``requires_avfoundation`` for explicit native-test selection.
 """
 
-from __future__ import annotations
-
 import struct
 
 import Foundation
@@ -15,6 +13,7 @@ import pytest
 import Quartz
 
 from kinomlx.videotoolbox import images as I
+from tests._image_fixtures import write_png
 
 pytestmark = pytest.mark.requires_avfoundation
 
@@ -51,6 +50,28 @@ def test_load_image_rgb_orientation_top_first(tmp_path):
     rt = I.load_image_rgb(p)
     assert int(rt[0, 0, 0].item()) > 240
     assert int(rt[h - 1, 0, 0].item()) < 15
+
+
+def test_image_size_reads_dimensions_without_decoding(tmp_path):
+    p = tmp_path / "size.png"
+    I.save_image(_gradient(48, 64), p)
+    assert I.image_size(p) == (64, 48)
+    with pytest.raises(FileNotFoundError):
+        I.image_size("/nonexistent/path/nope.png")
+
+
+def test_image_size_matches_decoded_shape_with_exif_orientation(tmp_path):
+    # Orientation 6 (rotate 90 degrees clockwise) swaps the displayed width and height.
+    p = tmp_path / "rotated.jpg"
+    dest = Quartz.CGImageDestinationCreateWithURL(I._url(p), "public.jpeg", 1, None)
+    Quartz.CGImageDestinationAddImage(
+        dest, I._mx_to_cgimage(_gradient(48, 64)), {Quartz.kCGImagePropertyOrientation: 6}
+    )
+    assert Quartz.CGImageDestinationFinalize(dest)
+    assert I.image_size(p) == (48, 64)
+    assert tuple(I.load_image_rgb(p).shape[:2]) == (64, 48)
+    assert I._oriented_size(64, 48, 1) == (64, 48)
+    assert I._oriented_size(64, 48, 8) == (48, 64)
 
 
 def test_load_missing_file_raises():
@@ -102,39 +123,35 @@ def test_grayscale_png_decodes_to_equal_rgb(tmp_path):
 
 
 def test_rgba_png_drops_alpha_without_compositing_hidden_rgb(tmp_path):
-    image_module = pytest.importorskip("PIL.Image")
     path = tmp_path / "alpha.png"
-    source = image_module.new("RGBA", (4, 1))
-    source.putdata(
-        [
-            (255, 0, 0, 0),
-            (0, 255, 0, 128),
-            (10, 20, 30, 64),
-            (200, 100, 50, 255),
-        ]
-    )
-    source.save(path)
-
+    pixels = [(255, 0, 0, 0), (0, 255, 0, 128), (10, 20, 30, 64), (200, 100, 50, 255)]
+    write_png(path, 4, 1, bytes(channel for pixel in pixels for channel in pixel), channels=4)
     actual = I.load_image_rgb(path)
-    expected = mx.array(
-        list(source.convert("RGB").get_flattened_data()),
-        dtype=mx.uint8,
-    ).reshape(1, 4, 3)
+    expected = mx.array([pixel[:3] for pixel in pixels], dtype=mx.uint8).reshape(1, 4, 3)
 
     assert mx.array_equal(actual, expected).item()
 
 
 @pytest.mark.parametrize("orientation", [1, 3, 6, 8])
 def test_jpeg_exif_orientation_matches_displayed_pixels(tmp_path, orientation: int):
-    image_module = pytest.importorskip("PIL.Image")
-    image_ops = pytest.importorskip("PIL.ImageOps")
     base_path = tmp_path / "orientation-base.jpg"
     path = tmp_path / f"orientation-{orientation}.jpg"
-    source = image_module.new("RGB", (32, 48), (0, 0, 0))
-    for y in range(48):
-        for x in range(32):
-            source.putpixel((x, y), (x * 7 % 256, y * 5 % 256, (x + y) * 3 % 256))
-    source.save(base_path, quality=100, subsampling=0)
+    png_path = tmp_path / "source.png"
+    pixels = bytes(
+        channel
+        for y in range(48)
+        for x in range(32)
+        for channel in (x * 7 % 256, y * 5 % 256, (x + y) * 3 % 256)
+    )
+    write_png(png_path, 32, 48, pixels)
+    source = Quartz.CGImageSourceCreateWithURL(
+        Foundation.NSURL.fileURLWithPath_(str(png_path)), None
+    )
+    destination = Quartz.CGImageDestinationCreateWithURL(
+        Foundation.NSURL.fileURLWithPath_(str(base_path)), "public.jpeg", 1, None
+    )
+    Quartz.CGImageDestinationAddImageFromSource(destination, source, 0, None)
+    assert Quartz.CGImageDestinationFinalize(destination)
     tiff = (
         struct.pack("<2sHIH", b"II", 42, 8, 1)
         + struct.pack("<HHI", 274, 3, 1)
@@ -149,11 +166,20 @@ def test_jpeg_exif_orientation_matches_displayed_pixels(tmp_path, orientation: i
 
     base = I.load_image_rgb(base_path)
     actual = I.load_image_rgb(path)
-    expected = I._apply_exif_orientation(base, orientation)
-    with image_module.open(path) as decoded:
-        displayed = image_ops.exif_transpose(decoded)
-
-    assert tuple(actual.shape[:2]) == (displayed.height, displayed.width)
+    # Literal coordinate maps from stored pixels to displayed pixels. Do not
+    # call the product orientation helper to calculate its own expected result.
+    rows = base.tolist()
+    height, width = base.shape[:2]
+    if orientation == 1:
+        displayed = rows
+    elif orientation == 3:
+        displayed = [list(reversed(row)) for row in reversed(rows)]
+    elif orientation == 6:
+        displayed = [[rows[height - 1 - x][y] for x in range(height)] for y in range(width)]
+    else:  # Orientation 8: 90 degrees counterclockwise.
+        displayed = [[rows[x][width - 1 - y] for x in range(height)] for y in range(width)]
+    expected = mx.array(displayed, dtype=mx.uint8)
+    assert actual.shape == expected.shape
     assert mx.array_equal(actual, expected).item()
 
 

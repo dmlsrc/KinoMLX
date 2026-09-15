@@ -1,7 +1,6 @@
 """Deterministic TOML serialization for resolved configuration."""
 
-from __future__ import annotations
-
+import dataclasses
 import datetime as dt
 import json
 import math
@@ -9,7 +8,7 @@ import re
 from collections.abc import Mapping
 from pathlib import Path
 
-from .validate import ConfigError
+from kinomlx.config_values import ConfigError, dataclass_to_mapping
 
 _BARE_KEY = re.compile(r"^[A-Za-z0-9_-]+$")
 _LITERAL_CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
@@ -34,6 +33,12 @@ def dump_toml_value(
     stringify_large_int: bool = False,
 ) -> str:
     """Serialize one scalar, array, or inline-table TOML value."""
+    if dataclasses.is_dataclass(value) and not isinstance(value, type):
+        return dump_toml_value(
+            dataclass_to_mapping(value),
+            multiline=multiline,
+            stringify_large_int=stringify_large_int,
+        )
     if isinstance(value, bool):
         return "true" if value else "false"
     if isinstance(value, str | Path):
@@ -41,7 +46,9 @@ def dump_toml_value(
             rendered = _multiline_literal(value)
             if rendered is not None:
                 return rendered
-        return json.dumps(str(value), ensure_ascii=False)
+        # json leaves DEL literal, and TOML's basic string forbids it, so the
+        # file would be written without complaint and refused on the next read.
+        return json.dumps(str(value), ensure_ascii=False).replace("\x7f", "\\u007F")
     if isinstance(value, int):
         if not _TOML_INT_MIN <= value <= _TOML_INT_MAX:
             if stringify_large_int:

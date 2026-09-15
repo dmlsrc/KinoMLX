@@ -1,10 +1,9 @@
 """Immutable checkpoint inventory and execution policy for GMNet."""
 
-from __future__ import annotations
-
 from dataclasses import dataclass
 from pathlib import Path
 
+from kinomlx.memory_policy import MLXMemoryPolicy
 from kinomlx.reporting import NullReporter, Reporter
 from kinomlx.settings import Settings
 
@@ -18,7 +17,7 @@ class GMNetResources:
 
     weights_path: Path
     spec: GMNetVariantSpec
-    mlx_cache_limit_bytes: int | None
+    memory_policy: MLXMemoryPolicy = MLXMemoryPolicy()
 
 
 def prepare_resources(
@@ -30,7 +29,7 @@ def prepare_resources(
     """Resolve a GMNet checkpoint and immutable execution policy."""
     host = infrastructure if infrastructure is not None else Settings.from_env()
     sink = reporter if reporter is not None else NullReporter()
-    phase = "prepare GMNet resources"
+    phase = "prepare resources"
     sink.phase_start(phase, total=1, unit="checkpoint")
     try:
         settings.validate()
@@ -39,14 +38,12 @@ def prepare_resources(
         weights_path = resolve_variant_weights(
             spec.variant,
             settings.weights_path,
-            cache_dir=host.cache_dir,
+            app_cache_dir=host.app_cache_dir,
         )
         resources = GMNetResources(
+            memory_policy=MLXMemoryPolicy.from_settings(host),
             weights_path=weights_path.expanduser().absolute(),
             spec=spec,
-            mlx_cache_limit_bytes=(
-                None if host.mlx_cache_limit_gb is None else int(host.mlx_cache_limit_gb * 1024**3)
-            ),
         )
         sink.phase_advance(phase)
         return resources

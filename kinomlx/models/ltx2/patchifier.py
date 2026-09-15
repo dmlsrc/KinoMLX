@@ -1,7 +1,5 @@
 """LTX-2 latent patchification helpers."""
 
-from __future__ import annotations
-
 import math
 
 import mlx.core as mx

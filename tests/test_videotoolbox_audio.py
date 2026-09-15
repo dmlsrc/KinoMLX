@@ -1,8 +1,8 @@
 """Round-trip and sample-buffer tests for ``kinomlx.videotoolbox.audio``.
 
 The VideoToolbox audio path was lifted whole into KinoMLX with no tests, and
-commit 9de34ab's memoryview copy-elisions - ``make_sample_buffer``'s block slice
-and ``_write_wav``'s ``cast("B")`` - were verified only by ``py_compile`` plus
+its memoryview copy elisions - ``make_sample_buffer``'s block slice and
+``_write_wav``'s ``cast("B")`` - were verified only by ``py_compile`` plus
 ad-hoc API probes. These tests pin the actual behavior:
 
 - ``AudioTrack.make_sample_buffer`` builds a CMSampleBuffer that spans the
@@ -16,8 +16,6 @@ ad-hoc API probes. These tests pin the actual behavior:
 Every test here drives a real AVFoundation / CoreMedia stack, so the module is
 tagged ``requires_avfoundation`` for explicit native-test selection.
 """
-
-from __future__ import annotations
 
 import CoreMedia
 import mlx.core as mx
@@ -88,7 +86,7 @@ def test_make_sample_buffer_presentation_timestamp(start):
 def test_make_sample_buffer_bytes_match_source():
     """The block bytes equal the interleaved source slice exactly.
 
-    Direct regression net for commit 9de34ab: make_sample_buffer slices a
+    Direct regression net for the zero-copy slice: make_sample_buffer slices a
     memoryview of self._bytes instead of a bytes copy. An off-by-one in the
     slice offset math would surface here even though the smoke checks pass.
     """

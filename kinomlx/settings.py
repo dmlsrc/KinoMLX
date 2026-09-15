@@ -12,31 +12,45 @@ strings are literal fallback values. CLI values are parsed by their declared
 types but never receive environment substitution.
 """
 
-from __future__ import annotations
-
 import argparse
 import dataclasses
-import math
 import os
 import re
+import tomllib
 import types
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, fields
 from pathlib import Path
-from typing import Protocol, Self, Union, cast, get_args, get_origin, get_type_hints
+from typing import ClassVar, Self, Union, cast, get_args, get_origin, get_type_hints
+
+from kinomlx.config_bindings import CliBinding
+from kinomlx.config_constraints import NumberConstraint
+from kinomlx.config_records import config_record, construct_record, replace_config
+from kinomlx.config_rules import RecordRule, validate_record
 
 _ENV_TEMPLATE_VAR = re.compile(r"\{\{([A-Za-z_][A-Za-z0-9_]*)\}\}")
 _FALSE_WORDS = frozenset({"", "0", "false", "no", "off"})
-CACHE_MODE_CHOICES = ("auto", "rebuild")
-
-
-class _KeywordConstructor[ResultT](Protocol):
-    def __call__(self, **kwargs: object) -> ResultT: ...
+_TRUE_WORDS = frozenset({"1", "true", "yes", "on"})
 
 
 def _parse_bool(raw: str) -> bool:
     """Parse conventional environment boolean spellings."""
-    return raw.strip().lower() not in _FALSE_WORDS
+    value = raw.strip().lower()
+    if value in _FALSE_WORDS:
+        return False
+    if value in _TRUE_WORDS:
+        return True
+    raise ValueError("expected true/false, yes/no, on/off, or 1/0")
+
+
+def environment_names(prefix: str) -> frozenset[str]:
+    """Snapshot variable names in one owned configuration namespace."""
+    return frozenset(name for name in os.environ if name.startswith(prefix))
+
+
+def read_environment(name: str) -> str | None:
+    """Read a registered variable, preserving an explicitly empty value."""
+    return os.environ.get(name)
 
 
 def _resolve_env_entry(entry: str) -> str | None:
@@ -47,13 +61,31 @@ def _resolve_env_entry(entry: str) -> str | None:
     last = 0
     for match in _ENV_TEMPLATE_VAR.finditer(entry):
         parts.append(entry[last : match.start()])
-        value = os.environ.get(match.group(1))
+        value = read_environment(match.group(1))
         if not value:
             return None
         parts.append(value)
         last = match.end()
     parts.append(entry[last:])
     return "".join(parts)
+
+
+def parse_config_value(raw: str) -> object:
+    """Parse a TOML scalar or collection, preserving ordinary unquoted text."""
+    try:
+        return cast(object, tomllib.loads(f"value = {raw}")["value"])
+    except tomllib.TOMLDecodeError:
+        return raw
+
+
+def parse_environment_value(annotation: object, raw: str) -> object:
+    """Use the shared CLI type parser for one registered environment value."""
+    return _parser_for(annotation)(raw)
+
+
+def environment_value_is_unset(annotation: object, raw: str | None) -> bool:
+    """Empty paths are absent; empty text and sequences remain meaningful values."""
+    return raw is None or (raw == "" and (annotation is Path or Path in get_args(annotation)))
 
 
 def _parser_for(annotation: object) -> Callable[[str], object]:
@@ -64,7 +96,9 @@ def _parser_for(annotation: object) -> Callable[[str], object]:
         concrete = tuple(item for item in arguments if item is not type(None))
         if len(concrete) == 1:
             return _parser_for(concrete[0])
-    if origin is tuple:
+        if str in concrete:
+            return lambda raw: parse_config_value(raw) if raw.lstrip().startswith("[") else raw
+    if origin in (tuple, list):
         item_type = arguments[0] if arguments else str
         item_parser = _parser_for(item_type)
 
@@ -72,6 +106,11 @@ def _parser_for(annotation: object) -> Callable[[str], object]:
             value = raw.strip()
             if not value or value.lower() in {"off", "none"}:
                 return ()
+            if value.startswith("["):
+                parsed = parse_config_value(value)
+                if not isinstance(parsed, list):
+                    raise ValueError("expected a TOML array")
+                return tuple(parsed)
             return tuple(item_parser(item.strip()) for item in value.split(",") if item.strip())
 
         return parse_tuple
@@ -133,8 +172,44 @@ def _cli_flags(item: dataclasses.Field[object]) -> tuple[str, ...]:
     return flags
 
 
+def _settings_cli_binding(
+    item: dataclasses.Field[object], annotation: object, title: str
+) -> CliBinding:
+    concrete = tuple(value for value in get_args(annotation) if value is not type(None))
+    is_bool = annotation is bool or concrete == (bool,)
+    return CliBinding(
+        group=title,
+        flags=_cli_flags(item),
+        action="paired_boolean" if is_bool else "store",
+        parse=None if is_bool else _parser_for(annotation),
+    )
+
+
+@dataclass(frozen=True)
+class EnvironmentValue:
+    """A decoded value and the exact source expression selected by the resolver."""
+
+    value: object
+    source: str
+    explicit: bool
+
+
 class EnvironmentSettings:
     """Mixin for frozen dataclasses with declarative environment fields."""
+
+    environment_prefix: ClassVar[str | None] = None
+    # The TOML table this record is written at, so a rule violation names a
+    # location the reader can edit rather than a Python class.
+    config_table: ClassVar[str] = "[settings]"
+
+    @classmethod
+    def cli_binding_for_field(cls, name: str, *, title: str) -> CliBinding:
+        """Compile the owned setting metadata for any CLI consumer."""
+        hints: dict[str, object] = get_type_hints(cls)
+        for item in _settings_fields(cls):
+            if item.name == name:
+                return _settings_cli_binding(item, hints[name], title)
+        raise KeyError(f"unknown {cls.__name__} field {name!r}")
 
     @classmethod
     def from_env(cls) -> Self:
@@ -144,33 +219,44 @@ class EnvironmentSettings:
     @classmethod
     def from_env_fields(cls, *names: str) -> Self:
         """Build a record while reading only selected environment fields."""
-        constructor = cast(_KeywordConstructor[Self], cls)
-        return constructor(**cls.overrides_from_env_fields(*names))
+        selected = cls.values_from_env_fields(*names)
+        values = {name: entry.value for name, entry in selected.items()}
+        presence = frozenset(name for name, entry in selected.items() if entry.explicit)
+        return construct_record(cls, values, presence)
 
     @classmethod
-    def overrides_from_env_fields(cls, *names: str) -> dict[str, object]:
-        """Return only values supplied by declared environment sources."""
+    def values_from_env_fields(cls, *names: str) -> dict[str, EnvironmentValue]:
+        """Decode once, retaining the chosen template or literal fallback."""
         requested = set(names)
         known = {item.name for item in _settings_fields(cls)}
         unknown = requested - known
         if unknown:
             raise KeyError(f"unknown {cls.__name__} fields: {', '.join(sorted(unknown))}")
 
-        kwargs: dict[str, object] = {}
+        kwargs: dict[str, EnvironmentValue] = {}
         hints: dict[str, object] = get_type_hints(cls)
         for item in _settings_fields(cls):
             if item.name not in requested:
                 continue
             try:
-                entries = _environment_entries(item)
+                entries = cls.environment_sources_for_field(item.name)
             except TypeError as exc:
                 raise TypeError(f"{cls.__name__}.{exc}") from exc
             for entry in entries:
-                resolved = _resolve_env_entry(entry)
-                if resolved is None:
+                resolved = (
+                    read_environment(entry[2:-2])
+                    if cls.environment_prefix is not None and not _environment_entries(item)
+                    else _resolve_env_entry(entry)
+                )
+                if environment_value_is_unset(hints[item.name], resolved):
                     continue
+                assert resolved is not None
                 try:
-                    kwargs[item.name] = _parser_for(hints[item.name])(resolved)
+                    kwargs[item.name] = EnvironmentValue(
+                        parse_environment_value(hints[item.name], resolved),
+                        entry,
+                        bool(_ENV_TEMPLATE_VAR.search(entry)),
+                    )
                 except (TypeError, ValueError) as exc:
                     raise ValueError(f"{item.name}: invalid value from {entry}") from exc
                 break
@@ -183,28 +269,57 @@ class EnvironmentSettings:
         if name not in reflected:
             raise KeyError(f"unknown {cls.__name__} field: {name}")
         try:
-            return _environment_entries(reflected[name])
+            entries = _environment_entries(reflected[name])
+            if not entries and cls.environment_prefix is not None:
+                return ("{{" + cls.environment_prefix + name.upper() + "}}",)
+            return entries
         except TypeError as exc:
             raise TypeError(f"{cls.__name__}.{exc}") from exc
+
+    def validate(self) -> None:
+        """Run owned semantic checks on the fully composed Settings record."""
+        validate_record(self, location=type(self).config_table)
 
     def with_overrides(self, **overrides: object) -> Self:
         """Return a record with non-None overrides applied."""
         clean = {name: value for name, value in overrides.items() if value is not None}
-        return dataclasses.replace(self, **clean)  # type: ignore[type-var]
+        return replace_config(self, **clean)
 
 
+def _profile_log_requires_signposts(values: Mapping[str, object]) -> None:
+    if values["profile_signpost_log"] is not None and not values["profile_signposts"]:
+        raise ValueError("profile_signpost_log requires profile_signposts=true")
+
+
+_PROFILE_LOG_RULE = RecordRule(
+    "profile_log_requires_signposts",
+    frozenset({"profile_signpost_log", "profile_signposts"}),
+    _profile_log_requires_signposts,
+)
+
+
+@config_record
 @dataclass(frozen=True)
 class Settings(EnvironmentSettings):
     """Model-neutral cache, UX, profiling, and MLX allocator settings."""
 
-    cache_dir: Path = field(
-        default_factory=lambda: Path("~/.cache/kinomlx").expanduser(),
-        metadata={"env": "{{KINO_CACHE_DIR}}"},
+    app_cache_dir: Path = field(
+        default_factory=lambda: Path("~/Library/Caches/KinoMLX").expanduser(),
+        metadata={
+            "env": [
+                "{{KINO_APP_CACHE_DIR}}",
+                "{{XDG_CACHE_HOME}}/KinoMLX",
+                "~/Library/Caches/KinoMLX",
+            ]
+        },
     )
-    cache_mode: str = field(default="auto", metadata={"env": "{{KINO_CACHE_MODE}}"})
     hf_home: Path = field(
         default_factory=lambda: Path("~/.cache/huggingface").expanduser(),
         metadata={"env": "{{HF_HOME}}"},
+    )
+
+    check_adapter_weights: bool = field(
+        default=True, metadata={"env": "{{KINO_CHECK_ADAPTER_WEIGHTS}}"}
     )
 
     verbose: bool = field(default=False, metadata={"env": "{{KINO_VERBOSE}}"})
@@ -220,25 +335,24 @@ class Settings(EnvironmentSettings):
     )
     profile_signpost_log: Path | None = field(
         default=None,
-        metadata={"env": "{{KINO_PROFILE_SIGNPOST_LOG}}"},
+        metadata={"env": "{{KINO_PROFILE_SIGNPOST_LOG}}", "config_rules": (_PROFILE_LOG_RULE,)},
     )
 
     mlx_cache_limit_gb: float | None = field(
         default=1.0,
-        metadata={"env": "{{KINO_MLX_CACHE_LIMIT_GB}}"},
+        metadata={
+            "env": "{{KINO_MLX_CACHE_LIMIT_GB}}",
+            "config_constraints": (NumberConstraint(minimum=0),),
+        },
     )
-
-    def validate(self) -> None:
-        """Validate infrastructure settings."""
-        if self.cache_mode not in CACHE_MODE_CHOICES:
-            valid = ", ".join(CACHE_MODE_CHOICES)
-            raise ValueError(f"cache_mode must be one of: {valid}")
-        if self.profile_signpost_log is not None and not self.profile_signposts:
-            raise ValueError("profile_signpost_log requires profile_signposts=true")
-        if self.mlx_cache_limit_gb is not None and (
-            not math.isfinite(self.mlx_cache_limit_gb) or self.mlx_cache_limit_gb < 0
-        ):
-            raise ValueError("mlx_cache_limit_gb must be finite and non-negative")
+    # None wires up to the device's recommended working set; 0 leaves buffers unwired.
+    mlx_wired_limit_gb: float | None = field(
+        default=None,
+        metadata={
+            "env": "{{KINO_MLX_WIRED_LIMIT_GB}}",
+            "config_constraints": (NumberConstraint(minimum=0),),
+        },
+    )
 
 
 def add_settings_argparse_args(
@@ -260,40 +374,15 @@ def add_settings_argparse_args(
     for item in _settings_fields(settings_type):
         if item.name in skip:
             continue
-        try:
-            flags = _cli_flags(item)
-        except TypeError as exc:
-            raise TypeError(f"{settings_type.__name__}.{exc}") from exc
-        annotation = hints[item.name]
-        concrete = tuple(value for value in get_args(annotation) if value is not type(None))
-        is_bool = annotation is bool or concrete == (bool,)
-        if is_bool:
-            group.add_argument(
-                *flags,
-                dest=item.name,
-                action="store_true",
-                default=None,
-                help=declared_help.get(item.name),
-            )
-            group.add_argument(
-                *("--no-" + flag.removeprefix("--") for flag in flags),
-                dest=item.name,
-                action="store_false",
-                default=None,
-                help=declared_negative_help.get(
-                    item.name,
-                    declared_help.get(item.name),
-                ),
-            )
-        else:
-            group.add_argument(
-                *flags,
-                dest=item.name,
-                type=_parser_for(annotation),
-                choices=declared_choices.get(item.name),
-                default=None,
-                help=declared_help.get(item.name),
-            )
+        binding = _settings_cli_binding(item, hints[item.name], title)
+        binding.add_arguments(
+            group,
+            destination=item.name,
+            annotation=hints[item.name],
+            choices=declared_choices.get(item.name, ()),
+            help=declared_help.get(item.name),
+            negative_help=declared_negative_help.get(item.name, declared_help.get(item.name)),
+        )
 
 
 def add_argparse_args(
@@ -324,7 +413,6 @@ def settings_from_args(args: argparse.Namespace, base: Settings) -> Settings:
 
 
 __all__ = [
-    "CACHE_MODE_CHOICES",
     "EnvironmentSettings",
     "Settings",
     "add_argparse_args",

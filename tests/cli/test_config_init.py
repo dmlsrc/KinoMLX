@@ -1,19 +1,12 @@
 """Model-specific starter configuration command contracts."""
 
-from __future__ import annotations
-
 import tomllib
 from dataclasses import dataclass, replace
 from pathlib import Path
 
 import pytest
 
-from kinomlx.cli._registry import (
-    config_registry,
-    model_choices,
-    validate_model_parser,
-)
-from kinomlx.cli.args import build_parser
+from kinomlx.cli._registry import validate_model_parser
 from kinomlx.cli.config_init import build_config_parser
 from kinomlx.cli.config_templates import (
     _render_field,
@@ -29,6 +22,10 @@ from kinomlx.config import (
     ConfigTableSpec,
     ModelConfigSpec,
 )
+from kinomlx.config_surfaces import MODEL_SURFACES, STRUCTURED_SURFACES
+from kinomlx.invocation_controls import MODEL_CONTROL
+from kinomlx.model_registry import config_registry, model_choices
+from kinomlx.models.ltx2.arguments import build_parser
 
 
 def _documented_fields(template: str) -> set[str]:
@@ -40,7 +37,7 @@ def _documented_fields(template: str) -> set[str]:
             if line in {"'''", "# '''"}:
                 multiline = False
             continue
-        content = line[2:] if line.startswith("# ") else line
+        content = line.removeprefix("# ")
         if content.startswith("[") and content.endswith("]"):
             table = content[1:-1]
             continue
@@ -60,9 +57,14 @@ def test_every_registered_model_has_one_distinct_template() -> None:
     assert template_models() == model_choices()
     assert config_template("ltx2") != config_template("gmnet")
     registry = config_registry()
-    assert registry.model("ltx2").table(("settings",)) is registry.model("gmnet").table(
-        ("settings",)
-    )
+    video = registry.model("ltx2").table(("settings",))
+    still = registry.model("gmnet").table(("settings",))
+    # One shared declaration owns infrastructure settings; only restart
+    # applicability is per model, and GMNet has no restart station.
+    assert video.record is still.record
+    assert [field.name for field in video.fields] == [field.name for field in still.fields]
+    assert video.stations == registry.model("ltx2").restart_stations
+    assert still.stations == ()
     with pytest.raises(RuntimeError, match="registry is frozen"):
         registry.register(registry.model("ltx2"))
 
@@ -89,9 +91,9 @@ def test_gmnet_template_documents_only_the_gmnet_schema() -> None:
 
 def test_registry_derives_every_environment_surface_from_record_metadata() -> None:
     registry = config_registry()
-    assert "KINO_OUTPUT_DIR" in registry.environment_variables()
+    assert "KINO_LTX2_OUTPUT_DIR" in registry.environment_variables()
     assert "KINO_GMNET_VARIANT" in registry.environment_variables()
-    assert "KINO_TRANSFORMER_DTYPE" in registry.environment_variables()
+    assert "KINO_LTX2_TRANSFORMER_DTYPE" in registry.environment_variables()
     for model in registry.models():
         template = config_template(model)
         for variables in registry.model(model).environment_variables().values():
@@ -108,7 +110,17 @@ def test_table_registration_rejects_an_undocumented_dataclass_field() -> None:
         ConfigTableSpec(
             path=("sample",),
             record=_Record,
-            fields=(ConfigFieldSpec("first", "Set first", "an integer", 1, "first"),),
+            fields=(
+                ConfigFieldSpec(
+                    "first",
+                    "Set first",
+                    "an integer",
+                    1,
+                    "first",
+                    persistence="intent",
+                    surfaces=STRUCTURED_SURFACES,
+                ),
+            ),
         )
 
 
@@ -117,7 +129,15 @@ def test_required_record_fields_are_limited_to_default_absent_tables() -> None:
     class _RequiredRecord:
         value: int
 
-    field = ConfigFieldSpec("value", "Set value", "an integer", 1, "value")
+    field = ConfigFieldSpec(
+        "value",
+        "Set value",
+        "an integer",
+        1,
+        "value",
+        persistence="intent",
+        surfaces=STRUCTURED_SURFACES,
+    )
     with pytest.raises(ValueError, match="default-present.*required field"):
         ConfigTableSpec(
             path=("sample",),
@@ -201,7 +221,9 @@ def test_save_all_coverage_rejects_an_untagged_new_boolean() -> None:
                 "true or false",
                 True,
                 "save_known",
+                persistence="intent",
                 groups=frozenset({ConfigGroup.SAVE_ALL_CANDIDATE}),
+                surfaces=STRUCTURED_SURFACES,
             ),
             ConfigFieldSpec(
                 "save_new",
@@ -209,6 +231,8 @@ def test_save_all_coverage_rejects_an_untagged_new_boolean() -> None:
                 "true or false",
                 True,
                 "save_new",
+                persistence="intent",
+                surfaces=STRUCTURED_SURFACES,
             ),
             ConfigFieldSpec(
                 "save_all_sidecars",
@@ -216,6 +240,8 @@ def test_save_all_coverage_rejects_an_untagged_new_boolean() -> None:
                 "true or false",
                 True,
                 "save_all_sidecars",
+                persistence="intent",
+                surfaces=STRUCTURED_SURFACES,
             ),
         ),
     )
@@ -225,9 +251,12 @@ def test_save_all_coverage_rejects_an_untagged_new_boolean() -> None:
         "",
         "sample",
         "model",
+        persistence="intent",
         virtual=True,
         default="sample",
         choices=("sample",),
+        surfaces=MODEL_SURFACES,
+        cli=MODEL_CONTROL.binding,
     )
     implication = ConfigImplication(
         trigger=("output", "save_all_sidecars"),
@@ -241,6 +270,8 @@ def test_save_all_coverage_rejects_an_untagged_new_boolean() -> None:
             model="sample",
             title="Sample configuration",
             introduction=("Describe the sample configuration.",),
+            restart_stations=(),
+            no_restart_reason="The sample contribution has no saved station.",
             root_fields=(model,),
             tables=(output,),
             implications=(implication,),
@@ -258,26 +289,51 @@ def test_default_text_cannot_override_a_concrete_non_environment_default() -> No
         "an integer",
         1,
         "value",
+        persistence="intent",
         default_text="one",
+        surfaces=STRUCTURED_SURFACES,
     )
     with pytest.raises(ValueError, match="default_text is permitted only"):
         ConfigTableSpec(path=("sample",), record=_Record, fields=(field,))
 
 
-def test_field_purpose_requires_the_consistent_imperative_style() -> None:
-    with pytest.raises(ValueError, match="imperative convention"):
-        ConfigFieldSpec("value", "Output value", "an integer", 1, "value")
-
-
 def test_field_rejects_an_unregistered_semantic_group() -> None:
+    @dataclass(frozen=True)
+    class _Record:
+        value: int = 1
+
+    field = ConfigFieldSpec(
+        "value",
+        "Set the value",
+        "an integer",
+        1,
+        "value",
+        persistence="intent",
+        groups=frozenset({"typo"}),
+        surfaces=STRUCTURED_SURFACES,
+    )
+    model = ConfigFieldSpec(
+        "model",
+        "Select the sample model",
+        "",
+        "sample",
+        "model",
+        persistence="intent",
+        virtual=True,
+        default="sample",
+        choices=("sample",),
+        surfaces=MODEL_SURFACES,
+        cli=MODEL_CONTROL.binding,
+    )
     with pytest.raises(ValueError, match="unknown semantic groups: typo"):
-        ConfigFieldSpec(
-            "value",
-            "Set the value",
-            "an integer",
-            1,
-            "value",
-            groups=frozenset({"typo"}),
+        ModelConfigSpec(
+            model="sample",
+            title="Sample configuration",
+            introduction=("Describe the sample configuration.",),
+            restart_stations=(),
+            no_restart_reason="The sample contribution has no saved station.",
+            root_fields=(model,),
+            tables=(ConfigTableSpec(path=("sample",), record=_Record, fields=(field,)),),
         )
 
 
@@ -305,6 +361,7 @@ def test_every_template_field_keeps_complete_structural_documentation() -> None:
             lines = _render_field(
                 field,
                 table=table,
+                model=model,
                 table_enabled=True,
                 include_assignment=include_assignment,
             )
@@ -326,13 +383,14 @@ def test_every_template_field_keeps_complete_structural_documentation() -> None:
 def test_every_template_table_keeps_its_field_block_spacing() -> None:
     for model in template_models():
         for table in config_registry().model(model).tables:
-            rendered = "\n".join(_render_table(table))
+            rendered = "\n".join(_render_table(table, model=model))
             if table.starter_enabled:
                 assert rendered.count("\n\n\n") == len(table.fields)
                 continue
             assert "\n\n" not in rendered
             for field in table.fields:
-                assert f"# {field.name}\n" in rendered
+                marker = " (required)" if table.default_kind(field) == "required" else ""
+                assert f"# {field.name}{marker}\n" in rendered
 
 
 def test_default_init_writes_a_round_trippable_ltx2_config(
@@ -408,7 +466,7 @@ def test_config_init_help_names_model_selection(capsys) -> None:
         parser.parse_args(["init", "--help"])
     assert exit_info.value.code == 0
     output = capsys.readouterr().out
-    assert "--model {gmnet,ltx2}" in output
+    assert "--model {flux2,gmnet,krea2,ltx2}" in output
     assert "--output OUTPUT" in output
 
 
@@ -417,4 +475,125 @@ def test_config_without_a_subcommand_names_the_public_choice(capsys) -> None:
     with pytest.raises(SystemExit) as exit_info:
         parser.parse_args([])
     assert exit_info.value.code == 2
-    assert "{init}" in capsys.readouterr().err
+    assert "{init,inspect}" in capsys.readouterr().err
+
+
+def test_the_klein_template_assembles_without_a_config_output_flag(tmp_path: Path) -> None:
+    """F-21: the command the generated template prints has to run."""
+    from kinomlx.models.flux2.arguments import build_parser as klein_parser
+    from kinomlx.models.flux2.config import assemble as klein_assemble
+
+    output = tmp_path / "flux2.toml"
+    assert main(["config", "init", "--model", "flux2", "--output", str(output)]) == 0
+    generated = output.read_text(encoding="utf-8")
+    assert f"#   kinomlx --config {output}" in generated
+    assert tomllib.loads(generated)["generate"]["prompt"] == (
+        "A cinematic portrait in afternoon light"
+    )
+    # The --print-config exemption cannot cover this path, so it proves the file runs.
+    invocation = klein_assemble(klein_parser().parse_args(["--config", str(output)]))
+    assert invocation.generate.prompts() == ("A cinematic portrait in afternoon light",)
+
+
+def test_a_required_field_reads_as_required_in_every_template() -> None:
+    """F-28: nothing with no default may print a default a reader could rely on."""
+    seen = 0
+    for model in template_models():
+        schema = config_registry().model(model)
+        template = config_template(model)
+        for table in schema.tables:
+            for field in table.fields:
+                if table.default_kind(field) != "required":
+                    continue
+                seen += 1
+                block = template.split(f"# {field.purpose}.")[1].split("\n\n")[0]
+                assert "# Default: required." in block
+                assert "# Default: unset." not in block
+    assert seen >= 5
+
+
+def test_a_missing_required_member_names_its_configuration_path() -> None:
+    """F-28: a nested constructor argument is not a spelling a reader can act on."""
+    from kinomlx.config import ConfigError, dataclass_from_mapping
+    from kinomlx.models.ltx2.types import ImageConditioningConfig
+
+    with pytest.raises(ConfigError) as error:
+        dataclass_from_mapping(
+            ImageConditioningConfig, {"frame_index": 0}, table="[generate].image"
+        )
+    assert str(error.value) == "[generate].image.path is required"
+
+
+@pytest.mark.parametrize("model", ["flux2", "krea2", "ltx2"])
+def test_templates_document_every_adapter_member(model: str) -> None:
+    """F-30: the file meant to document the inputs has to name the per-adapter ones."""
+    schema = config_registry().model(model)
+    field = next(
+        item
+        for item in schema.table(("generate",)).fields
+        if item.name == "adapters" and item.item_schema is not None
+    )
+    assert field.item_schema is not None
+    template = config_template(model)
+    block = template.split("# Select ordered user adapters.")[1].split("\n\n")[0]
+    assert "# Members:" in block
+    example = block[block.index("# adapters = [") :]
+    for member in field.item_schema.fields:
+        assert f"#   {member.name} " in block or f"#   {member.name}  " in block
+        assert f"{member.name} = " in example
+    # Every example record has to be legal on its own, not only well formed.
+    parsed = tomllib.loads(
+        "\n".join(line.removeprefix("# ").removeprefix("#") for line in example.splitlines())
+    )
+    for index, item in enumerate(parsed["adapters"]):
+        field.item_schema.coerce_members(item, f"[generate].adapters[{index}]")
+
+
+@pytest.mark.parametrize("model", ["flux2", "krea2", "ltx2"])
+def test_every_restart_selector_documents_what_omitting_it_means(model: str) -> None:
+    """F-38: the three models say the same kind of thing about the same selectors."""
+    table = config_registry().model(model).table(("restart",))
+    template = config_template(model)
+    assert "# Note: Omit the whole [restart] table to start a fresh run." in template
+    for field in table.fields:
+        if table.default_kind(field) == "required" or field.choices:
+            continue
+        # An optional selector with no default says what omitting it selects.
+        assert field.default_text is not None, f"{model} [restart].{field.name}"
+    rendered = "\n".join(_render_table(table, model=model))
+    assert "# Default: unset." not in rendered
+
+
+@pytest.mark.parametrize("model", ["flux2", "krea2", "ltx2"])
+def test_every_model_prints_a_generate_defaults_block(model: str, capsys) -> None:
+    """F-38: the reference block is the same shape for every model."""
+    arguments = {"flux2": ("--prompt", "a still"), "krea2": ("--prompt", "a still")}.get(
+        model, ("--prompt", "a clip")
+    )
+    assert main(["--model", model, "--print-config", *arguments]) == 0
+    printed = capsys.readouterr().out
+    assert "# [generate]\n" in printed
+
+
+def _save_all_implication(schema):
+    return next(
+        item for item in schema.implications if item.trigger == ("output", "save_all_sidecars")
+    )
+
+
+def test_an_implication_cannot_both_imply_and_inherit_a_field() -> None:
+    schema = config_registry().model("ltx2")
+    implication = _save_all_implication(schema)
+    broken = replace(implication, inherited=(implication.implied[0][0],))
+    implications = tuple(broken if item is implication else item for item in schema.implications)
+    with pytest.raises(ValueError, match="both declares and inherits"):
+        replace(schema, implications=implications)
+
+
+def test_an_implication_cannot_inherit_its_own_trigger() -> None:
+    schema = config_registry().model("ltx2")
+    implication = _save_all_implication(schema)
+    broken = replace(implication, inherited=(implication.trigger,))
+    implications = tuple(broken if item is implication else item for item in schema.implications)
+    with pytest.raises(ValueError, match="cannot inherit itself"):
+        replace(schema, implications=implications)

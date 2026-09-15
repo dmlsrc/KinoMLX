@@ -5,8 +5,6 @@ what a terminal must encode. Keeping those facts separate prevents a sink
 from relabelling scene-linear or working-space values as display video.
 """
 
-from __future__ import annotations
-
 from dataclasses import dataclass
 from enum import StrEnum
 from fractions import Fraction
@@ -257,10 +255,10 @@ def validate_sdr_output_plan(plan: OutputColorPlan) -> None:
 
 
 __all__ = [
-    "BT2020_HLG_DELIVERY",
     "BT709_SDR_420_DELIVERY",
     "BT709_SDR_422_DELIVERY",
     "BT709_SDR_DELIVERY",
+    "BT2020_HLG_DELIVERY",
     "ChromaSubsampling",
     "ColorMatrix",
     "ColorPrimaries",
@@ -277,8 +275,8 @@ __all__ = [
     "VideoLayout",
     "VideoSignalSpec",
     "VideoValueDomain",
-    "validate_sdr_output_plan",
-    "validate_sdr_delivery",
     "validate_encoded_delivery",
     "validate_hlg_delivery",
+    "validate_sdr_delivery",
+    "validate_sdr_output_plan",
 ]

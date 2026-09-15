@@ -1,7 +1,5 @@
 """Repository text stays portable and free of typographic Unicode drift."""
 
-from __future__ import annotations
-
 import tomllib
 from pathlib import Path
 
@@ -13,7 +11,9 @@ ROOT_FILES = (
     REPO / "LICENSE",
     REPO / "pyproject.toml",
 )
-TEXT_SUFFIXES = frozenset({".py", ".md", ".toml"})
+TEXT_SUFFIXES = frozenset(
+    {".py", ".md", ".toml", ".json", ".txt", ".yaml", ".yml", ".sh", ".ini", ".cfg"}
+)
 
 
 def test_public_project_text_is_ascii() -> None:

@@ -17,8 +17,6 @@ Everything here is separable: each axis is either a small fixed tap
 gather or one dense weight-matrix matmul. Pure MLX, float32.
 """
 
-from __future__ import annotations
-
 import math
 
 import mlx.core as mx
@@ -66,13 +64,10 @@ def _half_pixel_taps(
                 weight = _keys_cubic(distance, kernel_a)
             indices[slot].append(min(max(base + offset, 0), in_length - 1))
             weights[slot].append(weight)
-    for slot in range(len(offsets)):
-        taps.append(
-            (
-                mx.array(indices[slot], dtype=mx.int32),
-                mx.array(weights[slot], dtype=mx.float32),
-            )
-        )
+    taps.extend(
+        (mx.array(indices[slot], dtype=mx.int32), mx.array(weights[slot], dtype=mx.float32))
+        for slot in range(len(offsets))
+    )
     return taps
 
 

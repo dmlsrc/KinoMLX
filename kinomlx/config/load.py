@@ -1,12 +1,11 @@
 """TOML loading and ordered config composition."""
 
-from __future__ import annotations
-
 import tomllib
 from pathlib import Path
 
+from kinomlx.config_values import ConfigError
+
 from .merge import merge_configs
-from .validate import ConfigError
 
 
 def load_config(path: str | Path) -> dict[str, object]:

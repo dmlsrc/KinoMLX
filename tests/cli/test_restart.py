@@ -1,27 +1,36 @@
 """CLI contracts for restarting from saved KinoMLX station products."""
 
-from __future__ import annotations
-
 import json
 from datetime import datetime
 from pathlib import Path
 
+import mlx.core as mx
 import pytest
 
-import kinomlx.cli.config as config_module
-from kinomlx.cli.args import build_parser
-from kinomlx.cli.config import assemble, resolve_for_execution, validate_for_execution
 from kinomlx.config import ConfigError, dump_config
+from kinomlx.config.assembly import config_table
 from kinomlx.io.fingerprints import file_sha256
-from kinomlx.models.ltx2.pipelines.restart import DistilledRestart
+from kinomlx.models.ltx2.arguments import build_parser
+from kinomlx.models.ltx2.artifacts import distilled_stage_latents_artifact
+from kinomlx.models.ltx2.config import (
+    assemble,
+    resolve_for_execution,
+    validate_for_execution,
+)
+from kinomlx.models.ltx2.restart import DistilledRestart
+from kinomlx.models.ltx2.settings import STREAM_TRANSFORMER_RESIDENT_BLOCKS
 from kinomlx.settings import Settings
 from tests.cli.test_main import _generation_output
+from tests.config.saved_records import saved_run_configuration
 
 
 def _source_run(
     tmp_path: Path,
     *,
     generation: str = "2.5",
+    prompt: str = "parent prompt",
+    generate: dict[str, object] | None = None,
+    model_settings: dict[str, object] | None = None,
     include_stage_1: bool = True,
     include_final: bool = True,
     include_text: bool = True,
@@ -42,34 +51,38 @@ def _source_run(
         paths["text_conditioning"].write_bytes(b"text")
     outputs = {name: str(path) for name, path in paths.items() if path.is_file()}
     payload = {
-        "schema_version": 1,
         "status": "completed",
         "model": "ltx2",
-        "invocation": {
-            "model": "ltx2",
-            "generate": {
-                "prompt": "parent prompt",
-                "width": 768,
-                "height": 448,
-                "frames": 121,
-                "fps": 24.0,
-                "seed": 42,
-                "generate_audio": True,
+        **saved_run_configuration(
+            "ltx2",
+            {
+                "model": "ltx2",
+                "generate": {
+                    "prompt": prompt,
+                    "width": 768,
+                    "height": 448,
+                    "frames": 121,
+                    "fps": 24.0,
+                    "seed": 42,
+                    "generate_audio": True,
+                    **(generate or {}),
+                },
+                "output": {
+                    "path": str(paths["video"]),
+                    "save_run_log": True,
+                },
+                "model_settings": {
+                    "model_generation": generation,
+                    "video_vae": "conv",
+                    "video_vae_path": str(tmp_path / "parent-conv-vae.safetensors"),
+                    **(model_settings or {}),
+                },
+                "model_artifacts": {
+                    "save_latents": True,
+                    "save_text_conditioning": True,
+                },
             },
-            "output": {
-                "path": str(paths["video"]),
-                "save_run_log": True,
-            },
-            "model_settings": {
-                "model_generation": generation,
-                "video_vae": "conv",
-                "video_vae_path": str(tmp_path / "parent-conv-vae.safetensors"),
-            },
-            "model_artifacts": {
-                "save_latents": True,
-                "save_text_conditioning": True,
-            },
-        },
+        ),
         "outputs": outputs,
         "generation": {
             "model_generation": generation,
@@ -107,7 +120,8 @@ def test_restart_defaults_to_final_latent_decode_and_safe_new_output(tmp_path: P
     assert invocation.output.path is None
     assert invocation.output.directory == tmp_path
     assert invocation.output.prefix == "parent_final_decode"
-    assert invocation.model_artifacts.save_latents is False
+    # Decode re-emits the final latent it read, so the parent's request survives.
+    assert invocation.model_artifacts.save_latents is True
     assert invocation.model_artifacts.save_text_conditioning is False
 
     resolved = resolve_for_execution(invocation, now=datetime(2026, 8, 22, 20, 0, 0))
@@ -163,8 +177,43 @@ def test_decode_restart_rejects_changes_to_stations_it_skips(
     tmp_path: Path,
 ) -> None:
     run, _paths = _source_run(tmp_path)
-    with pytest.raises(ConfigError, match="earlier-station values cannot be changed"):
+    with pytest.raises(ConfigError, match="belongs to an earlier station"):
         _assemble(run, *arguments)
+
+
+def test_restart_refusal_names_the_station_and_quotes_the_declared_reason(
+    tmp_path: Path,
+) -> None:
+    run, _paths = _source_run(tmp_path)
+
+    with pytest.raises(ConfigError) as refusal:
+        _assemble(run, "--sigmas-stage-2", "0.95,0.8,0.6,0.3,0")
+
+    assert str(refusal.value) == (
+        "[restart]: decode restart: [generate].stage_2_sigmas belongs to an earlier "
+        "station: The saved final latent already embodies the stage-2 schedule."
+    )
+
+
+def test_decode_restart_accepts_a_parent_prompt_with_trailing_whitespace(tmp_path: Path) -> None:
+    """A generated multiline template block parses back with a trailing newline."""
+    run, _paths = _source_run(tmp_path, prompt="parent prompt\n")
+
+    invocation = _assemble(run)
+
+    assert invocation.request.prompt == "parent prompt"
+
+
+def test_decode_restart_accepts_a_streamed_transformer_parent(tmp_path: Path) -> None:
+    """The saved preset expands on both sides, so no flags means no change."""
+    run, _paths = _source_run(tmp_path, model_settings={"stream_transformer": True})
+
+    invocation = _assemble(run)
+
+    assert invocation.model_settings.stream_transformer is True
+    assert (
+        invocation.model_settings.transformer_resident_blocks == STREAM_TRANSFORMER_RESIDENT_BLOCKS
+    )
 
 
 def test_restart_rejects_audio_length_policy_change_after_latent_generation(
@@ -192,7 +241,8 @@ def test_stage_2_restart_requires_and_inherits_saved_text(tmp_path: Path) -> Non
     assert invocation.restart is not None
     assert invocation.restart.selected_latents == paths["stage_1_latents"]
     assert invocation.request.text_conditioning == paths["text_conditioning"]
-    assert invocation.model_artifacts.save_text_conditioning is False
+    # Stage-2 re-emits the saved text it consumed, so the parent's request survives.
+    assert invocation.model_artifacts.save_text_conditioning is True
     validate_for_execution(invocation)
 
 
@@ -210,6 +260,22 @@ def test_stage_2_restart_accepts_explicit_text_substitution(tmp_path: Path) -> N
 
     assert invocation.request.text_conditioning == replacement
     validate_for_execution(invocation)
+
+
+def test_stage_2_restart_accepts_a_new_stage_2_schedule_and_decode_refuses_it(
+    tmp_path: Path,
+) -> None:
+    """Stage-2 reruns its own schedule; the saved final latent already embodies it."""
+    run, _paths = _source_run(tmp_path)
+    schedule = "0.95,0.8,0.6,0.3,0"
+
+    invocation = _assemble(run, "--restart-from", "stage-2", "--sigmas-stage-2", schedule)
+
+    assert invocation.request.stage_2_sigmas == (0.95, 0.8, 0.6, 0.3, 0.0)
+    assert invocation.request.stage_1_sigmas == ()
+
+    with pytest.raises(ConfigError, match=r"\[generate\]\.stage_2_sigmas"):
+        _assemble(run, "--sigmas-stage-2", schedule)
 
 
 def test_stage_2_restart_rejects_geometry_and_prompt_changes(tmp_path: Path) -> None:
@@ -281,7 +347,7 @@ def test_file_config_rejects_non_table_restart(tmp_path: Path) -> None:
 
 def test_restart_table_rejects_non_string_keys() -> None:
     with pytest.raises(ConfigError, match=r"\[restart\] keys must be strings"):
-        config_module._table({"restart": {1: "invalid"}}, "restart")
+        config_table({"restart": {1: "invalid"}}, "restart")
 
 
 def test_stage_2_restart_without_text_sidecar_fails_before_execution(tmp_path: Path) -> None:
@@ -291,7 +357,7 @@ def test_stage_2_restart_without_text_sidecar_fails_before_execution(tmp_path: P
         validate_for_execution(invocation)
 
 
-def test_stage_2_restart_rejects_request_to_resave_consumed_text(tmp_path: Path) -> None:
+def test_stage_2_restart_may_resave_the_text_it_consumed(tmp_path: Path) -> None:
     run, _paths = _source_run(tmp_path)
     invocation = _assemble(
         run,
@@ -299,8 +365,27 @@ def test_stage_2_restart_rejects_request_to_resave_consumed_text(tmp_path: Path)
         "stage-2",
         "--save-text-conditioning",
     )
-    with pytest.raises(ConfigError, match="consumed, not produced"):
+
+    validate_for_execution(invocation)
+    assert invocation.model_artifacts.save_text_conditioning is True
+
+
+def test_decode_restart_still_refuses_artifacts_it_cannot_produce(tmp_path: Path) -> None:
+    run, _paths = _source_run(tmp_path)
+    invocation = _assemble(run, "--save-text-conditioning")
+
+    with pytest.raises(
+        ConfigError, match="save_text_conditioning is not produced by a decode restart"
+    ):
         validate_for_execution(invocation)
+
+
+def test_decode_restart_may_resave_the_latent_it_consumed(tmp_path: Path) -> None:
+    run, _paths = _source_run(tmp_path)
+    invocation = _assemble(run, "--save-latents")
+
+    validate_for_execution(invocation)
+    assert invocation.model_artifacts.save_latents is True
 
 
 def test_restart_latent_substitution_warns_and_records_hash_without_veto(
@@ -317,7 +402,7 @@ def test_restart_latent_substitution_warns_and_records_hash_without_veto(
 
     invocation = _assemble(run, "--restart-latents", str(replacement))
     assert invocation.restart is not None
-    with caplog.at_level("WARNING"):
+    with caplog.at_level("WARNING", logger="kinomlx.restart_receipts"):
         record = invocation.restart.to_record(
             text_conditioning=invocation.request.text_conditioning,
             decoder_seed=invocation.request.seed,
@@ -353,7 +438,7 @@ def test_restart_hash_read_failure_is_observed_but_never_a_load_veto(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    import kinomlx.cli.restart as restart_module
+    import kinomlx.restart_receipts as receipts_module
 
     run, paths = _source_run(tmp_path)
     payload = json.loads(run.read_text(encoding="utf-8"))
@@ -362,12 +447,12 @@ def test_restart_hash_read_failure_is_observed_but_never_a_load_veto(
     invocation = _assemble(run)
     assert invocation.restart is not None
     monkeypatch.setattr(
-        restart_module,
+        receipts_module,
         "file_sha256",
         lambda _path: (_ for _ in ()).throw(OSError("hash probe failed")),
     )
 
-    with caplog.at_level("WARNING"):
+    with caplog.at_level("WARNING", logger="kinomlx.restart_receipts"):
         record = invocation.restart.to_record(
             text_conditioning=invocation.request.text_conditioning,
             decoder_seed=invocation.request.seed,
@@ -409,6 +494,7 @@ def test_cli_dispatches_the_public_restart_recipe_and_records_inputs(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import kinomlx.cli.main as main_module
+    import kinomlx.models.ltx2.command as command_module
 
     run, paths = _source_run(tmp_path)
     payload = json.loads(run.read_text(encoding="utf-8"))
@@ -418,9 +504,22 @@ def test_cli_dispatches_the_public_restart_recipe_and_records_inputs(
     calls = {}
 
     class _Runner:
+        def __init__(self, artifact_sink):
+            self._artifacts = artifact_sink
+
         def restart(self, request, restart):
             calls["restart"] = restart
             calls["request"] = request
+            # A decode restart re-emits the latent product it consumed, so a
+            # run that finishes normally hands it to the sink.
+            self._artifacts.save(
+                distilled_stage_latents_artifact(
+                    2,
+                    video_latent=mx.zeros((1, 1, 1, 1), dtype=mx.bfloat16),
+                    audio_latent=None,
+                    final=True,
+                )
+            )
             return _generation_output()
 
         def run(self, recipe, request):
@@ -430,8 +529,10 @@ def test_cli_dispatches_the_public_restart_recipe_and_records_inputs(
         output.touch()
         return output
 
-    monkeypatch.setattr(main_module, "create_runner", lambda *_args, **_kwargs: _Runner())
-    monkeypatch.setattr(main_module, "write_generation", fake_write_generation)
+    monkeypatch.setattr(
+        command_module, "create_runner", lambda *_args, **kwargs: _Runner(kwargs["artifact_sink"])
+    )
+    monkeypatch.setattr(command_module, "write_generation", fake_write_generation)
 
     assert (
         main_module.main(
@@ -463,4 +564,60 @@ def test_cli_dispatches_the_public_restart_recipe_and_records_inputs(
     assert record["restart"]["inputs"]["final_latents"]["sha256"] == file_sha256(
         paths["final_latents"]
     )
-    assert record["output_fingerprints"] == {}
+    # The re-emitted latent is a fresh output of this run, fingerprinted as one.
+    assert set(record["output_fingerprints"]) == {"final_latents"}
+
+
+def test_a_layer_asking_for_both_tiling_modes_is_refused(tmp_path: Path) -> None:
+    """F-29: a tile value and a non-custom mode in one layer say two things."""
+    config = tmp_path / "tiling.toml"
+    config.write_text(
+        '[generate]\nprompt = "a clip"\n\n'
+        '[generate.vae_tiling]\nmode = "single"\nspatial_tile_pixels = 256\n',
+        encoding="utf-8",
+    )
+    with pytest.raises(ConfigError) as error:
+        assemble(
+            build_parser().parse_args(["--config", str(config), "--print-config"]),
+            base_settings=Settings(),
+        )
+    assert str(error.value) == (
+        f'{config}: [generate].vae_tiling: tile values require mode = "custom"'
+    )
+
+
+def test_an_overlap_beside_an_inactive_mode_stays_a_redundancy(tmp_path: Path) -> None:
+    """F-29 boundary: an overlap has a default that legacy whole dumps wrote out."""
+    config = tmp_path / "overlap.toml"
+    config.write_text(
+        '[generate]\nprompt = "a clip"\n\n'
+        '[generate.vae_tiling]\nmode = "single"\ntemporal_overlap_frames = 16\n',
+        encoding="utf-8",
+    )
+    invocation = assemble(
+        build_parser().parse_args(["--config", str(config), "--print-config"]),
+        base_settings=Settings(),
+    )
+    assert invocation.request.vae_tiling.mode == "single"
+
+
+def test_a_tile_value_alone_still_selects_custom_tiling(tmp_path: Path) -> None:
+    invocation = assemble(
+        build_parser().parse_args(
+            ["--prompt", "a clip", "--vae-spatial-tile-pixels", "256", "--print-config"]
+        ),
+        base_settings=Settings(),
+    )
+    assert invocation.request.vae_tiling.mode == "custom"
+    assert invocation.request.vae_tiling.spatial_tile_pixels == 256
+
+
+def test_a_decode_restart_may_switch_a_custom_parent_to_single(tmp_path: Path) -> None:
+    """F-29: a lower layer's geometry is precedence, not a contradiction."""
+    run, _paths = _source_run(
+        tmp_path,
+        generate={"vae_tiling": {"mode": "custom", "spatial_tile_pixels": 256}},
+    )
+    invocation = _assemble(run, "--vae-tiling", "single")
+    assert invocation.request.vae_tiling.mode == "single"
+    assert invocation.request.vae_tiling.spatial_tile_pixels is None

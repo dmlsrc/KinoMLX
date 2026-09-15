@@ -1,7 +1,7 @@
-"""Sequence-start onset-spike detection and mitigation.
+"""Sequence-start waveform onset-spike detection and mitigation.
 
-Some distilled LTX-2.3 AV generations produce a short (~65 ms) loud
-transient at t=0 followed by clean silence until the first spoken word:
+Some generated audio contains a short loud transient at t=0 followed by clean
+silence until the first intended sound:
 
   * Dialog-heavy prompts: the model encodes a broadband loud onset that
     the vocoder's bandwidth extension synthesizes into an audible click.
@@ -39,11 +39,8 @@ Public API
 - ``detect_onset_spike(samples, sample_rate, ...)`` -> bool
 - ``trim_onset(samples, sample_rate, *, trim_ms)`` -> trimmed mx.array
 - ``mitigate_onset(samples, sample_rate, *, mode, trim_ms)`` -> result
-- ``detect_onset_latent_spike(latent, ...)`` -> bool
 - ``parse_trim_mode(s)`` -> (mode, trim_ms) for the CLI flag
 """
-
-from __future__ import annotations
 
 from dataclasses import dataclass
 
@@ -133,9 +130,9 @@ def detect_onset_spike(
         mono = mx.mean(arr, axis=0)
         n_total = mono.shape[0]
 
-        win = max(1, int(round(window_ms / 1000.0 * sample_rate)))
-        silence_start = int(round(silence_start_ms / 1000.0 * sample_rate))
-        silence_end = int(round(silence_end_ms / 1000.0 * sample_rate))
+        win = max(1, round(window_ms / 1000.0 * sample_rate))
+        silence_start = round(silence_start_ms / 1000.0 * sample_rate)
+        silence_end = round(silence_end_ms / 1000.0 * sample_rate)
 
         # Need the full silence window present to evaluate the second condition.
         if n_total < silence_end or win <= 0:
@@ -183,7 +180,7 @@ def trim_onset(
     arr = _to_audio_ct_mlx(samples, dtype=mx.float32)
     if trim_ms <= 0:
         return arr
-    n_zero = int(round(trim_ms / 1000.0 * sample_rate))
+    n_zero = round(trim_ms / 1000.0 * sample_rate)
     n_zero = min(n_zero, arr.shape[1])
     if n_zero <= 0:
         return arr
@@ -288,55 +285,3 @@ def mitigate_onset(
         )
 
     raise ValueError(f"Unknown onset mitigation mode {mode!r}. Expected one of: auto, off, force.")
-
-
-# ---------------------------------------------------------------------------
-# Latent-domain onset DETECTION (causal-VAE sequence-start boundary spike)
-# ---------------------------------------------------------------------------
-# The audio VAE is causal in time, so its first latent frame is encoded against
-# zero-padding (a cold-start boundary). In the 8-channel audio latent this lands
-# as a concentrated single-channel spike at frame 0 that the vocoder renders as a
-# broadband t=0 click. Total frame-0 energy is normal -- it is the per-channel
-# concentration that clicks -- so the waveform RMS detector above misses it.
-#
-# This detector is the reliable trigger for that click class. The mitigation is
-# the waveform `trim_onset` zero-fill applied to the decoded audio: the spike
-# decodes to a transient confined to the leading ~120 ms (well before the first
-# spoken word at ~175 ms), so zeroing that region clears it with no content loss.
-# Flattening the latent first was tried and dropped: it only dents the spike (the
-# decoder is itself causal and leaves an audible residual), and the waveform
-# zero-fill overwrites that region anyway. Decode-only -- saved sidecars and
-# stage-2 latents are upstream and untouched.
-
-DEFAULT_LATENT_SPIKE_RATIO = 2.0
-DEFAULT_LATENT_CONCENTRATION = 1.8
-
-
-def _audio_latent_ct(latent: mx.array) -> mx.array:
-    """(B, C, T, F) or (C, T, F) -> (C, T, F)."""
-    return latent[0] if latent.ndim == 4 else latent
-
-
-def detect_onset_latent_spike(
-    latent: mx.array,
-    *,
-    ratio: float = DEFAULT_LATENT_SPIKE_RATIO,
-    concentration: float = DEFAULT_LATENT_CONCENTRATION,
-) -> bool:
-    """True iff the first audio-latent frame has a concentrated single-channel spike.
-
-    Per-channel-per-frame RMS; a channel's frame-0 energy must exceed ``ratio`` x
-    that channel's mean over all frames (anomalous start), AND the frame-0
-    per-channel profile must be concentrated -- peak channel > ``concentration`` x
-    the mean channel -- so a broad all-channel elevation (which decodes quietly)
-    does not trip it.
-    """
-    a = _audio_latent_ct(latent).astype(mx.float32)
-    if a.shape[1] < 4:
-        return False
-    perch = mx.sqrt(mx.mean(a * a, axis=2))  # (C, T)
-    base = mx.mean(perch, axis=1) + 1e-9  # (C,)
-    f0 = perch[:, 0] / base  # (C,)
-    peak = float(mx.max(f0))
-    mean = float(mx.mean(f0))
-    return peak > ratio and peak > concentration * mean

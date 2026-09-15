@@ -1,36 +1,29 @@
-"""Immutable checkpoint inventory and prepared cache policy for LTX-2."""
+"""Immutable checkpoint inventory and weight policy for LTX-2."""
 
-from __future__ import annotations
-
-import re
 from collections.abc import Iterable
 from dataclasses import dataclass, replace
 from enum import StrEnum
 from pathlib import Path
-from typing import TypedDict
 
 import mlx.core as mx
 
-from kinomlx.reporting import Reporter
+from kinomlx.huggingface import cached_snapshots
+from kinomlx.io.identity import (
+    artifact_fingerprint,
+    payload_digest,
+    source_fingerprint,
+)
+from kinomlx.memory_policy import MLXMemoryPolicy
+from kinomlx.models.ltx2.weights.dtypes import resolve_transformer_dtype
 from kinomlx.settings import Settings
 from kinomlx.types import SpatioTemporalScaleFactors
 
-from .cache import (
-    ensure_transformer_cache,
-    ensure_weight_family_caches,
-)
-from .cache.schema import file_signature, payload_digest
-from .cache.weights import resolve_transformer_dtype
 from .compatibility import (
     LTX2CompatibilityReport,
     LTX2ComponentSources,
     inspect_ltx2_compatibility,
 )
-from .metadata import (
-    LTX2CheckpointConfig,
-    TransformerConstructorConfig,
-    checkpoint_config,
-)
+from .metadata import checkpoint_config
 from .precision import LTX2DTypePolicy
 from .settings import (
     LTX2Settings,
@@ -38,7 +31,7 @@ from .settings import (
     parse_ff_layout_specs,
     parse_ff_quantize_specs,
 )
-from .text_encoder.tokenizer_cache import TokenizerCache, ensure_tokenizer_cache
+from .transformer_config import TransformerConstructorConfig
 from .video_vae.config import VideoVAEConfig
 
 _LTX23_REPO_ID = "Lightricks/LTX-2.3"
@@ -122,19 +115,17 @@ class ComponentLocator:
 
     kind: ComponentKind
     source_path: Path
-    cache_path: Path | None = None
     metadata: ComponentMetadata = ComponentMetadata()
     source_fingerprint: str | None = None
 
 
 @dataclass(frozen=True)
 class ComponentResource:
-    """One immutable source/cache location in a prepared inventory."""
+    """One immutable source location in a prepared inventory."""
 
     kind: ComponentKind
     source_path: Path
     source_fingerprint: str
-    cache_path: Path | None
     metadata: ComponentMetadata
 
 
@@ -161,18 +152,15 @@ class LTX2Capabilities:
     text_encoder_family: str
     native_hdr: bool
     generates_audio: bool
-    text_projection_family: str | None = None
-    connector_family: str | None = None
     sampler_policy: str = "deterministic-euler-two-stage"
     generated_keyframes: bool = False
     duration_available: bool = False
     temporal_latent_upscaler_available: bool = False
-    native_signal_domains: tuple[str, ...] = ("normalized-sdr",)
 
 
 @dataclass(frozen=True)
-class TransformerCachePolicy:
-    """Resolved policy needed to bind a fresh model to a prepared cache."""
+class TransformerWeightPolicy:
+    """Resolved policy needed to prepare and bind a fresh model."""
 
     include_audio: bool
     video_ff_layout_specs: tuple[tuple[str, str], ...]
@@ -184,38 +172,20 @@ class TransformerCachePolicy:
     audio_attn_layout_specs: tuple[tuple[str, str], ...] | None
     audio_attn_layout_layers: tuple[int, ...] | None
     adaln_pretranspose: bool
-    transformer_cache_quantize: str
+    transformer_quantize: str
     video_ff_quantize_specs: tuple[tuple[str, str], ...]
     video_ff_quantize_layers: tuple[int, ...]
     video_ff_quantize_group_size: int | None
     video_ff_quantize_bits: int | None
     resident_blocks: int | None
-
-
-class _EnsureTransformerCacheOptions(TypedDict):
-    transformer_dtype: str | mx.Dtype | None
-    cache_mode: str
-    cache_root: Path | str | None
-    include_audio: bool
-    video_ff_layout_specs: tuple[tuple[str, str], ...]
-    video_ff_layout_layers: tuple[int, ...]
-    video_attn_layout_specs: tuple[tuple[str, str], ...]
-    video_attn_layout_layers: tuple[int, ...]
-    audio_ff_layout_specs: tuple[tuple[str, str], ...] | None
-    audio_ff_layout_layers: tuple[int, ...] | None
-    audio_attn_layout_specs: tuple[tuple[str, str], ...] | None
-    audio_attn_layout_layers: tuple[int, ...] | None
-    adaln_pretranspose: bool
-    transformer_cache_quantize: str
-    video_ff_quantize_specs: tuple[tuple[str, str], ...]
-    video_ff_quantize_layers: tuple[int, ...]
-    video_ff_quantize_group_size: int | None
-    video_ff_quantize_bits: int | None
+    transformer_quantize_exclude_layers: tuple[int, ...] = ()
+    adapter_accumulation: str = "float32"
+    transformer_retain: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
 class TransformerExecutionPolicy:
-    """Immutable constructor and allocator settings for component leases."""
+    """Immutable transformer constructor settings for component leases."""
 
     use_steel_attention: bool
     compile_attention: bool
@@ -224,7 +194,7 @@ class TransformerExecutionPolicy:
     fast_mode: bool
     compile_block_groups: int | None
     transformer_compile_group_size: int | None
-    mlx_cache_limit_bytes: int | None
+    check_adapter_weights: bool = True
 
 
 @dataclass(frozen=True)
@@ -235,11 +205,11 @@ class LTX2Resources:
     components: tuple[ComponentResource, ...]
     capabilities: LTX2Capabilities
     dtype_policy: LTX2DTypePolicy
-    cache_policy: TransformerCachePolicy
+    weight_policy: TransformerWeightPolicy
     execution_policy: TransformerExecutionPolicy
     video_vae_config: VideoVAEConfig
     transformer_config: TransformerConstructorConfig | None = None
-    tokenizer_cache: TokenizerCache | None = None
+    memory_policy: MLXMemoryPolicy = MLXMemoryPolicy()
 
     def optional(self, kind: ComponentKind) -> ComponentResource | None:
         """Return an inventory item when the checkpoint/discovery provides it."""
@@ -284,49 +254,11 @@ class LTX2Resources:
     def duration_head_path(self) -> Path:
         return self.require(ComponentKind.DURATION_HEAD).source_path
 
-    @property
-    def transformer_cache_path(self) -> Path:
-        cache_path = self.require(ComponentKind.TRANSFORMER).cache_path
-        if cache_path is None:
-            raise LookupError("prepared transformer resource has no cache path")
-        return cache_path
-
-    @property
-    def transformer_cache_hash(self) -> str:
-        return self.transformer_cache_path.parent.name.rsplit("-", 1)[-1]
-
-
-def _repo_cache_dir(hf_home: Path, repo_id: str) -> Path:
-    return hf_home / "hub" / f"models--{repo_id.replace('/', '--')}"
-
-
-def _cached_snapshots(hf_home: Path, repo_id: str) -> tuple[Path, ...]:
-    root = _repo_cache_dir(hf_home, repo_id) / "snapshots"
-    if not root.is_dir():
-        return ()
-    return tuple(
-        sorted(
-            (path for path in root.iterdir() if path.is_dir()),
-            key=lambda path: path.stat().st_mtime,
-            reverse=True,
-        )
-    )
-
 
 def _ltx25_component_relative_path(name: str, *, video_vae: str) -> str:
     if name == "video_vae_path":
         return _LTX25_VIDEO_VAE_PATHS[video_vae]
     return _LTX25_COMPONENT_PATHS[name]
-
-
-def _cached_ltx25_component(
-    snapshot: Path,
-    name: str,
-    *,
-    video_vae: str = "conv",
-) -> Path | None:
-    candidate = snapshot / _ltx25_component_relative_path(name, video_vae=video_vae)
-    return candidate if candidate.is_file() else None
 
 
 def _local_ltx25_component(
@@ -414,8 +346,8 @@ def _discover_selected_diffusion_video_vae(
     """Resolve the named shared diffusion decoder independently of the transformer."""
     if settings.video_vae != "diffusion" or settings.video_vae_path is not None:
         return settings
-    for snapshot in _cached_snapshots(hf_home, _LTX25_REPO_ID):
-        candidate = _cached_ltx25_component(
+    for snapshot in cached_snapshots(hf_home, _LTX25_REPO_ID):
+        candidate = _local_ltx25_component(
             snapshot,
             "video_vae_path",
             video_vae="diffusion",
@@ -423,7 +355,7 @@ def _discover_selected_diffusion_video_vae(
         if candidate is not None:
             return replace(settings, video_vae_path=candidate)
     raise ValueError(
-        "no cached LTX-2.5 diffusion video VAE was found; download that artifact or set "
+        "no LTX-2.5 diffusion video VAE was found in the Hugging Face snapshots; download that artifact or set "
         "--video-vae-path"
     )
 
@@ -432,15 +364,32 @@ def _discover_generation_selection(
     settings: LTX2Settings,
     infrastructure: Settings,
 ) -> LTX2Settings:
-    """Resolve a cached default pack without making filenames compatibility gates."""
+    """Resolve missing components from local packs and Hugging Face snapshots."""
     if settings.weights_path is not None and settings.weights_path.expanduser().is_dir():
         return _discover_ltx25_pack_directory(settings, settings.weights_path)
-    generation = settings.model_generation or "2.3"
+    if all(
+        getattr(settings, name) is not None
+        or (name == "text_encoder_path" and settings.gemma_path is not None)
+        for name in _LTX25_COMPONENT_PATHS
+    ):
+        return settings
+    generation = settings.model_generation or (
+        checkpoint_config(settings.transformer_path).model_generation
+        if settings.transformer_path is not None and settings.weights_path is None
+        else "2.3"
+    )
     hf_home = infrastructure.hf_home.expanduser()
-    if settings.weights_path is not None or settings.transformer_path is not None:
+    if settings.weights_path is not None:
+        return _discover_selected_diffusion_video_vae(settings, hf_home)
+    if (
+        settings.transformer_path is not None
+        and (settings.text_encoder_path is not None or settings.gemma_path is not None)
+        and settings.video_vae_path is not None
+        and generation == "2.3"
+    ):
         return _discover_selected_diffusion_video_vae(settings, hf_home)
     if generation == "2.3":
-        for snapshot in _cached_snapshots(hf_home, _LTX23_REPO_ID):
+        for snapshot in cached_snapshots(hf_home, _LTX23_REPO_ID):
             for filename in _LTX23_CHECKPOINT_FILENAMES:
                 candidate = snapshot / filename
                 if candidate.is_file():
@@ -449,36 +398,44 @@ def _discover_generation_selection(
                         hf_home,
                     )
         raise ValueError(
-            "no cached default LTX-2.3 checkpoint was found; set --weights-path or "
-            "KINO_WEIGHTS_PATH"
+            "no default LTX-2.3 checkpoint was found in the Hugging Face snapshots; set --weights-path or "
+            "KINO_LTX2_WEIGHTS_PATH"
         )
 
-    snapshots = _cached_snapshots(hf_home, _LTX25_REPO_ID)
+    snapshots = list(cached_snapshots(hf_home, _LTX25_REPO_ID))
+    if settings.transformer_path is not None:
+        parent = settings.transformer_path.expanduser().absolute().parent
+        pack = parent.parent if parent.name == "diffusion_models" else parent
+        if any(_local_ltx25_component(pack, name) is not None for name in _LTX25_COMPONENT_PATHS):
+            snapshots = [pack, *(snapshot for snapshot in snapshots if snapshot != pack)]
     for snapshot in snapshots:
-        required_names = {"transformer_path"}
+        required_names = set()
+        if settings.transformer_path is None:
+            required_names.add("transformer_path")
         if settings.text_encoder_path is None and settings.gemma_path is None:
             required_names.add("text_encoder_path")
         if settings.video_vae_path is None:
             required_names.add("video_vae_path")
         required = {
-            name: snapshot / _ltx25_component_relative_path(name, video_vae=settings.video_vae)
+            name: _local_ltx25_component(snapshot, name, video_vae=settings.video_vae)
             for name in required_names
         }
-        if not all(path.is_file() for path in required.values()):
+        if not all(path is not None for path in required.values()):
             continue
 
         return replace(
             settings,
-            transformer_path=_cached_ltx25_component(snapshot, "transformer_path"),
+            transformer_path=settings.transformer_path
+            or _local_ltx25_component(snapshot, "transformer_path"),
             text_encoder_path=(
                 settings.text_encoder_path
                 if settings.text_encoder_path is not None or settings.gemma_path is not None
-                else _cached_ltx25_component(snapshot, "text_encoder_path")
+                else _local_ltx25_component(snapshot, "text_encoder_path")
             ),
             video_vae_path=(
                 settings.video_vae_path
                 if settings.video_vae_path is not None
-                else _cached_ltx25_component(
+                else _local_ltx25_component(
                     snapshot,
                     "video_vae_path",
                     video_vae=settings.video_vae,
@@ -487,27 +444,29 @@ def _discover_generation_selection(
             audio_vae_path=(
                 settings.audio_vae_path
                 if settings.audio_vae_path is not None
-                else _cached_ltx25_component(snapshot, "audio_vae_path")
+                else _local_ltx25_component(snapshot, "audio_vae_path")
             ),
             spatial_upscaler_path=(
                 settings.spatial_upscaler_path
                 if settings.spatial_upscaler_path is not None
-                else _cached_ltx25_component(snapshot, "spatial_upscaler_path")
+                else _local_ltx25_component(snapshot, "spatial_upscaler_path")
             ),
             temporal_latent_upscaler_path=(
                 settings.temporal_latent_upscaler_path
                 if settings.temporal_latent_upscaler_path is not None
-                else _cached_ltx25_component(snapshot, "temporal_latent_upscaler_path")
+                else _local_ltx25_component(snapshot, "temporal_latent_upscaler_path")
             ),
             duration_head_path=(
                 settings.duration_head_path
                 if settings.duration_head_path is not None
-                else _cached_ltx25_component(snapshot, "duration_head_path")
+                else _local_ltx25_component(snapshot, "duration_head_path")
             ),
         )
+    if settings.transformer_path is not None:
+        return _discover_selected_diffusion_video_vae(settings, hf_home)
     raise ValueError(
-        f"no complete cached LTX-2.5 pack with video_vae={settings.video_vae} was found; "
-        "set --transformer-path and the component overrides"
+        f"no usable LTX-2.5 component pack with video_vae={settings.video_vae} was found; "
+        "set --weights-path to a pack directory or supply the missing component paths"
     )
 
 
@@ -524,7 +483,7 @@ def _discover_gemma_path(
     # than silently swapping encoders, and downstream compatibility reports
     # the text encoder as unavailable.
     repo_id = _GEMMA_REPO_IDS[settings.gemma_variant]
-    for snapshot in _cached_snapshots(infrastructure.hf_home.expanduser(), repo_id):
+    for snapshot in cached_snapshots(infrastructure.hf_home.expanduser(), repo_id):
         if (snapshot / "config.json").is_file():
             return snapshot.resolve()
     return None
@@ -544,28 +503,12 @@ def _discover_spatial_upscaler_path(
         sibling = weights_path.parent / filename
         if sibling.is_file():
             return sibling.resolve()
-    for snapshot in _cached_snapshots(infrastructure.hf_home.expanduser(), _LTX23_REPO_ID):
+    for snapshot in cached_snapshots(infrastructure.hf_home.expanduser(), _LTX23_REPO_ID):
         for filename in _SPATIAL_UPSCALER_FILENAMES:
             candidate = snapshot / filename
             if candidate.is_file():
                 return candidate.resolve()
     return None
-
-
-def _source_fingerprint(path: Path) -> str:
-    signature_path = path / "config.json" if path.is_dir() else path
-    return payload_digest({"source": file_signature(signature_path)})
-
-
-def _artifact_fingerprint(path: Path) -> str:
-    """Return a cheap cache/receipt identity that never gates compatibility."""
-    if path.is_dir():
-        return f"source:{_source_fingerprint(path)}"
-    if path.is_symlink():
-        blob_name = path.resolve().name
-        if re.fullmatch(r"[0-9a-f]{64}", blob_name):
-            return f"sha256:{blob_name}"
-    return f"source:{_source_fingerprint(path)}"
 
 
 def resolve_component_inventory(
@@ -581,9 +524,6 @@ def resolve_component_inventory(
         # Preserve a Hugging Face snapshot's logical filename. Its symlink
         # target is an extensionless blob, which MLX cannot format-dispatch.
         source_path = locator.source_path.expanduser().absolute()
-        cache_path = (
-            None if locator.cache_path is None else locator.cache_path.expanduser().resolve()
-        )
         resources.append(
             ComponentResource(
                 kind=locator.kind,
@@ -591,18 +531,17 @@ def resolve_component_inventory(
                 source_fingerprint=(
                     locator.source_fingerprint
                     if locator.source_fingerprint is not None
-                    else _source_fingerprint(source_path)
+                    else source_fingerprint(source_path)
                 ),
-                cache_path=cache_path,
                 metadata=locator.metadata,
             )
         )
     return tuple(sorted(resources, key=lambda item: item.kind.value))
 
 
-def _cache_policy(settings: LTX2Settings) -> TransformerCachePolicy:
+def _weight_policy(settings: LTX2Settings) -> TransformerWeightPolicy:
     mirrored = settings.audio_layout_mirror
-    return TransformerCachePolicy(
+    return TransformerWeightPolicy(
         include_audio=True,
         video_ff_layout_specs=parse_ff_layout_specs(settings.video_ff_layout_specs),
         video_ff_layout_layers=tuple(settings.video_ff_layout_layers),
@@ -617,40 +556,16 @@ def _cache_policy(settings: LTX2Settings) -> TransformerCachePolicy:
         ),
         audio_attn_layout_layers=(None if mirrored else tuple(settings.audio_attn_layout_layers)),
         adaln_pretranspose=settings.adaln_pretranspose,
-        transformer_cache_quantize=settings.transformer_cache_quantize,
+        transformer_quantize=settings.transformer_quantize,
+        transformer_quantize_exclude_layers=tuple(settings.transformer_quantize_exclude_layers),
         video_ff_quantize_specs=parse_ff_quantize_specs(settings.video_ff_quantize_specs),
         video_ff_quantize_layers=tuple(settings.video_ff_quantize_layers),
         video_ff_quantize_group_size=settings.video_ff_quantize_group_size,
         video_ff_quantize_bits=settings.video_ff_quantize_bits,
         resident_blocks=settings.transformer_resident_blocks,
+        transformer_retain=settings.transformer_retain,
+        adapter_accumulation=settings.resolved_adapter_accumulation(),
     )
-
-
-def _transformer_cache_options(
-    policy: TransformerCachePolicy,
-    settings: LTX2Settings,
-    infrastructure: Settings,
-) -> _EnsureTransformerCacheOptions:
-    return {
-        "transformer_dtype": settings.transformer_dtype,
-        "cache_mode": infrastructure.cache_mode,
-        "cache_root": infrastructure.cache_dir,
-        "include_audio": policy.include_audio,
-        "video_ff_layout_specs": policy.video_ff_layout_specs,
-        "video_ff_layout_layers": policy.video_ff_layout_layers,
-        "video_attn_layout_specs": policy.video_attn_layout_specs,
-        "video_attn_layout_layers": policy.video_attn_layout_layers,
-        "audio_ff_layout_specs": policy.audio_ff_layout_specs,
-        "audio_ff_layout_layers": policy.audio_ff_layout_layers,
-        "audio_attn_layout_specs": policy.audio_attn_layout_specs,
-        "audio_attn_layout_layers": policy.audio_attn_layout_layers,
-        "adaln_pretranspose": policy.adaln_pretranspose,
-        "transformer_cache_quantize": policy.transformer_cache_quantize,
-        "video_ff_quantize_specs": policy.video_ff_quantize_specs,
-        "video_ff_quantize_layers": policy.video_ff_quantize_layers,
-        "video_ff_quantize_group_size": policy.video_ff_quantize_group_size,
-        "video_ff_quantize_bits": policy.video_ff_quantize_bits,
-    }
 
 
 def _execution_policy(
@@ -658,6 +573,7 @@ def _execution_policy(
     infrastructure: Settings,
 ) -> TransformerExecutionPolicy:
     return TransformerExecutionPolicy(
+        check_adapter_weights=infrastructure.check_adapter_weights,
         use_steel_attention=settings.steel_attention,
         compile_attention=settings.compile_attention,
         steel_attention_d64=settings.steel_attention_d64,
@@ -665,11 +581,6 @@ def _execution_policy(
         fast_mode=settings.fast_mode,
         compile_block_groups=settings.compile_block_groups,
         transformer_compile_group_size=settings.transformer_compile_group_size,
-        mlx_cache_limit_bytes=(
-            None
-            if infrastructure.mlx_cache_limit_gb is None
-            else int(infrastructure.mlx_cache_limit_gb * 1024**3)
-        ),
     )
 
 
@@ -727,9 +638,8 @@ def _prepare_inspected_resources(
     layout: CheckpointLayout,
     sources: LTX2ComponentSources,
     report: LTX2CompatibilityReport,
-    reporter: Reporter | None,
 ) -> LTX2Resources:
-    """Build an inventory and generation-exact transformer cache."""
+    """Build a source inventory with phase-local component ownership."""
     transformer_config = report.checkpoint.transformer
     text_config = report.text_encoder
     video_config = report.video_vae
@@ -745,47 +655,14 @@ def _prepare_inspected_resources(
     if video_config is None or report.video_vae_source is None:
         raise ValueError(f"{report.label} compatibility requires a video VAE")
 
-    tokenizer_cache = (
-        None
-        if report.text_encoder_source is None
-        else ensure_tokenizer_cache(
-            report.text_encoder_source,
-            cache_root=infrastructure.cache_dir,
-            cache_mode=infrastructure.cache_mode,
-        )
-    )
-    cache_policy = _cache_policy(settings)
-    transformer_cache = ensure_transformer_cache(
-        sources.transformer,
-        constructor_config=transformer_config,
-        reporter=reporter,
-        **_transformer_cache_options(cache_policy, settings, infrastructure),
-    )
-    video_families = ensure_weight_family_caches(
-        report.video_vae_source,
-        families=("video_vae",),
-        source_component="video_vae",
-        cache_mode=infrastructure.cache_mode,
-        cache_root=infrastructure.cache_dir,
-        reporter=reporter,
-    )
-    audio_families = None
-    if report.audio_vae_source is not None and report.audio_vae is not None:
-        audio_families = ensure_weight_family_caches(
-            report.audio_vae_source,
-            families=("audio_vae", "vocoder"),
-            source_component="audio_vae_vocoder",
-            cache_mode=infrastructure.cache_mode,
-            cache_root=infrastructure.cache_dir,
-            reporter=reporter,
-        )
+    weight_policy = _weight_policy(settings)
 
     fingerprints: dict[Path, str] = {}
 
     def fingerprint(path: Path) -> str:
         resolved = path.resolve()
         if resolved not in fingerprints:
-            fingerprints[resolved] = _artifact_fingerprint(path)
+            fingerprints[resolved] = artifact_fingerprint(path)
         return fingerprints[resolved]
 
     generation = report.model_generation
@@ -820,7 +697,6 @@ def _prepare_inspected_resources(
         ComponentLocator(
             ComponentKind.TRANSFORMER,
             sources.transformer,
-            transformer_cache.cache_path,
             metadata=transformer_metadata,
             source_fingerprint=fingerprint(sources.transformer),
         ),
@@ -833,7 +709,6 @@ def _prepare_inspected_resources(
         ComponentLocator(
             ComponentKind.VIDEO_VAE,
             report.video_vae_source,
-            video_families.cache_paths["video_vae"],
             metadata=_component_metadata(
                 family=f"video-vae-{video_config.decoder_kind}",
                 config_digest=video_digest,
@@ -873,24 +748,21 @@ def _prepare_inspected_resources(
             )
         )
     if report.audio_vae_source is not None and report.audio_vae is not None:
-        if audio_families is None:
-            raise RuntimeError("audio family caches were not prepared")
         audio_metadata = _component_metadata(
             family="audio-vae-vocoder",
             config_digest=payload_digest({"constructor": repr(report.audio_vae)}),
             layout=layout,
             generation=generation,
         )
-        for kind in (ComponentKind.AUDIO_VAE, ComponentKind.VOCODER):
-            locators.append(
-                ComponentLocator(
-                    kind,
-                    report.audio_vae_source,
-                    audio_families.cache_paths[kind.value],
-                    metadata=audio_metadata,
-                    source_fingerprint=fingerprint(report.audio_vae_source),
-                )
+        locators.extend(
+            ComponentLocator(
+                kind,
+                report.audio_vae_source,
+                metadata=audio_metadata,
+                source_fingerprint=fingerprint(report.audio_vae_source),
             )
+            for kind in (ComponentKind.AUDIO_VAE, ComponentKind.VOCODER)
+        )
     if sources.spatial_upscaler is not None and report.spatial_upscaler is not None:
         locators.append(
             ComponentLocator(
@@ -944,6 +816,7 @@ def _prepare_inspected_resources(
         else "ancestral-stage1-deterministic-stage2"
     )
     return LTX2Resources(
+        memory_policy=MLXMemoryPolicy.from_settings(infrastructure),
         checkpoint=CheckpointIdentity(
             source_path=sources.transformer.absolute(),
             source_fingerprint=checkpoint_fingerprint,
@@ -961,34 +834,24 @@ def _prepare_inspected_resources(
             text_encoder_family=("unavailable" if text_config is None else text_config.family),
             native_hdr=generation == "2.5",
             generates_audio=report.audio_vae is not None,
-            text_projection_family="packaged-49-state",
-            connector_family="ltx2-8-layer",
             sampler_policy=sampler_policy,
             generated_keyframes=(
                 generation == "2.5" and transformer_config.use_keyframes_abs_pos_embedding
             ),
             duration_available=report.duration_head is not None,
             temporal_latent_upscaler_available=report.temporal_upscaler is not None,
-            native_signal_domains=(
-                ("normalized-sdr", "acescct-working-codes")
-                if generation == "2.5"
-                else ("normalized-sdr",)
-            ),
         ),
         dtype_policy=LTX2DTypePolicy.reference(transformer=dtype),
-        cache_policy=cache_policy,
+        weight_policy=weight_policy,
         execution_policy=_execution_policy(settings, infrastructure),
         video_vae_config=video_config,
         transformer_config=transformer_config,
-        tokenizer_cache=tokenizer_cache,
     )
 
 
-def _prepare_split_resources(
+def _split_composition(
     settings: LTX2Settings,
-    infrastructure: Settings,
-    reporter: Reporter | None,
-) -> LTX2Resources:
+) -> tuple[LTX2ComponentSources, LTX2CompatibilityReport]:
     """Inspect a componentized pack of either generation."""
     transformer_path = _required_component_path(settings.transformer_path, "transformer_path")
     raw_text_path = (
@@ -1033,36 +896,18 @@ def _prepare_split_resources(
         parsed_checkpoint=parsed,
         expected_generation=settings.model_generation,
     )
-    return _prepare_inspected_resources(
-        settings,
-        infrastructure,
-        layout=CheckpointLayout.SPLIT,
-        sources=sources,
-        report=report,
-        reporter=reporter,
-    )
+    return sources, report
 
 
-def prepare_resources(
-    settings: LTX2Settings,
-    *,
-    infrastructure: Settings | None = None,
-    reporter: Reporter | None = None,
-) -> LTX2Resources:
-    """Validate sources, prepare caches, and return no live model state."""
-    host = infrastructure if infrastructure is not None else Settings.from_env()
-    host.validate()
-    resolved = _discover_generation_selection(settings.resolve_presets(), host)
-    resolved.validate()
+def _monolithic_composition(
+    resolved: LTX2Settings,
+    host: Settings,
+) -> tuple[CheckpointLayout, LTX2ComponentSources, LTX2CompatibilityReport]:
+    """Inspect a monolithic checkpoint plus its discovered or explicit companions."""
     if resolved.weights_path is None:
-        if resolved.uses_split_checkpoint:
-            return _prepare_split_resources(resolved, host, reporter)
         raise ValueError("weights_path or transformer_path is required")
-    # Preserve the logical ``.safetensors`` snapshot name while preparing
-    # caches. Hugging Face snapshots are symlinks to extensionless blob names;
-    # resolving here both defeats MLX format inference and changes cache-dir
-    # identity. File signatures and the frozen inventory canonicalize the
-    # target independently.
+    # Preserve the logical snapshot filename for format and component selection.
+    # Source identities canonicalize the underlying target independently.
     weights_path = resolved.weights_path.expanduser().absolute()
     if not weights_path.is_file():
         raise FileNotFoundError(f"checkpoint does not exist: {weights_path}")
@@ -1140,17 +985,50 @@ def prepare_resources(
     if report.video_vae is None:
         raise ValueError(f"{report.label} compatibility requires a video VAE")
 
+    layout = (
+        CheckpointLayout.MONOLITHIC if resolved.transformer_path is None else CheckpointLayout.MIXED
+    )
+    return layout, sources, report
+
+
+def _inspect_composition(
+    resolved: LTX2Settings,
+    host: Settings,
+) -> tuple[CheckpointLayout, LTX2ComponentSources, LTX2CompatibilityReport]:
+    """Resolve the physical sources and compatibility report for any packaging."""
+    if resolved.weights_path is None:
+        if resolved.uses_split_checkpoint:
+            sources, report = _split_composition(resolved)
+            return CheckpointLayout.SPLIT, sources, report
+        raise ValueError("weights_path or transformer_path is required")
+    return _monolithic_composition(resolved, host)
+
+
+def _resolve_selection(settings: LTX2Settings, host: Settings) -> LTX2Settings:
+    # The field-owned source and execution rules are pure and must reject an
+    # invalid direct API record before checkpoint discovery touches files.
+    settings.validate()
+    resolved = _discover_generation_selection(settings.resolve_presets(), host)
+    resolved.validate()
+    return resolved
+
+
+def prepare_resources(
+    settings: LTX2Settings,
+    *,
+    infrastructure: Settings | None = None,
+) -> LTX2Resources:
+    """Validate sources and return resources without live model arrays."""
+    host = infrastructure if infrastructure is not None else Settings.from_env()
+    host.validate()
+    resolved = _resolve_selection(settings, host)
+    layout, sources, report = _inspect_composition(resolved, host)
     return _prepare_inspected_resources(
         resolved,
         host,
-        layout=(
-            CheckpointLayout.MONOLITHIC
-            if resolved.transformer_path is None
-            else CheckpointLayout.MIXED
-        ),
+        layout=layout,
         sources=sources,
         report=report,
-        reporter=reporter,
     )
 
 
@@ -1162,13 +1040,9 @@ __all__ = [
     "ComponentMetadata",
     "ComponentResource",
     "LTX2Capabilities",
-    "LTX2CheckpointConfig",
     "LTX2Resources",
-    "TransformerConstructorConfig",
-    "TransformerCachePolicy",
     "TransformerExecutionPolicy",
-    "TokenizerCache",
-    "checkpoint_config",
+    "TransformerWeightPolicy",
     "prepare_resources",
     "resolve_component_inventory",
 ]

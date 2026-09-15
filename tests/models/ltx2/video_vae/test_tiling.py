@@ -1,12 +1,12 @@
 """Streaming VAE tiling, blending, and memory-plan tests."""
 
-from __future__ import annotations
-
 from collections.abc import Iterator
 
 import mlx.core as mx
 import pytest
 
+from kinomlx.modeling.memory import DecodeMemoryBudget
+from kinomlx.models.ltx2.video_vae import tiling
 from kinomlx.models.ltx2.video_vae.tiling import (
     DEFAULT_SPATIAL_SCALE,
     DEFAULT_TEMPORAL_SCALE,
@@ -18,10 +18,8 @@ from kinomlx.models.ltx2.video_vae.tiling import (
     compute_trapezoidal_mask_1d,
     decode_single_pass,
     decode_streaming,
-    default_vae_decode_budget_gb,
-    detect_system_memory_gb,
 )
-from kinomlx.reporting import RecordingReporter
+from tests._reporting import RecordingReporter
 
 TEMPORAL_SCALE = DEFAULT_TEMPORAL_SCALE
 SPATIAL_SCALE = DEFAULT_SPATIAL_SCALE
@@ -275,12 +273,12 @@ def test_auto_plan_scales_conv3d_estimate_for_fp32_compute() -> None:
     assert fp32.temporal_config == TemporalChunkConfig(40, 8)
 
 
-def test_auto_plan_uses_spatial_tiling_when_incremental_peak_exceeds_budget() -> None:
+def test_auto_plan_tries_smallest_temporal_chunk_before_spatial_tiling() -> None:
     plan = TilingConfig.auto(1024, 576, 300, memory_budget_gb=12.0)
 
     assert plan is not None
-    assert plan.spatial_config == SpatialTilingConfig(512, 64)
-    assert plan.temporal_config == TemporalChunkConfig(32, 8)
+    assert plan.spatial_config is None
+    assert plan.temporal_config == TemporalChunkConfig(16, 8)
 
 
 def test_auto_plan_accounts_for_full_frame_spatial_assembly_buffers() -> None:
@@ -288,7 +286,12 @@ def test_auto_plan_accounts_for_full_frame_spatial_assembly_buffers() -> None:
 
     assert plan is not None
     assert plan.spatial_config == SpatialTilingConfig(512, 64)
-    assert plan.temporal_config == TemporalChunkConfig(32, 8)
+    assert plan.temporal_config == TemporalChunkConfig(16, 8)
+
+
+def test_conv3d_does_not_return_an_over_budget_fallback() -> None:
+    with pytest.raises(MemoryError, match="No Conv3d VAE tile fits"):
+        TilingConfig.auto_native_conv3d(1024, 576, 121, memory_budget_gb=0.5)
 
 
 def test_public_streaming_decode_never_exceeds_spatial_tile_maximum() -> None:
@@ -373,14 +376,43 @@ def test_auto_plan_has_no_stale_conv3d_address_boundary() -> None:
     )
 
 
-def test_memory_detection_and_budget_use_mlx_device_info(monkeypatch) -> None:
+def test_low_level_auto_plan_uses_shared_headroom_without_a_16gb_cap(monkeypatch) -> None:
     monkeypatch.setattr(
-        mx,
-        "device_info",
-        lambda: {"memory_size": 24_000_000_000},
+        tiling,
+        "capture_decode_memory_budget",
+        lambda: DecodeMemoryBudget(
+            limit_bytes=60 * 1024**3,
+            active_bytes=2 * 1024**3,
+            cache_bytes=0,
+            system_reclaimable_bytes=55 * 1024**3,
+        ),
     )
-    assert detect_system_memory_gb() == 24.0
-    assert default_vae_decode_budget_gb() == 12.0
+    assert TilingConfig.auto(1024, 576, 121) is None
+
+
+@pytest.mark.parametrize("compute_dtype", [mx.bfloat16, mx.float16, mx.float32])
+def test_diffusion_auto_plan_uses_memory_instead_of_fixed_dimensions(compute_dtype) -> None:
+    assert (
+        TilingConfig.auto_diffusion(
+            1024, 576, 121, memory_budget_gb=60.0, compute_dtype=compute_dtype
+        )
+        is None
+    )
+    assert (
+        TilingConfig.auto_diffusion(
+            1024, 576, 121, memory_budget_gb=12.0, compute_dtype=compute_dtype
+        )
+        is not None
+    )
+
+
+def test_diffusion_does_not_return_a_plan_that_exceeds_the_smallest_budget() -> None:
+    with pytest.raises(MemoryError, match="No diffusion VAE tile fits"):
+        TilingConfig.auto_diffusion(1024, 576, 121, memory_budget_gb=0.5)
+
+
+def test_diffusion_auto_accounts_for_minimum_padded_working_grid() -> None:
+    assert TilingConfig.auto_diffusion(64, 64, 1, memory_budget_gb=1.4) is not None
 
 
 def test_trapezoidal_mask_has_expected_ramps() -> None:

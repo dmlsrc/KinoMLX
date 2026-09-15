@@ -1,13 +1,10 @@
 """Replace clean tokens at a latent-frame index without moving positions."""
 
-from __future__ import annotations
-
 from dataclasses import dataclass
 
 import mlx.core as mx
 
-from kinomlx.types import LatentState
-
+from ..types import LatentState
 from .tools import VideoLatentTools
 
 

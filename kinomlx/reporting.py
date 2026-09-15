@@ -2,20 +2,18 @@
 
 Runtime code reports phase progress through :class:`Reporter`; it does not
 own a terminal or import Rich. The CLI supplies a Rich-backed reporter, host
-applications may provide their own adapter, and tests use
-:class:`RecordingReporter`.
+applications may provide their own adapter.
 
 Log messages are deliberately outside this protocol. The stdlib logging
 framework already provides a host-neutral message surface; Reporter carries
 live phase totals, advancement, and completion.
 """
 
-from __future__ import annotations
-
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field
-from typing import Protocol, TypedDict, runtime_checkable
+from typing import NotRequired, Protocol, TypedDict, runtime_checkable
 
 
 class MemorySample(TypedDict):
@@ -62,6 +60,14 @@ class MemoryReport(TypedDict, total=False):
     sampling_errors: list[MemorySamplingError]
 
 
+class ProgressTimingRecord(TypedDict):
+    """Wall time between progress advances, including the work that completed."""
+
+    advance: float
+    completed: float
+    duration_seconds: float
+
+
 class PhaseTimingRecord(TypedDict):
     phase: str
     parent_phase: str | None
@@ -72,6 +78,7 @@ class PhaseTimingRecord(TypedDict):
     started_seconds: float
     duration_seconds: float
     status: str
+    advances: NotRequired[list[ProgressTimingRecord]]
 
 
 class TimingReport(TypedDict):
@@ -91,8 +98,13 @@ class Reporter(Protocol):
         *,
         total: float | None = None,
         unit: str = "it",
+        aggregate_total: float | None = None,
     ) -> None:
-        """Record that a phase began."""
+        """Record a phase; aggregate_total combines repeated batches in the UI.
+
+        Each batch retains its own timing record and total. Presentation may
+        retain one bar until the surrounding phase advances or ends.
+        """
 
     def phase_advance(self, phase: str, advance: float = 1.0) -> None:
         """Advance a phase by ``advance`` units."""
@@ -110,6 +122,7 @@ class NullReporter:
         *,
         total: float | None = None,
         unit: str = "it",
+        aggregate_total: float | None = None,
     ) -> None:
         pass
 
@@ -120,11 +133,15 @@ class NullReporter:
         pass
 
 
-@dataclass
-class RecordingReporter:
-    """Capture ordered progress events for tests and host integration."""
+@dataclass(frozen=True)
+class ScopedReporter:
+    """Qualify model-owned phases while retaining one shared timing stream."""
 
-    events: list[tuple[str, str, dict[str, object]]] = field(default_factory=list)
+    delegate: Reporter
+    scope: str
+
+    def _phase(self, phase: str) -> str:
+        return f"{self.scope}: {phase}"
 
     def phase_start(
         self,
@@ -132,14 +149,29 @@ class RecordingReporter:
         *,
         total: float | None = None,
         unit: str = "it",
+        aggregate_total: float | None = None,
     ) -> None:
-        self.events.append(("start", phase, {"total": total, "unit": unit}))
+        self.delegate.phase_start(
+            self._phase(phase), total=total, unit=unit, aggregate_total=aggregate_total
+        )
 
     def phase_advance(self, phase: str, advance: float = 1.0) -> None:
-        self.events.append(("advance", phase, {"advance": advance}))
+        self.delegate.phase_advance(self._phase(phase), advance)
 
     def phase_end(self, phase: str) -> None:
-        self.events.append(("end", phase, {}))
+        self.delegate.phase_end(self._phase(phase))
+
+
+@contextmanager
+def reported_phase(reporter: Reporter, phase: str) -> Iterator[None]:
+    """Report one lexical station boundary without letting UX break cleanup."""
+    with suppress(Exception):
+        reporter.phase_start(phase)
+    try:
+        yield
+    finally:
+        with suppress(Exception):
+            reporter.phase_end(phase)
 
 
 @dataclass
@@ -153,6 +185,8 @@ class _PhaseTiming:
     completed: float = 0.0
     ended_seconds: float | None = None
     peak_memory_bytes: int = 0
+    advances: list[ProgressTimingRecord] = field(default_factory=list)
+    last_advance_seconds: float | None = None
 
 
 class TimingReporter:
@@ -203,7 +237,7 @@ class TimingReporter:
                 ),
             }
             self._memory_samples.append(sample)
-            interval_peak = sample["peak_bytes_since_previous_sample"]
+            interval_peak = max(sample["active_bytes"], sample["peak_bytes_since_previous_sample"])
             for timing in self._stack:
                 timing.peak_memory_bytes = max(timing.peak_memory_bytes, interval_peak)
             return sample
@@ -234,6 +268,7 @@ class TimingReporter:
         *,
         total: float | None = None,
         unit: str = "it",
+        aggregate_total: float | None = None,
     ) -> None:
         now = self._clock()
         previous = self._active.pop(phase, None)
@@ -250,15 +285,31 @@ class TimingReporter:
             started_seconds=now,
         )
         self._phases.append(timing)
-        self._sample_memory("phase_start", phase=phase)
+        sample = self._sample_memory("phase_start", phase=phase)
+        if sample is not None:
+            # The previous interval's peak predates this phase; only carry in
+            # the allocations that are still live at entry.
+            timing.peak_memory_bytes = sample["active_bytes"]
         self._active[phase] = timing
         self._stack.append(timing)
-        self._delegate.phase_start(phase, total=total, unit=unit)
+        self._delegate.phase_start(phase, total=total, unit=unit, aggregate_total=aggregate_total)
 
     def phase_advance(self, phase: str, advance: float = 1.0) -> None:
         timing = self._active.get(phase)
         if timing is not None:
             timing.completed += advance
+            if advance > 0:
+                now = self._clock()
+                previous = timing.last_advance_seconds
+                timing.advances.append(
+                    {
+                        "advance": advance,
+                        "completed": timing.completed,
+                        "duration_seconds": now
+                        - (timing.started_seconds if previous is None else previous),
+                    }
+                )
+                timing.last_advance_seconds = now
         self._delegate.phase_advance(phase, advance)
 
     def phase_end(self, phase: str) -> None:
@@ -277,7 +328,10 @@ class TimingReporter:
         if self._memory_sampler is None:
             return {}
         observed_peak = max(
-            (sample["peak_bytes_since_previous_sample"] for sample in self._memory_samples),
+            (
+                max(sample["active_bytes"], sample["peak_bytes_since_previous_sample"])
+                for sample in self._memory_samples
+            ),
             default=0,
         )
         return {
@@ -305,20 +359,20 @@ class TimingReporter:
         phases: list[PhaseTimingRecord] = []
         for timing in self._phases:
             ended = timing.ended_seconds
-            phases.append(
-                {
-                    "phase": timing.phase,
-                    "parent_phase": timing.parent_phase,
-                    "depth": timing.depth,
-                    "total": timing.total,
-                    "unit": timing.unit,
-                    "completed": timing.completed,
-                    "started_seconds": timing.started_seconds - self._started,
-                    "duration_seconds": (ended if ended is not None else now)
-                    - timing.started_seconds,
-                    "status": "completed" if ended is not None else "active",
-                }
-            )
+            record: PhaseTimingRecord = {
+                "phase": timing.phase,
+                "parent_phase": timing.parent_phase,
+                "depth": timing.depth,
+                "total": timing.total,
+                "unit": timing.unit,
+                "completed": timing.completed,
+                "started_seconds": timing.started_seconds - self._started,
+                "duration_seconds": (ended if ended is not None else now) - timing.started_seconds,
+                "status": "completed" if ended is not None else "active",
+            }
+            if timing.advances:
+                record["advances"] = [advance.copy() for advance in timing.advances]
+            phases.append(record)
         return {
             "total_seconds": now - self._started,
             "phases": phases,
@@ -332,8 +386,10 @@ __all__ = [
     "NullReporter",
     "PhaseMemoryPeak",
     "PhaseTimingRecord",
-    "RecordingReporter",
+    "ProgressTimingRecord",
     "Reporter",
+    "ScopedReporter",
     "TimingReport",
     "TimingReporter",
+    "reported_phase",
 ]

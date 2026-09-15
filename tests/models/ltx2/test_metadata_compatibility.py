@@ -1,7 +1,5 @@
 """Consumed-target LTX-2 compatibility contracts."""
 
-from __future__ import annotations
-
 import json
 from dataclasses import replace
 from pathlib import Path
@@ -11,7 +9,7 @@ import pytest
 
 import kinomlx.models.ltx2.metadata as metadata_module
 from kinomlx.models.ltx2.audio_vae.config import AudioVAEConfig
-from kinomlx.models.ltx2.metadata import TransformerConstructorConfig
+from kinomlx.models.ltx2.transformer_config import TransformerConstructorConfig
 from kinomlx.models.ltx2.video_vae.config import LTX23_VIDEO_VAE_CONFIG
 
 

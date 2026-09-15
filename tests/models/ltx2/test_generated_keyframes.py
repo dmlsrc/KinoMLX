@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import json
 from pathlib import Path
 
@@ -9,8 +7,8 @@ import pytest
 from kinomlx.models.ltx2.generated_keyframes import (
     append_generated_keyframe_slots,
     extract_generated_keyframes,
-    generated_keyframe_indices,
 )
+from kinomlx.models.ltx2.keyframe_positions import generated_keyframe_indices
 from kinomlx.models.ltx2.state import create_video_latent_tools, init_video_latent_state
 from kinomlx.types import VideoLatentShape
 

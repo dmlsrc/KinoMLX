@@ -1,7 +1,5 @@
 """The typed GMNet request/resources/recipe/runner public surface."""
 
-from __future__ import annotations
-
 from pathlib import Path
 
 import mlx.core as mx
@@ -13,7 +11,7 @@ from kinomlx.models.gmnet.pipeline import expand_gmnet
 from kinomlx.models.gmnet.resources import GMNetResources
 from kinomlx.models.gmnet.runner import GMNetRunner
 from kinomlx.models.gmnet.types import GMNetRequest
-from kinomlx.reporting import RecordingReporter
+from tests._reporting import RecordingReporter
 
 
 class _FakeGMNet:
@@ -39,7 +37,6 @@ def _resources(tmp_path: Path) -> GMNetResources:
     return GMNetResources(
         weights_path=tmp_path / "unused.safetensors",
         spec=variant_spec(GMNetVariant.REALWORLD),
-        mlx_cache_limit_bytes=None,
     )
 
 
@@ -50,7 +47,7 @@ def test_public_recipe_uses_injected_components_and_bounded_ownership(
     source = tmp_path / "source.png"
     source.write_bytes(b"fixture")
     monkeypatch.setattr(
-        "kinomlx.io.image.load_image",
+        "kinomlx.models.gmnet.pipeline.load_image",
         lambda _path: mx.full((4, 6, 3), 0.5, dtype=mx.float32),
     )
     components = _Components()
@@ -71,9 +68,9 @@ def test_public_recipe_uses_injected_components_and_bounded_ownership(
         ("start", "load SDR image"),
         ("advance", "load SDR image"),
         ("end", "load SDR image"),
-        ("start", "GMNet expansion"),
-        ("advance", "GMNet expansion"),
-        ("end", "GMNet expansion"),
+        ("start", "expand image"),
+        ("advance", "expand image"),
+        ("end", "expand image"),
     ]
 
 
@@ -81,7 +78,7 @@ def test_runner_hosts_the_same_public_recipe(tmp_path, monkeypatch) -> None:
     source = tmp_path / "source.png"
     source.write_bytes(b"fixture")
     monkeypatch.setattr(
-        "kinomlx.io.image.load_image",
+        "kinomlx.models.gmnet.pipeline.load_image",
         lambda _path: mx.full((4, 4, 3), 0.25, dtype=mx.float32),
     )
     runner = GMNetRunner(resources=_resources(tmp_path), components=_Components())

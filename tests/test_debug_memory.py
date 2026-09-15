@@ -1,10 +1,8 @@
 """Low-overhead MLX allocator-counter diagnostics."""
 
-from __future__ import annotations
-
 import pytest
 
-from kinomlx.debug.memory import _create_interval_sampler, capture_mlx_memory_counters
+from kinomlx.debug.memory import capture_mlx_memory_counters, create_mlx_memory_sampler
 
 
 def test_memory_counter_capture_does_not_synchronize_or_touch_arrays() -> None:
@@ -52,7 +50,7 @@ def test_interval_sampler_resets_at_creation_and_after_each_sample() -> None:
             nonlocal reset_calls
             reset_calls += 1
 
-    sample = _create_interval_sampler(_Counters())
+    sample = create_mlx_memory_sampler(_Counters())
     assert reset_calls == 1
     assert sample()["peak_bytes"] == 33
     assert reset_calls == 2

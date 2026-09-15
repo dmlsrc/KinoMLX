@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 from dataclasses import replace
 
 import mlx.core as mx
@@ -12,7 +10,7 @@ from kinomlx.models.ltx2.audio_vae import (
     load_vocoder_weights,
 )
 from kinomlx.models.ltx2.audio_vae.vocoder_loading import _targets
-from kinomlx.reporting import RecordingReporter
+from tests._reporting import RecordingReporter
 
 
 def _generator(
@@ -56,7 +54,7 @@ def _config() -> BWEVocoderConfig:
     )
 
 
-def test_vocoder_direct_defaults_match_reference_constructor() -> None:
+def test_vocoder_defaults_match_reference_constructor() -> None:
     config = _generator(
         rate=2,
         kernel=4,

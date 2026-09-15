@@ -1,16 +1,17 @@
-"""Shared print/save behavior for fully resolved model configurations."""
-
-from __future__ import annotations
+"""Shared print/save behavior for canonical configuration intent."""
 
 import argparse
 import logging
-from collections.abc import Mapping
 from pathlib import Path
 
+from kinomlx.config.provenance import PreparedConfig
+from kinomlx.config_values import ConfigError
+from kinomlx.invocation_controls import validate_control_inputs
 from kinomlx.io.atomic import write_text_exclusive
+from kinomlx.model_registry import config_registry
+from kinomlx.ui import configure_machine_output
 
-from ._registry import config_registry
-from .common import render_error
+from .presentation import render_error
 
 _log = logging.getLogger(__name__)
 
@@ -19,23 +20,32 @@ def handle_config_output(
     options: argparse.Namespace,
     *,
     model: str,
-    resolved: Mapping[str, object],
     json_output: bool,
+    intent: PreparedConfig,
 ) -> int | None:
-    """Print and/or exclusively save a resolved config, or continue execution."""
+    """Print and/or exclusively save canonical inputs, or continue execution."""
     print_requested = bool(options.print_config)
     save_path = options.save_config
-    if options.only_non_defaults and not print_requested and save_path is None:
-        return render_error(
-            "config error: --only-non-defaults requires --print-config or --save-config",
-            json_output=json_output,
-        )
+    try:
+        validate_control_inputs(options)
+    except ValueError as exc:
+        return render_error(f"config error: {exc}", json_output=json_output)
     if not print_requested and save_path is None:
         return None
 
     schema = config_registry().model(model)
-    output = schema.non_default_config(resolved) if options.only_non_defaults else dict(resolved)
-    text = schema.dump_config(output)
+    try:
+        text = schema.dump_intent(intent)
+        if not options.only_non_defaults:
+            defaults = schema.dump_config(schema.default_config())
+            reference = "\n".join("# " + line if line else "#" for line in defaults.splitlines())
+            text += (
+                "\n# Built-in defaults for reference only; these comments are not inputs.\n"
+                + reference
+                + "\n"
+            )
+    except ConfigError as exc:
+        return render_error(f"config error: {exc}", json_output=json_output)
     if save_path is not None:
         destination = Path(save_path).expanduser()
         try:
@@ -51,10 +61,8 @@ def handle_config_output(
                 f"config save failed for {destination}: {exc}",
                 json_output=json_output,
             )
-        _log.info("Saved resolved %s configuration to %s", model, destination)
+        _log.info("Saved %s configuration to %s", model, destination)
     if print_requested:
-        from kinomlx.ui import configure_machine_output
-
         output_logger = configure_machine_output("kinomlx.cli.config_output.stdout")
         output_logger.info("%s", text.rstrip("\n"))
     return 0

@@ -1,7 +1,5 @@
 """Small content-fingerprint helpers for artifacts and receipts."""
 
-from __future__ import annotations
-
 import hashlib
 from pathlib import Path
 

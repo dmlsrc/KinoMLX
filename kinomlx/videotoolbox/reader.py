@@ -1,7 +1,5 @@
 """Native SDR video decode for bounded model conditioning inputs."""
 
-from __future__ import annotations
-
 from pathlib import Path
 from typing import Protocol, cast
 

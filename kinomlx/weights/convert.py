@@ -1,7 +1,5 @@
 """Generic torch-free conversion of plain PyTorch state dicts to safetensors."""
 
-from __future__ import annotations
-
 import hashlib
 import logging
 from collections.abc import Mapping
@@ -16,7 +14,8 @@ from kinomlx.io.safetensors import load_weights, save_weights
 from kinomlx.reporting import NullReporter, Reporter
 
 from .output import WeightOutputError, reserved_weight_output
-from .torch_checkpoint import RestrictedCheckpointError, load_restricted_checkpoint
+from .pickle_scan import RestrictedCheckpointError
+from .torch_checkpoint import load_restricted_checkpoint
 
 _log = logging.getLogger(__name__)
 SOURCE_COLLECTION = Path("weights-src")

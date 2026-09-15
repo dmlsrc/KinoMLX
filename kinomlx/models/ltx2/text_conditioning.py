@@ -1,11 +1,9 @@
 """Public text-conditioning station and reusable encoded-text product."""
 
-from __future__ import annotations
-
 import hashlib
 import logging
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Literal, Protocol
 
@@ -15,9 +13,12 @@ from kinomlx.reporting import Reporter
 
 from .encode import encode_text, load_text_conditioning
 from .resources import ComponentKind, ComponentResource, LTX2Resources
-from .text_encoder.tokenizer_cache import (
-    TOKENIZER_CACHE_SCHEMA_VERSION,
+from .text_encoder.tokenizer_derivation import (
+    TOKENIZER_DERIVATION_VERSION,
     TOKENIZER_SERIALIZATION_POLICY,
+    TokenizerDerivation,
+    derive_tokenizer,
+    resolve_tokenizer_source,
 )
 from .types import DistilledRequest
 
@@ -28,8 +29,6 @@ _CORE_PROVENANCE_FIELDS = (
 )
 _EXTENDED_PROVENANCE_FIELDS = (
     "tokenizer_source_sha256",
-    "tokenizer_model_sha256",
-    "tokenizer_metadata_sha256",
     "tokenization_policy",
     "text_artifact_identity",
     "projection_source_identity",
@@ -49,8 +48,6 @@ class TextConditioningProvenance:
     text_encoder_identity: str
     projection_identity: str
     tokenizer_source_sha256: str | None = None
-    tokenizer_model_sha256: str | None = None
-    tokenizer_metadata_sha256: str | None = None
     tokenization_policy: str | None = None
     text_artifact_identity: str | None = None
     projection_source_identity: str | None = None
@@ -64,8 +61,6 @@ class TextConditioningProvenance:
         }
         extended = (
             ("tokenizer_source_sha256", self.tokenizer_source_sha256),
-            ("tokenizer_model_sha256", self.tokenizer_model_sha256),
-            ("tokenizer_metadata_sha256", self.tokenizer_metadata_sha256),
             ("tokenization_policy", self.tokenization_policy),
             ("text_artifact_identity", self.text_artifact_identity),
             ("projection_source_identity", self.projection_source_identity),
@@ -103,13 +98,25 @@ class TextConditioningProvenance:
 
     def is_compatible_with(self, expected: TextConditioningProvenance) -> bool:
         """Accept exact schema-3 identity or a valid legacy LTX-2.3 identity."""
-        if self == expected:
+        # The v3 rename changed terminology only, not tokenization. Normalize
+        # just that published spelling; every other provenance field still matches.
+        old_policy = "sentencepiece-bpe-modelproto-v2:cache-v3:left-padding-v1"
+        new_policy = "sentencepiece-bpe-modelproto-v2:derivation-v3:left-padding-v1"
+        actual_policy = (
+            new_policy if self.tokenization_policy == old_policy else self.tokenization_policy
+        )
+        expected_policy = (
+            new_policy
+            if expected.tokenization_policy == old_policy
+            else expected.tokenization_policy
+        )
+        if replace(self, tokenization_policy=actual_policy) == replace(
+            expected, tokenization_policy=expected_policy
+        ):
             return True
         legacy_generation = self.model_generation.lower() in {"2.3", "ltx-2.3"}
         extended_values = (
             self.tokenizer_source_sha256,
-            self.tokenizer_model_sha256,
-            self.tokenizer_metadata_sha256,
             self.tokenization_policy,
             self.text_artifact_identity,
             self.projection_source_identity,
@@ -153,13 +160,30 @@ def _component_identity(component: ComponentResource) -> str:
     return f"{family}:{component.source_fingerprint}"
 
 
-def _sha256_file(path: Path) -> str:
-    with path.open("rb") as stream:
-        return hashlib.file_digest(stream, "sha256").hexdigest()
+def resolve_tokenizer(resources: LTX2Resources) -> TokenizerDerivation | None:
+    """Derive tokenizer tables and stable provenance from the text source."""
+    text = resources.optional(ComponentKind.TEXT_ENCODER)
+    if text is None:
+        return None
+    try:
+        source = resolve_tokenizer_source(text.source_path)
+    except FileNotFoundError:
+        # Nothing to derive from: keep the legacy identity. Encoding itself
+        # reports the missing tokenizer source before any weights load.
+        return None
+    return derive_tokenizer(source)
 
 
-def text_conditioning_provenance(resources: LTX2Resources) -> TextConditioningProvenance:
-    """Resolve the checkpoint, encoder-family, and projection compatibility identity."""
+def text_conditioning_provenance(
+    resources: LTX2Resources,
+    *,
+    tokenizer: TokenizerDerivation | None = None,
+) -> TextConditioningProvenance:
+    """Resolve the checkpoint, encoder-family, and projection compatibility identity.
+
+    ``tokenizer`` lets a caller that already resolved the tokenizer reuse it
+    instead of rereading its small source JSON. Replay never derives tokenizer tables.
+    """
     connector = resources.require(ComponentKind.CONNECTOR)
     projection_family = connector.metadata.get("family", "connector")
     base = TextConditioningProvenance(
@@ -167,10 +191,18 @@ def text_conditioning_provenance(resources: LTX2Resources) -> TextConditioningPr
         text_encoder_identity=resources.capabilities.text_encoder_family,
         projection_identity=f"{projection_family}:{connector.source_fingerprint}",
     )
-    tokenizer = resources.tokenizer_cache
-    if tokenizer is None:
+    text = resources.optional(ComponentKind.TEXT_ENCODER)
+    source_digest = tokenizer.source_json_sha256 if tokenizer is not None else None
+    if source_digest is None and text is not None:
+        try:
+            source = resolve_tokenizer_source(text.source_path)
+        except FileNotFoundError:
+            pass
+        else:
+            source_digest = hashlib.sha256(source.read_json_bytes()).hexdigest()
+    if source_digest is None:
         if resources.capabilities.model_generation.lower() in {"2.5", "ltx-2.5"}:
-            raise LookupError("LTX-2.5 text conditioning requires a prepared tokenizer cache")
+            raise LookupError("LTX-2.5 text conditioning requires a tokenizer source")
         return base
     text = resources.require(ComponentKind.TEXT_ENCODER)
     projection = resources.require(ComponentKind.TEXT_PROJECTION)
@@ -178,11 +210,9 @@ def text_conditioning_provenance(resources: LTX2Resources) -> TextConditioningPr
         model_generation=base.model_generation,
         text_encoder_identity=base.text_encoder_identity,
         projection_identity=base.projection_identity,
-        tokenizer_source_sha256=tokenizer.source_json_sha256,
-        tokenizer_model_sha256=tokenizer.model_sha256,
-        tokenizer_metadata_sha256=_sha256_file(tokenizer.metadata_path),
+        tokenizer_source_sha256=source_digest,
         tokenization_policy=(
-            f"{TOKENIZER_SERIALIZATION_POLICY}:cache-v{TOKENIZER_CACHE_SCHEMA_VERSION}:"
+            f"{TOKENIZER_SERIALIZATION_POLICY}:derivation-v{TOKENIZER_DERIVATION_VERSION}:"
             "left-padding-v1"
         ),
         text_artifact_identity=_component_identity(text),
@@ -210,13 +240,16 @@ class NativeTextConditioner:
         *,
         reporter: Reporter | None = None,
     ) -> EncodedTextConditioning:
-        expected = text_conditioning_provenance(resources)
+        tokenizer = None if request.text_conditioning is not None else resolve_tokenizer(resources)
+        expected = text_conditioning_provenance(resources, tokenizer=tokenizer)
         if request.text_conditioning is not None:
             encoded, metadata = load_text_conditioning(
                 request.text_conditioning,
                 reporter=reporter,
                 metadata_policy=self.replay_identity_policy,
             )
+            if request.prompt_unconditional and metadata.get("prompt") != "":
+                raise ValueError("prompt_unconditional requires empty saved text conditioning")
             parse_error = None
             try:
                 actual = TextConditioningProvenance.from_metadata(
@@ -281,8 +314,8 @@ class NativeTextConditioner:
             )
         connector = resources.require(ComponentKind.CONNECTOR)
         projection = resources.require(ComponentKind.TEXT_PROJECTION)
-        connector_path = connector.cache_path or connector.source_path
-        projection_path = projection.cache_path or projection.source_path
+        connector_path = connector.source_path
+        projection_path = projection.source_path
         encoded = encode_text(
             request.prompt,
             gemma_path=text.source_path,
@@ -290,7 +323,7 @@ class NativeTextConditioner:
             projection_path=projection_path,
             config_path=resources.transformer_path,
             model_generation=resources.capabilities.model_generation,
-            tokenizer_cache=resources.tokenizer_cache,
+            tokenizer=tokenizer,
             pad_prompt_to_max=request.pad_prompt_to_max,
             reporter=reporter,
         )
@@ -309,5 +342,6 @@ __all__ = [
     "ReplayIdentityPolicy",
     "TextConditioner",
     "TextConditioningProvenance",
+    "resolve_tokenizer",
     "text_conditioning_provenance",
 ]

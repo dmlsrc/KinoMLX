@@ -1,7 +1,5 @@
 """Native scene-linear RGB to user-viewable BT.2100 PQ HEIC frames."""
 
-from __future__ import annotations
-
 import json
 import math
 from pathlib import Path

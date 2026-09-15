@@ -1,9 +1,9 @@
 """Low-overhead allocator counters for durable run diagnostics."""
 
-from __future__ import annotations
-
 from collections.abc import Callable
 from typing import Protocol
+
+import mlx.core as mx
 
 
 class _MLXMemoryCounters(Protocol):
@@ -36,19 +36,15 @@ def capture_mlx_memory_counters(
     return counters
 
 
-def create_mlx_memory_sampler() -> Callable[[], dict[str, int]]:
-    """Bind MLX once and return a non-synchronizing interval-peak sampler."""
-    import mlx.core as mx
-
-    return _create_interval_sampler(mx)
-
-
-def _create_interval_sampler(mx: _MLXMemoryCounters) -> Callable[[], dict[str, int]]:
-    """Create an interval sampler against an MLX-compatible counter surface."""
+def create_mlx_memory_sampler(
+    counters: _MLXMemoryCounters | None = None,
+) -> Callable[[], dict[str, int]]:
+    """Create an interval sampler against MLX or an injected counter surface."""
+    backend: _MLXMemoryCounters = mx if counters is None else counters
     # Establish the baseline when diagnostics begin so the first checkpoint is
     # not polluted by allocator activity that predates the run reporter.
-    mx.reset_peak_memory()
-    return lambda: capture_mlx_memory_counters(mx, reset_peak=True)
+    backend.reset_peak_memory()
+    return lambda: capture_mlx_memory_counters(backend, reset_peak=True)
 
 
 __all__ = ["capture_mlx_memory_counters", "create_mlx_memory_sampler"]

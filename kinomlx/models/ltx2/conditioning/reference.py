@@ -1,13 +1,12 @@
 """Append clean full-video latent tokens for explicit IC-LoRA conditioning."""
 
-from __future__ import annotations
-
 from dataclasses import dataclass, replace
 
 import mlx.core as mx
 
-from kinomlx.types import LatentState, VideoLatentShape
+from kinomlx.types import VideoLatentShape
 
+from ..types import LatentState
 from .latent import ConditioningError
 from .tools import VideoLatentTools
 

@@ -1,7 +1,5 @@
 """Reproducibility-sidecar contracts at the CLI orchestration boundary."""
 
-from __future__ import annotations
-
 import gc
 import json
 import time
@@ -13,7 +11,7 @@ import mlx.core as mx
 import pytest
 
 from kinomlx.artifacts import TensorArtifact
-from kinomlx.cli._registry import config_registry
+from kinomlx.config.provenance import PreparedConfig
 from kinomlx.debug import (
     RunRecord,
     SidecarArtifactSink,
@@ -25,15 +23,17 @@ from kinomlx.debug import (
 )
 from kinomlx.io.fingerprints import file_sha256
 from kinomlx.io.safetensors import load_weights_with_metadata
+from kinomlx.model_registry import config_registry
 from kinomlx.models.ltx2.artifacts import (
     FINAL_LATENTS,
     STAGE_1_CONDITIONING,
     STAGE_1_LATENTS,
     STAGE_2_CONDITIONING,
     TEXT_CONDITIONING,
+    LTX2ArtifactConfig,
     distilled_stage_latents_artifact,
     media_conditioning_artifact,
-    restart_artifacts,
+    requested_artifacts,
     sidecar_paths,
     text_conditioning_artifact,
 )
@@ -214,22 +214,26 @@ def test_media_conditioning_artifact_preserves_every_ordered_encoded_source(
     assert artifact.reporting_phase == "save stage 2 media conditioning"
 
 
-def test_restart_artifacts_keep_only_new_stage_conditioning() -> None:
-    requested = frozenset(
-        {
-            TEXT_CONDITIONING,
-            STAGE_1_CONDITIONING,
-            STAGE_2_CONDITIONING,
-            STAGE_1_LATENTS,
-            FINAL_LATENTS,
-        }
-    )
-
-    assert restart_artifacts(requested, phase="stage-2") == {
+def test_station_selection_keeps_only_artifacts_the_station_holds() -> None:
+    options = LTX2ArtifactConfig()
+    assert requested_artifacts(
+        options, save_all=True, has_media_conditioning=True, station="stage-2"
+    ) == {
         STAGE_2_CONDITIONING,
+        STAGE_1_LATENTS,
         FINAL_LATENTS,
+        TEXT_CONDITIONING,
     }
-    assert restart_artifacts(requested, phase="decode") == frozenset()
+    assert requested_artifacts(
+        options, save_all=True, has_media_conditioning=True, station="decode"
+    ) == {FINAL_LATENTS}
+    assert requested_artifacts(
+        options,
+        save_all=True,
+        has_media_conditioning=True,
+        station="decode",
+        source_latent_stage="stage-1",
+    ) == {STAGE_1_LATENTS}
 
 
 def test_artifact_sink_writes_text_and_each_latent_stage(tmp_path: Path) -> None:
@@ -424,7 +428,7 @@ def test_artifact_sink_ignores_reporter_failures(
         reporter=reporter,
     )
 
-    with caplog.at_level("WARNING"):
+    with caplog.at_level("WARNING", logger="kinomlx.debug.sidecars"):
         sink.save(
             distilled_stage_latents_artifact(
                 1,
@@ -496,7 +500,8 @@ def test_run_record_and_execution_log_capture_status_and_timing(tmp_path: Path) 
     record = RunRecord(
         paths.run_log,
         model="ltx2",
-        invocation={"output": {"path": paths.video}},
+        effective_config={"output": {"path": paths.video}},
+        config_intent=PreparedConfig({}, {}),
         argv=["kinomlx", "--seed", "42"],
         timings=timings,
         planned_outputs={"video": str(paths.video)},
@@ -531,7 +536,8 @@ def test_run_record_serializes_shared_sidecar_errors(tmp_path: Path) -> None:
     record = RunRecord(
         paths.run_log,
         model="ltx2",
-        invocation={},
+        effective_config={},
+        config_intent=PreparedConfig({}, {}),
         argv=["kinomlx"],
         timings=TimingReporter(),
         planned_outputs={"video": str(paths.video)},
@@ -552,3 +558,39 @@ def test_run_record_serializes_shared_sidecar_errors(tmp_path: Path) -> None:
 def test_timing_reporter_defaults_to_monotonic_performance_clock() -> None:
     reporter = TimingReporter()
     assert reporter._clock is time.perf_counter
+
+
+def test_failed_run_record_update_preserves_last_valid_record_and_partial_console_log(
+    tmp_path, monkeypatch
+):
+    from kinomlx.io import atomic
+
+    paths = _ltx2_paths(tmp_path / "sample.mp4")
+    initialize_execution_log(paths.execution_log, ["kinomlx", "--seed", "9", "2"])
+    with paths.execution_log.open("a") as stream:
+        stream.write("First seed finished. Second seed started.\n")
+    record = RunRecord(
+        paths.run_log,
+        model="ltx2",
+        effective_config={},
+        config_intent=PreparedConfig({}, {}),
+        argv=["kinomlx"],
+        timings=TimingReporter(),
+        planned_outputs={},
+    )
+    previous = paths.run_log.read_bytes()
+    console = paths.execution_log.read_bytes()
+    original = atomic.Path.write_text
+
+    def fail(path, text, **kwargs):
+        if path.suffix == ".tmp":
+            original(path, text[:20], **kwargs)
+            raise OSError("disk full")
+        return original(path, text, **kwargs)
+
+    monkeypatch.setattr(atomic.Path, "write_text", fail)
+    with pytest.raises(SidecarError, match="disk full"):
+        record.write(status="aborted", error="KeyboardInterrupt")
+    assert paths.run_log.read_bytes() == previous
+    assert json.loads(paths.run_log.read_text())["status"] == "started"
+    assert paths.execution_log.read_bytes() == console

@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import json
 
 import mlx.core as mx
@@ -19,7 +17,7 @@ from kinomlx.models.ltx2.audio_vae.loading import (
 )
 from kinomlx.models.ltx2.patchifier import AudioPatchifier
 from kinomlx.models.ltx2.types import AudioLatentShape
-from kinomlx.reporting import RecordingReporter
+from tests._reporting import RecordingReporter
 
 
 def _config() -> AudioVAEConfig:

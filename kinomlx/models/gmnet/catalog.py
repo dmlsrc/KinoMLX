@@ -15,12 +15,12 @@ Both predict a gain map normalized so that 1.0 means the full
 ``log2(peak)`` stops of expansion.
 """
 
-from __future__ import annotations
-
 import math
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
+
+from kinomlx.settings import Settings
 
 WEIGHTS_DIR = Path(__file__).resolve().parent / "weights"
 
@@ -91,7 +91,7 @@ def variant_for_source_sha256(digest: str) -> GMNetVariant | None:
 
 def variant_weights_path(
     variant: GMNetVariant | str,
-    cache_dir: Path | str,
+    app_cache_dir: Path | str,
 ) -> Path:
     """Return the convenient writable path for one converted checkpoint.
 
@@ -103,7 +103,10 @@ def variant_weights_path(
     if checkout_dir is not None:
         return checkout_dir / variant_spec(variant).weights_filename
     return (
-        Path(cache_dir).expanduser() / "weights" / "gmnet" / variant_spec(variant).weights_filename
+        Path(app_cache_dir).expanduser()
+        / "weights"
+        / "gmnet"
+        / variant_spec(variant).weights_filename
     )
 
 
@@ -119,7 +122,7 @@ def resolve_variant_weights(
     variant: GMNetVariant | str,
     override: Path | None = None,
     *,
-    cache_dir: Path | str | None = None,
+    app_cache_dir: Path | str | None = None,
 ) -> Path:
     """Resolve the converted safetensors for ``variant``.
 
@@ -132,11 +135,9 @@ def resolve_variant_weights(
     if override is not None:
         target = override.expanduser()
     else:
-        if cache_dir is None:
-            from kinomlx.settings import Settings
-
-            cache_dir = Settings.from_env_fields("cache_dir").cache_dir
-        target = variant_weights_path(spec.variant, cache_dir)
+        if app_cache_dir is None:
+            app_cache_dir = Settings.from_env_fields("app_cache_dir").app_cache_dir
+        target = variant_weights_path(spec.variant, app_cache_dir)
     if not target.is_file():
         raise FileNotFoundError(
             f"no converted GMNet weights at {target}; download {spec.source_filename} "
@@ -149,9 +150,9 @@ def resolve_variant_weights(
 
 __all__ = [
     "DEFAULT_VARIANT",
+    "WEIGHTS_DIR",
     "GMNetVariant",
     "GMNetVariantSpec",
-    "WEIGHTS_DIR",
     "resolve_variant_weights",
     "variant_for_source_sha256",
     "variant_spec",

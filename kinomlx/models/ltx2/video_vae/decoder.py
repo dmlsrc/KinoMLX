@@ -1,7 +1,5 @@
 """Native MLX Conv3d video VAE decoder."""
 
-from __future__ import annotations
-
 import logging
 import math
 from collections.abc import Iterator, Mapping
@@ -276,7 +274,7 @@ class Conv3dDecoderLoadReceipt:
 def _weights_from_source(source: WeightSource) -> Mapping[str, mx.array]:
     if isinstance(source, Mapping):
         return source
-    return load_weights(source)
+    return load_weights(Path(source))
 
 
 def _stat_weight(
@@ -308,7 +306,7 @@ def load_native_vae_decoder_weights(
     decoder: NativeConv3dVideoDecoder,
     source: WeightSource,
 ) -> int:
-    """Load a complete decoder from raw-checkpoint or family-cache tensors."""
+    """Load a complete decoder from source or prepared tensors."""
     weights = _weights_from_source(source)
     assignments: list[tuple[object, str, mx.array]] = []
     missing: list[str] = []

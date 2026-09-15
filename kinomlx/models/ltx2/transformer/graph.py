@@ -1,7 +1,5 @@
 """Pure transformer parameter-graph and checkpoint-key contracts."""
 
-from __future__ import annotations
-
 import re
 from dataclasses import dataclass
 from typing import Protocol
@@ -362,8 +360,8 @@ def convert_checkpoint_key(
 
 
 __all__ = [
-    "ConvertedTransformerKey",
     "DIFFUSION_PREFIX",
+    "ConvertedTransformerKey",
     "TransformerGraphConfig",
     "TransformerGraphSpec",
     "convert_checkpoint_key",

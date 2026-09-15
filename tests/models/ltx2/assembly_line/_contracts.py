@@ -1,12 +1,8 @@
 """Pure contract harness for the assembly-line architecture.
 
-The harness is deliberately independent of MLX and model weights. Phase A uses
-it to make the desired station ordering and ownership rules executable before
-the product exposes component providers. Later phases can run the same trace
-assertions against the public recipes and native providers.
+The harness is independent of MLX and model weights. It verifies station ordering
+and ownership rules with injected providers and reusable trace assertions.
 """
-
-from __future__ import annotations
 
 from collections.abc import Iterator
 from contextlib import AbstractContextManager, contextmanager
@@ -176,6 +172,7 @@ class ProgressReporter(Protocol):
         *,
         total: float | None = None,
         unit: str = "it",
+        aggregate_total: float | None = None,
     ) -> None: ...
 
     def phase_advance(self, phase: str, advance: float = 1.0) -> None: ...
@@ -233,6 +230,7 @@ class NullProgressReporter:
         *,
         total: float | None = None,
         unit: str = "it",
+        aggregate_total: float | None = None,
     ) -> None:
         pass
 
@@ -253,6 +251,7 @@ class RecordingProgressReporter:
         *,
         total: float | None = None,
         unit: str = "it",
+        aggregate_total: float | None = None,
     ) -> None:
         self.events.append(("start", phase))
 

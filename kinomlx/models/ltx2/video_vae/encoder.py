@@ -1,7 +1,5 @@
 """Native MLX Conv3d video VAE encoder."""
 
-from __future__ import annotations
-
 import logging
 import math
 from collections.abc import Iterator, Mapping
@@ -248,7 +246,7 @@ WeightSource = Mapping[str, mx.array] | Path | str
 def _weights_from_source(source: WeightSource) -> Mapping[str, mx.array]:
     if isinstance(source, Mapping):
         return source
-    return load_weights(source)
+    return load_weights(Path(source))
 
 
 def _require_stat(
@@ -280,7 +278,7 @@ def load_native_vae_encoder_weights(
     encoder: NativeConv3dVideoEncoder,
     source: WeightSource,
 ) -> int:
-    """Load a complete encoder from raw-checkpoint or family-cache tensors."""
+    """Load a complete encoder from source or prepared tensors."""
     weights = _weights_from_source(source)
     assignments: list[tuple[object, str, mx.array]] = []
     missing: list[str] = []

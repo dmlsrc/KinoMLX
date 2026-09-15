@@ -1,7 +1,5 @@
 """Ownership and validation tests for model-neutral frame streams."""
 
-from __future__ import annotations
-
 from dataclasses import replace
 
 import mlx.core as mx

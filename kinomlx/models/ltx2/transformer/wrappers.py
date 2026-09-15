@@ -1,16 +1,13 @@
 """Input and velocity-to-denoised wrappers for the LTX-2 transformer."""
 
-from __future__ import annotations
-
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Protocol
+from typing import Protocol
 
 import mlx.core as mx
 
 import kinomlx._mlx_nn as nn
 
-if TYPE_CHECKING:
-    from ..cache import LoRAAdapterReceipt
+from ..adapters.receipt import LTX2AdapterReceipt
 
 
 @dataclass(frozen=True)
@@ -72,8 +69,8 @@ class X0Model(nn.Module):
         super().__init__()
         self.velocity_model = velocity_model
         # Receipt objects are orchestration metadata, not model parameters.
-        object.__setattr__(self, "lora_receipts", ())
-        self.lora_receipts: tuple[LoRAAdapterReceipt, ...]
+        object.__setattr__(self, "adapter_receipts", ())
+        self.adapter_receipts: tuple[LTX2AdapterReceipt, ...]
 
     @property
     def num_blocks(self) -> int:

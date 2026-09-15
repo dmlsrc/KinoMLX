@@ -1,7 +1,5 @@
 """Checkpoint construction for the native LTX video VAE."""
 
-from __future__ import annotations
-
 import gc
 from dataclasses import dataclass
 from pathlib import Path
@@ -43,7 +41,7 @@ def _config_for_artifact(
         return VideoVAEConfig.from_checkpoint(checkpoint)
 
     raise ValueError(
-        f"{checkpoint}: missing config.vae metadata; normalized family caches do not "
+        f"{checkpoint}: missing config.vae metadata; weight-only files do not "
         "carry constructor authority, so pass the inspected VideoVAEConfig explicitly"
     )
 
@@ -55,7 +53,7 @@ def load_native_video_vae(
     compute_dtype: mx.Dtype = mx.bfloat16,
     reporter: Reporter | None = None,
 ) -> NativeVideoVAE:
-    """Build a complete VAE from a checkpoint or recognized family cache."""
+    """Build a complete VAE from a checkpoint with constructor metadata or an explicit config."""
     checkpoint = Path(path)
     sink = reporter if reporter is not None else NullReporter()
     phase = "load video VAE"

@@ -1,61 +1,341 @@
 """Data-only LTX-2 contribution to the global configuration registry."""
 
-from __future__ import annotations
-
+from dataclasses import replace
 from pathlib import Path
+from typing import Literal
 
-from kinomlx.cli.config_records import (
-    AUDIO_CODEC_CHOICES,
-    CUT_DETECT_MODE_CHOICES,
-    VSR_SPATIAL_MODE_CHOICES,
-    VSR_TEMPORAL_MODE_CHOICES,
-    OutputConfig,
-)
+from kinomlx.api_boundaries import APIBoundary, configuration, runtime
 from kinomlx.cli.config_schema import settings_table
-from kinomlx.cli.restart import LATENT_STAGE_CHOICES, RESTART_PHASE_CHOICES, RestartConfig
+from kinomlx.cli.prompt_arguments import prompt_unconditional_field
+from kinomlx.cli.seed_arguments import seed_fields
 from kinomlx.config import (
+    CliBinding,
     ConfigFieldSpec,
     ConfigGroup,
     ConfigImplication,
     ConfigTableSpec,
     ModelConfigSpec,
 )
-from kinomlx.models.ltx2.artifacts import LTX2ArtifactConfig
-from kinomlx.models.ltx2.settings import (
-    GEMMA_VARIANT_CHOICES,
-    MODEL_GENERATION_CHOICES,
-    STREAM_TRANSFORMER_COMPILE_GROUP_SIZE,
+from kinomlx.config.layer_rules import OUTPUT_SELECTION
+from kinomlx.config.source_rules import PROMPT_FILE
+from kinomlx.config.stations import StationPolicy
+from kinomlx.config_bindings import argument_value
+from kinomlx.config_constraints import field_choices
+from kinomlx.config_surfaces import CONFIG_SURFACES, MODEL_SURFACES, SOURCE_SURFACES
+from kinomlx.invocation_controls import MODEL_CONTROL
+from kinomlx.samplers.sigmas import parse_sigmas
+from kinomlx.settings import Settings
+
+from .adapters.config_schema import ADAPTERS
+from .artifacts import OUTPUT_POLICIES, LTX2ArtifactConfig
+from .config_groups import LTX2ConfigGroup
+from .layer_rules import (
+    DURATION_SELECTION,
+    DURATION_SERIALIZATION,
+    VAE_TILING_EFFECTIVE,
+    VAE_TILING_INPUT,
+    VAE_TILING_SELECTION,
+    source_selection_rule,
+)
+from .output_config import (
+    OutputConfig,
+)
+from .pipelines.distilled import generate_distilled
+from .pipelines.restart import restart_distilled
+from .resources import prepare_resources
+from .restart import RESTART_PHASE_CHOICES, RestartConfig
+from .runner import API_BOUNDARIES as RUNNER_API_BOUNDARIES
+from .settings import (
     STREAM_TRANSFORMER_RESIDENT_BLOCKS,
-    TRANSFORMER_CACHE_QUANTIZE_CHOICES,
-    TRANSFORMER_DTYPE_CHOICES,
-    VIDEO_VAE_CHOICES,
     LTX2Settings,
 )
-from kinomlx.models.ltx2.types import (
-    DISTILLED_SAMPLER_CHOICES,
-    HDR_AUTHORING_CHOICES,
-    LORA_EXCLUDE_CATEGORIES,
-    VAE_DECODE_DTYPE_CHOICES,
-    VAE_TILING_MODE_CHOICES,
+from .types import (
     DistilledRequest,
     HDRReferenceConditioningConfig,
     ImageConditioningConfig,
     VideoVAETilingConfig,
 )
-from kinomlx.types import NOISE_BACKEND_CHOICES
 
 F = ConfigFieldSpec
-_RESTART_DECODE = frozenset({ConfigGroup.RESTART_DECODE_LOCKED})
-_RESTART_BOTH = frozenset(
+_LOCKED = (StationPolicy("decode", "locked"), StationPolicy("stage-2", "locked"))
+_DECODE_LOCKED = (StationPolicy("decode", "locked"), StationPolicy("stage-2", "mutable"))
+_MUTABLE = (StationPolicy("decode", "mutable"), StationPolicy("stage-2", "mutable"))
+
+
+def _policy(
+    stage_2: Literal["mutable", "locked", "irrelevant"],
+    decode: Literal["mutable", "locked", "irrelevant"],
+    *,
+    stage_2_reason: str,
+    decode_reason: str,
+    stage_2_action: Literal["ignore", "reject"] | None = None,
+    decode_action: Literal["ignore", "reject"] | None = None,
+) -> tuple[StationPolicy, ...]:
+    """Give one LTX field explicit decisions at both supported restart stations."""
+    return (
+        StationPolicy("stage-2", stage_2, reason=stage_2_reason, irrelevant_action=stage_2_action),
+        StationPolicy("decode", decode, reason=decode_reason, irrelevant_action=decode_action),
+    )
+
+
+_MODEL_SOURCE_POLICIES = {
+    "model_generation": _policy(
+        "locked",
+        "locked",
+        stage_2_reason="The saved stage-1 latent fixes checkpoint generation and geometry.",
+        decode_reason="The saved latent fixes checkpoint generation and geometry.",
+    ),
+    "weights_path": _policy(
+        "mutable",
+        "mutable",
+        stage_2_reason="A compatible baseline can supply the repeated transformer and decoder.",
+        decode_reason="A compatible baseline can supply the decoder; resources inspect its full inventory.",
+    ),
+    "gemma_path": _policy(
+        "mutable",
+        "locked",
+        stage_2_reason="The source can supply stage-2 projection or connector identity for saved text.",
+        decode_reason="The source remains part of the inspected inventory, although decode does not encode text.",
+    ),
+    "gemma_variant": _policy(
+        "mutable",
+        "locked",
+        stage_2_reason="Gemma discovery can select stage-2 text projection and connector identity.",
+        decode_reason="Gemma discovery remains part of the inspected inventory; decode does not encode text.",
+    ),
+    "spatial_upscaler_path": _policy(
+        "mutable",
+        "locked",
+        stage_2_reason="Stage-2 explicitly loads the spatial latent upscaler.",
+        decode_reason="The saved latent needs no upscaling, but this source remains in resource inspection.",
+    ),
+    "transformer_path": _policy(
+        "mutable",
+        "locked",
+        stage_2_reason="Stage-2 loads a transformer for its repeated denoise.",
+        decode_reason="Decode skips transformer execution but resource preparation inspects this source.",
+    ),
+    "text_encoder_path": _policy(
+        "mutable",
+        "locked",
+        stage_2_reason="The split source can supply projection or connector identity for saved text.",
+        decode_reason="The source remains in the inspected inventory; decode does not encode text.",
+    ),
+    "video_vae": _policy(
+        "mutable",
+        "mutable",
+        stage_2_reason="Stage-2 media conditions and terminal video decode use this VAE variant.",
+        decode_reason="Terminal video decode uses this VAE variant.",
+    ),
+    "video_vae_path": _policy(
+        "mutable",
+        "mutable",
+        stage_2_reason="Stage-2 media conditions and terminal video decode use this VAE source.",
+        decode_reason="Terminal video decode uses this VAE source.",
+    ),
+    "audio_vae_path": _policy(
+        "mutable",
+        "mutable",
+        stage_2_reason="Stage-2 and its terminal decode can use this audio VAE source.",
+        decode_reason="Terminal audio decode can use this audio VAE source.",
+    ),
+    "temporal_latent_upscaler_path": _policy(
+        "locked",
+        "locked",
+        stage_2_reason="The restart uses recorded geometry and this source remains in inspected capabilities.",
+        decode_reason="Decode uses recorded geometry and this source remains in inspected capabilities.",
+    ),
+    "duration_head_path": _policy(
+        "locked",
+        "locked",
+        stage_2_reason="The restart uses recorded frame count and this source remains in inspected capabilities.",
+        decode_reason="Decode uses recorded frame count and this source remains in inspected capabilities.",
+    ),
+}
+
+_TRANSFORMER_SETTINGS = frozenset(
     {
-        ConfigGroup.RESTART_DECODE_LOCKED,
-        ConfigGroup.RESTART_STAGE2_LOCKED,
+        "fast_mode",
+        "transformer_dtype",
+        "adapter_accumulation",
+        "steel_attention",
+        "steel_attention_d64",
+        "steel_attention_probe",
+        "compile_attention",
+        "video_ff_layout_specs",
+        "video_ff_layout_layers",
+        "video_attn_layout_specs",
+        "video_attn_layout_layers",
+        "audio_layout_mirror",
+        "audio_ff_layout_specs",
+        "audio_ff_layout_layers",
+        "audio_attn_layout_specs",
+        "audio_attn_layout_layers",
+        "adaln_pretranspose",
+        "transformer_quantize",
+        "transformer_quantize_exclude_layers",
+        "video_ff_quantize_specs",
+        "video_ff_quantize_layers",
+        "video_ff_quantize_group_size",
+        "video_ff_quantize_bits",
+        "stream_transformer",
+        "transformer_retain",
+        "transformer_resident_blocks",
+        "transformer_compile_group_size",
+        "compile_block_groups",
     }
 )
+
+_OUTPUT_REASONS = {
+    "path": "the fresh video destination",
+    "directory": "the fresh output directory",
+    "prefix": "the fresh output stem",
+    "vsr_spatial_mode": "post-decode spatial VSR, subject to HDR restrictions",
+    "target_fps": "post-decode frame conversion, subject to HDR restrictions",
+    "vsr_temporal_mode": "post-decode temporal VSR",
+    "cut_detect_mode": "post-decode cut detection",
+    "cut_detect_threshold": "the post-decode cut threshold",
+    "vsr_save_original": "the post-decode original-video sidecar, subject to HDR restrictions",
+    "encode_quality": "terminal video encoding quality",
+    "audio_codec": "terminal audio encoding",
+    "audio_onset_trim": "terminal audio trimming",
+    "save_run_log": "the current run record",
+    "save_console_log": "the current execution log",
+    "save_effective_config": "the current effective-configuration sidecar",
+    "save_audio_sidecar": "the current audio sidecar",
+    "save_hdr_heic_frames": "HDR-only terminal HEIC frames",
+    "save_vae_frames": "SDR-only terminal VAE diagnostic frames",
+    "save_all_sidecars": "applicable current-station sidecars",
+}
+
+
+def _artifact_policy(
+    field: str,
+    *,
+    stage_2_reason: str,
+    decode_reason: str,
+) -> tuple[StationPolicy, ...]:
+    """Derive one artifact field's station modes from where its group is produced.
+
+    A station that produces the group may be asked for it; one that does not
+    cannot, and its explicit request is ignored rather than refused as a change.
+    Only the reasons are written by hand, because no synthesized sentence is
+    true of every artifact group.
+    """
+    produced = OUTPUT_POLICIES[field].produced_at
+    return tuple(
+        StationPolicy(
+            station,
+            "mutable" if station in produced else "irrelevant",
+            reason=reason,
+            irrelevant_action=None if station in produced else "ignore",
+        )
+        for station, reason in (("stage-2", stage_2_reason), ("decode", decode_reason))
+    )
+
+
+_ARTIFACT_POLICIES = {
+    "save_latents": _artifact_policy(
+        "save_latents",
+        stage_2_reason="Stage-2 emits new final latents and re-emits the stage-1 latent it read.",
+        decode_reason="Decode re-emits the one latent product it read, so its bundle restarts too.",
+    ),
+    "save_media_conditioning": _artifact_policy(
+        "save_media_conditioning",
+        stage_2_reason="Stage-2 can emit stage-2 media conditioning when media input exists.",
+        decode_reason="Decode emits no media conditioning; artifact availability rejects explicit true.",
+    ),
+    "save_text_conditioning": _artifact_policy(
+        "save_text_conditioning",
+        stage_2_reason="Stage-2 re-emits the saved text it consumed, so its bundle restarts too.",
+        decode_reason="Decode neither consumes nor creates text-conditioning artifacts.",
+    ),
+}
+
+_RESTART_REASONS = {
+    "run": "Select the current parent run before loading its manifest.",
+    "phase": "Select the first repeated station before saved-base assembly.",
+    "latent_stage": "Select the current source latent stage; stage-2 requires stage-1.",
+    "latents": "Select a substitute current-run latent artifact for input validation.",
+}
+
+
+def _completed_table(table: ConfigTableSpec) -> ConfigTableSpec:
+    """Attach the model's exact station decisions to its existing field owners."""
+    if table.path == ("settings",):
+        # The shared builder already bound this model's stations at declaration.
+        return table
+    fields = []
+    for field in table.fields:
+        if table.path == ("model_settings",):
+            if field.name in _MODEL_SOURCE_POLICIES:
+                policies = _MODEL_SOURCE_POLICIES[field.name]
+            elif field.name in _TRANSFORMER_SETTINGS:
+                policies = _policy(
+                    "mutable",
+                    "locked",
+                    stage_2_reason=f"The repeated stage-2 transformer uses {field.name}.",
+                    decode_reason=(
+                        f"Decode skips transformer execution, but {field.name} remains part of "
+                        "the inspected resource policy."
+                    ),
+                )
+            else:
+                raise ValueError(f"unclassified LTX model setting {field.name}")
+        elif table.path == ("output",):
+            use = _OUTPUT_REASONS.get(field.name)
+            if use is None:
+                raise ValueError(f"unclassified LTX output field {field.name}")
+            policies = _policy(
+                "mutable",
+                "mutable",
+                stage_2_reason=f"The stage-2 run selects {use} after terminal decode.",
+                decode_reason=f"The decode run selects {use} after terminal decode.",
+            )
+        elif table.path == ("model_artifacts",):
+            policies = _ARTIFACT_POLICIES[field.name]
+        elif table.path == ("restart",):
+            reason = _RESTART_REASONS[field.name]
+            policies = _policy("mutable", "mutable", stage_2_reason=reason, decode_reason=reason)
+        else:
+            # Keep the established generation projections; supply their missing
+            # independent reason so final inspection can explain each decision.
+            # A field that already states its own reason keeps it, because a
+            # synthesized sentence cannot be true of every generation field.
+            policies = tuple(
+                policy
+                if policy.reason
+                else replace(
+                    policy,
+                    reason=(
+                        "The saved latent already embodies this generation or conditioning value."
+                        if policy.mode == "locked"
+                        else "The repeated stage-2 path consumes this value before terminal output."
+                        if policy.station == "stage-2"
+                        else "The terminal decode path consumes this value."
+                    ),
+                )
+                for policy in field.station_policies
+            )
+        fields.append(replace(field, station_policies=policies))
+    if not table.stations:
+        return replace(
+            table,
+            fields=tuple(fields),
+            stations=RESTART_PHASE_CHOICES,
+            station_record=table.record,
+        )
+    return replace(table, fields=tuple(fields))
+
+
+def _completed_tables(*tables: ConfigTableSpec) -> tuple[ConfigTableSpec, ...]:
+    """Complete every declared table so the contribution is valid when constructed."""
+    return tuple(_completed_table(table) for table in tables)
 
 
 CONFIG_SCHEMA = ModelConfigSpec(
     model="ltx2",
+    restart_stations=RESTART_PHASE_CHOICES,
     title="KinoMLX LTX-2 starter configuration",
     introduction=(
         "The prompt below is the only non-default starter value.",
@@ -65,9 +345,12 @@ CONFIG_SCHEMA = ModelConfigSpec(
             "want to override."
         ),
     ),
+    semantic_groups=frozenset(LTX2ConfigGroup),
     root_fields=(
         F(
+            persistence="intent",
             name="model",
+            cli=MODEL_CONTROL.binding,
             purpose="Select the invocation schema",
             valid="",
             choices=("ltx2",),
@@ -76,225 +359,316 @@ CONFIG_SCHEMA = ModelConfigSpec(
             cli_dest="model",
             virtual=True,
             default="ltx2",
+            surfaces=MODEL_SURFACES,
         ),
     ),
-    tables=(
+    tables=_completed_tables(
         ConfigTableSpec(
             path=("generate",),
+            cli_generated=True,
             record=DistilledRequest,
+            stations=RESTART_PHASE_CHOICES,
+            station_record=DistilledRequest,
             nested=("image", "hdr_reference", "vae_tiling"),
             fields=(
+                *(
+                    replace(
+                        field, station_policies={"seed": _MUTABLE, "seeds": _MUTABLE}[field.name]
+                    )
+                    for field in seed_fields(image=False)
+                ),
+                replace(prompt_unconditional_field(), station_policies=_LOCKED),
+                F(
+                    persistence="source",
+                    name="prompt_file",
+                    purpose="Load one complete prompt from a UTF-8 text file",
+                    valid="a path to a nonempty UTF-8 file; exclusive with prompt in the same layer",
+                    example=Path("prompt.txt"),
+                    cli_dest="prompt_file",
+                    input_annotation=Path | None,
+                    layer_transforms=(PROMPT_FILE,),
+                    cli=CliBinding("LTX-2 generation", parse=Path),
+                    virtual=True,
+                    default=None,
+                    surfaces=SOURCE_SURFACES,
+                ),
                 F(
                     "prompt",
                     "Describe the video to generate",
                     "any string",
                     "Describe your video here.",
+                    persistence="intent",
                     cli_dest="prompt",
+                    cli=CliBinding("LTX-2 generation"),
                     starter="Describe your video here.",
                     multiline=True,
                     strip=True,
-                    groups=_RESTART_BOTH,
+                    station_policies=_LOCKED,
+                    surfaces=CONFIG_SURFACES,
                 ),
                 F(
                     "width",
                     "Set the output width in pixels",
                     "a positive multiple of 64",
                     1024,
+                    persistence="intent",
                     cli_dest="width",
-                    groups=_RESTART_BOTH,
+                    cli=CliBinding("LTX-2 generation"),
+                    station_policies=_LOCKED,
+                    surfaces=CONFIG_SURFACES,
                 ),
                 F(
                     "height",
                     "Set the output height in pixels",
                     "a positive multiple of 64",
                     576,
+                    persistence="intent",
                     cli_dest="height",
-                    groups=_RESTART_BOTH,
+                    cli=CliBinding("LTX-2 generation"),
+                    station_policies=_LOCKED,
+                    surfaces=CONFIG_SURFACES,
                 ),
                 F(
                     "frames",
                     "Set the output frame count",
                     "a positive integer matching 8*k + 1",
                     121,
+                    persistence="intent",
                     cli_dest="frames",
+                    cli=CliBinding("LTX-2 generation"),
                     notes=("Do not combine this with duration or auto_duration in the same layer",),
-                    groups=_RESTART_BOTH,
+                    station_policies=_LOCKED,
+                    surfaces=CONFIG_SURFACES,
                 ),
                 F(
                     "duration",
                     "Set the duration instead of setting the frame count",
                     "a finite number of seconds greater than 0",
                     5.0,
+                    persistence="intent",
                     cli_dest="duration",
+                    cli=CliBinding("LTX-2 generation", parse=float),
                     notes=("Do not combine this with frames or auto_duration in the same layer",),
-                    groups=_RESTART_BOTH,
+                    station_policies=_LOCKED,
+                    surfaces=CONFIG_SURFACES,
                 ),
                 F(
                     "auto_duration",
                     "Let the checkpoint duration head choose the duration",
                     "true or false",
                     True,
+                    persistence="source",
                     cli_dest="auto_duration",
+                    layer_transforms=(DURATION_SELECTION, DURATION_SERIALIZATION),
+                    cli=CliBinding("LTX-2 generation", action="store_true"),
                     virtual=True,
                     default=False,
                     notes=("Do not combine this with frames or duration in the same layer",),
+                    surfaces=SOURCE_SURFACES,
                 ),
                 F(
                     "fps",
                     "Set the generation frame rate",
                     "a finite number greater than 0",
                     24.0,
+                    persistence="intent",
                     cli_dest="fps",
-                    groups=_RESTART_BOTH,
-                ),
-                F(
-                    "seed",
-                    "Set the random seed",
-                    "an integer from 0 through 2**64 - 1",
-                    42,
-                    cli_dest="seed",
-                    stringify_large_int=True,
+                    cli=CliBinding("LTX-2 generation"),
+                    station_policies=_LOCKED,
+                    surfaces=CONFIG_SURFACES,
                 ),
                 F(
                     "noise_backend",
                     "Select the normal-noise stream",
                     "",
                     "mlx",
+                    persistence="intent",
                     cli_dest="noise_backend",
-                    choices=NOISE_BACKEND_CHOICES,
+                    cli=CliBinding("LTX-2 generation"),
+                    choices=field_choices(DistilledRequest, "noise_backend"),
                     choice_help=(
                         ("mlx", "Use KinoMLX's native MLX normal-noise stream"),
                         ("torch-mps", "Match the pinned PyTorch MPS normal-noise stream"),
                     ),
+                    station_policies=_MUTABLE,
+                    surfaces=CONFIG_SURFACES,
                 ),
                 F(
                     "sampler",
                     "Select the stage-1 sampler policy",
                     "",
                     "auto",
+                    persistence="intent",
                     cli_dest="sampler",
-                    choices=DISTILLED_SAMPLER_CHOICES,
+                    cli=CliBinding("LTX-2 generation"),
+                    choices=field_choices(DistilledRequest, "sampler"),
                     choice_help=(
                         ("auto", "Use the checkpoint generation's published policy"),
                         ("deterministic", "Use deterministic stage-1 sampling"),
                         ("ancestral", "Use ancestral stage-1 sampling"),
                     ),
-                    groups=_RESTART_BOTH,
+                    station_policies=_LOCKED,
+                    surfaces=CONFIG_SURFACES,
+                ),
+                F(
+                    "stage_1_sigmas",
+                    "Set the stage-1 denoise schedule explicitly",
+                    "numbers between 0 and 1, strictly decreasing, one more than the steps they drive",
+                    (1.0, 0.975, 0.725, 0.0),
+                    persistence="intent",
+                    cli_dest="stage_1_sigmas",
+                    cli=CliBinding(
+                        "LTX-2 generation",
+                        flags=("--sigmas-stage-1", "--stage1-sigmas"),
+                        parse=argument_value(parse_sigmas, "stage 1 sigmas"),
+                    ),
+                    notes=(
+                        "Each stage has its own schedule; overriding one leaves the other "
+                        "on its pinned distilled values.",
+                    ),
+                    station_policies=_LOCKED,
+                    surfaces=CONFIG_SURFACES,
+                ),
+                F(
+                    "stage_2_sigmas",
+                    "Set the stage-2 denoise schedule explicitly",
+                    "numbers between 0 and 1, strictly decreasing, one more than the steps they drive",
+                    (0.909375, 0.725, 0.421875, 0.0),
+                    persistence="intent",
+                    cli_dest="stage_2_sigmas",
+                    cli=CliBinding(
+                        "LTX-2 generation",
+                        flags=("--sigmas-stage-2", "--stage2-sigmas"),
+                        parse=argument_value(parse_sigmas, "stage 2 sigmas"),
+                    ),
+                    notes=(
+                        "Each stage has its own schedule; overriding one leaves the other "
+                        "on its pinned distilled values.",
+                    ),
+                    station_policies=_policy(
+                        "mutable",
+                        "locked",
+                        stage_2_reason=(
+                            "A stage-2 restart reruns the stage-2 schedule from the saved "
+                            "stage-1 latent."
+                        ),
+                        decode_reason="The saved final latent already embodies the stage-2 schedule.",
+                    ),
+                    surfaces=CONFIG_SURFACES,
                 ),
                 F(
                     "hdr",
                     "Select an HDR authoring profile",
                     "",
                     "SRGB_LINEAR",
+                    persistence="intent",
                     cli_dest="hdr",
-                    choices=HDR_AUTHORING_CHOICES,
+                    cli=CliBinding("LTX-2 generation"),
+                    choices=field_choices(DistilledRequest, "hdr"),
                     choice_help=(
                         ("SRGB_LINEAR", "Write scene-linear Rec.709 EXR masters"),
                         ("ACESCG", "Write scene-linear ACEScg EXR masters"),
                         ("ACESCCT", "Write ACEScct working-space EXR masters"),
                     ),
                     default_text="unset, which produces SDR output",
+                    station_policies=_MUTABLE,
+                    surfaces=CONFIG_SURFACES,
                 ),
                 F(
                     "generate_audio",
                     "Generate the joint audio branch",
                     "true or false",
                     False,
+                    persistence="intent",
                     cli_dest="generate_audio",
+                    cli=CliBinding("LTX-2 generation", action="paired_boolean"),
                     negative_purpose="Disable the joint audio branch",
+                    station_policies=_MUTABLE,
+                    surfaces=CONFIG_SURFACES,
                 ),
                 F(
                     "reference_aligned_audio",
                     "Use the reference implementation's rounded audio length",
                     "true or false",
                     False,
+                    persistence="intent",
                     cli_dest="reference_aligned_audio",
-                    groups=_RESTART_BOTH,
+                    cli=CliBinding("LTX-2 generation", action="boolean"),
+                    station_policies=_LOCKED,
+                    surfaces=CONFIG_SURFACES,
                 ),
                 F(
                     "generated_keyframes",
                     "Reserve stage-1 slots for generated keyframes",
                     "a non-negative integer",
                     0,
+                    persistence="intent",
                     cli_dest="generated_keyframes",
-                    groups=_RESTART_BOTH,
+                    cli=CliBinding("LTX-2 generation"),
+                    station_policies=_LOCKED,
+                    surfaces=CONFIG_SURFACES,
                 ),
                 F(
                     "text_conditioning",
                     "Load saved prompt tensors instead of running Gemma",
                     "a path to a compatible safetensors file",
                     Path("prompt_text.safetensors"),
+                    persistence="intent",
                     cli_dest="text_conditioning",
-                    groups=_RESTART_DECODE,
+                    cli=CliBinding("LTX-2 generation"),
+                    station_policies=_DECODE_LOCKED,
+                    surfaces=CONFIG_SURFACES,
                 ),
                 F(
                     "vae_decode_dtype",
                     "Select the VAE decode precision",
                     "",
                     "auto",
+                    persistence="intent",
                     cli_dest="vae_decode_dtype",
-                    choices=VAE_DECODE_DTYPE_CHOICES,
+                    cli=CliBinding("LTX-2 generation"),
+                    choices=field_choices(DistilledRequest, "vae_decode_dtype"),
                     choice_help=(
                         ("auto", "Use bfloat16 for SDR and float32 for HDR"),
                         ("bfloat16", "Force bfloat16 VAE decode compute"),
+                        ("float16", "Experimental FP16 compute for the diffusion VAE only"),
                         ("float32", "Force float32 VAE decode compute"),
                     ),
+                    station_policies=_MUTABLE,
+                    surfaces=CONFIG_SURFACES,
                 ),
                 F(
                     "pad_prompt_to_max",
                     "Pad Gemma input to 1,024 tokens",
                     "true or false",
                     True,
+                    persistence="intent",
                     cli_dest="pad_prompt_to_max",
+                    cli=CliBinding(
+                        "LTX-2 generation",
+                        flags=("--reference-prompt-padding",),
+                        action="paired_boolean",
+                        negative_flags=("--compact-prompt",),
+                    ),
                     negative_purpose="Use variable-length Gemma input without maximum padding",
-                    groups=_RESTART_BOTH,
+                    station_policies=_LOCKED,
+                    surfaces=CONFIG_SURFACES,
                 ),
-                F(
-                    "lora_paths",
-                    "Apply community LoRA adapters in order",
-                    "an array of paths to compatible safetensors files",
-                    (Path("adapter.safetensors"),),
-                    cli_dest="lora_paths",
-                    groups=_RESTART_DECODE,
-                ),
-                F(
-                    "lora_strengths",
-                    "Set the total adapter weights",
-                    "one finite value or one per LoRA",
-                    (1.0,),
-                    cli_dest="lora_strengths",
-                    groups=_RESTART_DECODE,
-                ),
-                F(
-                    "lora_stage1_strengths",
-                    "Set stage-1 adapter weights",
-                    "one finite value or one per LoRA",
-                    (1.0,),
-                    cli_dest="lora_stage1_strengths",
-                    groups=_RESTART_BOTH,
-                ),
-                F(
-                    "lora_stage2_strengths",
-                    "Set stage-2 adapter weights",
-                    "one finite value or one per LoRA",
-                    (1.0,),
-                    cli_dest="lora_stage2_strengths",
-                    groups=_RESTART_DECODE,
-                ),
-                F(
-                    "lora_exclusions",
-                    "Disable selected adapter categories for each LoRA",
-                    "one category string or one string per LoRA; categories: "
-                    + ", ".join(sorted(LORA_EXCLUDE_CATEGORIES)),
-                    ("audio",),
-                    cli_dest="lora_exclusions",
-                    groups=_RESTART_DECODE,
+                replace(
+                    ADAPTERS,
+                    station_policies=(
+                        StationPolicy("stage-2", "locked", "adapter_stage1_profile"),
+                        StationPolicy("decode", "locked", "adapter_stage_profiles"),
+                    ),
                 ),
             ),
         ),
         ConfigTableSpec(
             path=("generate", "image"),
+            cli_generated=True,
             record=ImageConditioningConfig,
+            stations=RESTART_PHASE_CHOICES,
+            station_record=ImageConditioningConfig,
             starter_enabled=False,
             default_present=False,
             introduction=(
@@ -307,28 +681,45 @@ CONFIG_SCHEMA = ModelConfigSpec(
                     "Set the image-conditioning source",
                     "a readable image path",
                     Path("input.png"),
+                    persistence="intent",
                     cli_dest="image",
-                    groups=_RESTART_DECODE,
+                    environment_key="image",
+                    cli=CliBinding("LTX-2 generation"),
+                    station_policies=_DECODE_LOCKED,
+                    surfaces=CONFIG_SURFACES,
                 ),
                 F(
                     "frame_index",
                     "Choose the conditioned output frame",
                     "a non-negative integer",
                     0,
+                    persistence="intent",
                     cli_dest="image_frame_index",
+                    environment_key="image_frame_index",
+                    cli=CliBinding("LTX-2 generation"),
+                    station_policies=_DECODE_LOCKED,
+                    surfaces=CONFIG_SURFACES,
                 ),
                 F(
                     "strength",
                     "Set the image-conditioning strength",
                     "a number from 0 through 1",
                     0.95,
+                    persistence="intent",
                     cli_dest="image_strength",
+                    environment_key="image_strength",
+                    cli=CliBinding("LTX-2 generation"),
+                    station_policies=_DECODE_LOCKED,
+                    surfaces=CONFIG_SURFACES,
                 ),
             ),
         ),
         ConfigTableSpec(
             path=("generate", "hdr_reference"),
+            cli_generated=True,
             record=HDRReferenceConditioningConfig,
+            stations=RESTART_PHASE_CHOICES,
+            station_record=HDRReferenceConditioningConfig,
             starter_enabled=False,
             default_present=False,
             introduction=(
@@ -341,21 +732,33 @@ CONFIG_SCHEMA = ModelConfigSpec(
                     "Set the SDR reference video",
                     "a readable video path",
                     Path("reference.mov"),
+                    persistence="intent",
                     cli_dest="hdr_reference",
-                    groups=_RESTART_DECODE,
+                    environment_key="hdr_reference",
+                    cli=CliBinding("LTX-2 generation"),
+                    station_policies=_DECODE_LOCKED,
+                    surfaces=CONFIG_SURFACES,
                 ),
                 F(
                     "strength",
                     "Set the SDR reference strength",
                     "a number from 0 through 1",
                     1.0,
+                    persistence="intent",
                     cli_dest="hdr_reference_strength",
+                    environment_key="hdr_reference_strength",
+                    cli=CliBinding("LTX-2 generation"),
+                    station_policies=_DECODE_LOCKED,
+                    surfaces=CONFIG_SURFACES,
                 ),
             ),
         ),
         ConfigTableSpec(
             path=("generate", "vae_tiling"),
+            cli_generated=True,
             record=VideoVAETilingConfig,
+            stations=RESTART_PHASE_CHOICES,
+            station_record=VideoVAETilingConfig,
             starter_enabled=False,
             introduction=(
                 "Optional VAE decode tiling. Uncomment this table header and the "
@@ -367,219 +770,329 @@ CONFIG_SCHEMA = ModelConfigSpec(
                     "Select the decode tiling policy",
                     "",
                     "custom",
+                    persistence="intent",
                     cli_dest="vae_tiling",
-                    choices=VAE_TILING_MODE_CHOICES,
+                    environment_key="vae_tiling",
+                    layer_transforms=(
+                        VAE_TILING_INPUT,
+                        VAE_TILING_SELECTION,
+                        VAE_TILING_EFFECTIVE,
+                    ),
+                    cli=CliBinding("LTX-2 generation"),
+                    choices=field_choices(VideoVAETilingConfig, "mode"),
                     choice_help=(
                         ("auto", "Let the decoder choose a memory-aware tiling plan"),
                         ("single", "Decode the complete latent in one operation"),
                         ("custom", "Use the temporal and spatial tile fields below"),
                     ),
+                    station_policies=_MUTABLE,
+                    surfaces=CONFIG_SURFACES,
                 ),
                 F(
                     "temporal_tile_frames",
                     "Set the temporal tile size",
                     "0, or a multiple of 8 that is at least 16",
                     32,
+                    persistence="intent",
                     cli_dest="vae_temporal_tile_frames",
+                    environment_key="vae_temporal_tile_frames",
+                    cli=CliBinding("LTX-2 generation"),
                     default_text="unset, or 256 when the mode is custom",
+                    station_policies=_MUTABLE,
+                    surfaces=CONFIG_SURFACES,
                 ),
                 F(
                     "temporal_overlap_frames",
                     "Set the temporal overlap",
                     "a non-negative multiple of 8 smaller than the temporal tile",
                     24,
+                    persistence="intent",
                     cli_dest="vae_temporal_overlap_frames",
+                    environment_key="vae_temporal_overlap_frames",
+                    cli=CliBinding("LTX-2 generation"),
+                    station_policies=_MUTABLE,
+                    surfaces=CONFIG_SURFACES,
                 ),
                 F(
                     "spatial_tile_pixels",
                     "Set the spatial tile size",
                     "0, or a multiple of 32 that is at least 64",
                     512,
+                    persistence="intent",
                     cli_dest="vae_spatial_tile_pixels",
+                    environment_key="vae_spatial_tile_pixels",
+                    cli=CliBinding("LTX-2 generation"),
+                    station_policies=_MUTABLE,
+                    surfaces=CONFIG_SURFACES,
                 ),
                 F(
                     "spatial_overlap_pixels",
                     "Set the spatial overlap",
                     "a non-negative multiple of 32 smaller than the spatial tile",
                     64,
+                    persistence="intent",
                     cli_dest="vae_spatial_overlap_pixels",
+                    environment_key="vae_spatial_overlap_pixels",
+                    cli=CliBinding("LTX-2 generation"),
+                    station_policies=_MUTABLE,
+                    surfaces=CONFIG_SURFACES,
                 ),
             ),
         ),
         ConfigTableSpec(
             path=("output",),
+            cli_generated=True,
             record=OutputConfig,
             fields=(
                 F(
                     "path",
-                    "Write to an exact video path",
-                    "a path string",
+                    "Write to an exact video path, including .mp4",
+                    "an MP4 path",
                     Path("video.mp4"),
+                    persistence="intent",
                     cli_dest="output_path",
+                    environment_key="output_path",
+                    layer_transforms=(OUTPUT_SELECTION,),
+                    cli=CliBinding("Output", flags=("--output",)),
                     default_text="unset, which creates a timestamped output",
+                    surfaces=CONFIG_SURFACES,
                 ),
                 F(
                     "directory",
                     "Choose the directory for timestamped output",
                     "a directory path",
                     Path("outputs"),
+                    persistence="intent",
                     cli_dest="output_dir",
-                    default_text='KINO_OUTPUT_DIR, then "outputs"',
+                    environment_key="output_dir",
+                    cli=CliBinding("Output"),
+                    surfaces=CONFIG_SURFACES,
                 ),
                 F(
                     "prefix",
                     "Set the timestamped filename prefix",
                     "non-empty filename text",
-                    "kinomlx",
+                    "ltx2-distilled-seed42",
+                    persistence="intent",
                     cli_dest="output_prefix",
+                    environment_key="output_prefix",
+                    cli=CliBinding("Output"),
+                    default_text="ltx2-distilled-seed<seed>",
+                    surfaces=CONFIG_SURFACES,
                 ),
                 F(
                     "vsr_spatial_mode",
                     "Select the spatial VSR mode",
                     "",
                     "off",
+                    persistence="intent",
                     cli_dest="vsr_spatial_mode",
-                    choices=VSR_SPATIAL_MODE_CHOICES,
+                    cli=CliBinding("Output"),
+                    choices=field_choices(OutputConfig, "vsr_spatial_mode"),
                     choice_help=(
                         ("off", "Disable spatial super-resolution"),
                         ("fast", "Use the low-latency spatial processor"),
                         ("balanced", "Use temporally aware balanced-quality VSR"),
                         ("image", "Use the highest-quality per-frame spatial processor"),
                     ),
+                    surfaces=CONFIG_SURFACES,
                 ),
                 F(
                     "target_fps",
                     "Set the post-generation frame rate",
                     "a finite number greater than 0",
                     48.0,
+                    persistence="intent",
                     cli_dest="target_fps",
+                    cli=CliBinding("Output"),
+                    surfaces=CONFIG_SURFACES,
                 ),
                 F(
                     "vsr_temporal_mode",
                     "Select the temporal interpolation quality",
                     "",
                     "normal",
+                    persistence="intent",
                     cli_dest="vsr_temporal_mode",
-                    choices=VSR_TEMPORAL_MODE_CHOICES,
+                    cli=CliBinding("Output"),
+                    choices=field_choices(OutputConfig, "vsr_temporal_mode"),
                     choice_help=(
                         ("normal", "Use normal-quality frame interpolation"),
                         ("high", "Use high-quality frame interpolation"),
                     ),
+                    surfaces=CONFIG_SURFACES,
                 ),
                 F(
                     "cut_detect_mode",
                     "Select hard-cut protection",
                     "",
                     "simple",
+                    persistence="intent",
                     cli_dest="cut_detect_mode",
-                    choices=CUT_DETECT_MODE_CHOICES,
+                    cli=CliBinding("Output"),
+                    choices=field_choices(OutputConfig, "cut_detect_mode"),
                     choice_help=(
                         ("off", "Disable hard-cut protection"),
                         ("simple", "Use the default lightweight cut detector"),
                         ("hist", "Use histogram detection for motion-heavy footage"),
                     ),
+                    surfaces=CONFIG_SURFACES,
                 ),
                 F(
                     "cut_detect_threshold",
                     "Override the cut detector threshold",
                     "a finite number greater than or equal to 0",
                     0.35,
+                    persistence="intent",
                     cli_dest="cut_detect_threshold",
+                    cli=CliBinding("Output", metavar="FLOAT"),
+                    surfaces=CONFIG_SURFACES,
                 ),
                 F(
                     "vsr_save_original",
                     "Keep the preprocessed video beside the VSR output",
                     "true or false",
                     False,
+                    persistence="intent",
                     cli_dest="vsr_save_original",
+                    cli=CliBinding("Output", action="boolean"),
                     groups=frozenset({ConfigGroup.SAVE_ALL_CANDIDATE}),
+                    surfaces=CONFIG_SURFACES,
                 ),
                 F(
                     "encode_quality",
                     "Set VideoToolbox encoding quality",
                     "a number from 0 through 1",
                     0.65,
+                    persistence="intent",
                     cli_dest="encode_quality",
+                    cli=CliBinding("Output"),
+                    surfaces=CONFIG_SURFACES,
                 ),
                 F(
                     "audio_codec",
                     "Select the encoded audio codec",
                     "",
                     "alac",
+                    persistence="intent",
                     cli_dest="audio_codec",
-                    choices=AUDIO_CODEC_CHOICES,
+                    cli=CliBinding("Output"),
+                    choices=field_choices(OutputConfig, "audio_codec"),
                     choice_help=(
                         ("alac", "Encode lossless Apple Lossless audio"),
                         ("aac", "Encode compact lossy AAC audio"),
                     ),
+                    surfaces=CONFIG_SURFACES,
                 ),
                 F(
                     "audio_onset_trim",
                     "Configure audio onset repair",
-                    '"auto", "off", or a non-negative millisecond value',
+                    '"auto", "off", or a non-negative millisecond count, bare or quoted '
+                    '(in TOML, audio_onset_trim = 120 or "120"; saved as the string)',
                     "auto",
+                    persistence="intent",
                     cli_dest="audio_onset_trim",
+                    cli=CliBinding("Output", metavar="AUTO|OFF|MS"),
+                    surfaces=CONFIG_SURFACES,
                 ),
                 F(
                     "save_run_log",
                     "Save the resolved invocation and timing as JSON",
                     "true or false",
                     False,
+                    persistence="intent",
                     cli_dest="save_run_log",
+                    cli=CliBinding(
+                        "Output", flags=("--save-run-log", "--save-metadata"), action="boolean"
+                    ),
+                    default_text="unset, which inherits the save-all setting",
                     groups=frozenset({ConfigGroup.SAVE_ALL_CANDIDATE}),
+                    surfaces=CONFIG_SURFACES,
                 ),
                 F(
                     "save_console_log",
                     "Save a human-readable execution log",
                     "true or false",
                     False,
+                    persistence="intent",
                     cli_dest="save_console_log",
+                    cli=CliBinding("Output", action="boolean"),
+                    default_text="unset, which inherits the save-all setting",
                     groups=frozenset({ConfigGroup.SAVE_ALL_CANDIDATE}),
+                    surfaces=CONFIG_SURFACES,
                 ),
                 F(
                     "save_effective_config",
                     "Save the effective invocation as a TOML sidecar",
                     "true or false",
                     False,
+                    persistence="intent",
                     cli_dest="save_effective_config",
+                    cli=CliBinding("Output", action="boolean"),
+                    default_text="unset, which inherits the save-all setting",
                     groups=frozenset({ConfigGroup.SAVE_ALL_CANDIDATE}),
+                    surfaces=CONFIG_SURFACES,
                 ),
                 F(
                     "save_audio_sidecar",
                     "Save generated audio as a WAV sidecar",
                     "true or false",
                     False,
+                    persistence="intent",
                     cli_dest="save_audio_sidecar",
+                    cli=CliBinding("Output", action="boolean"),
+                    default_text="unset, which inherits the save-all setting",
                     groups=frozenset({ConfigGroup.SAVE_ALL_CANDIDATE}),
+                    surfaces=CONFIG_SURFACES,
                 ),
                 F(
                     "save_hdr_heic_frames",
                     "Save HDR frames as PQ HEIC files",
                     "true or false",
                     False,
+                    persistence="intent",
                     cli_dest="save_hdr_heic_frames",
+                    cli=CliBinding("Output", action="boolean"),
+                    default_text="unset, which stays off because save-all excludes this sequence",
                     groups=frozenset({ConfigGroup.SAVE_ALL_CANDIDATE}),
+                    surfaces=CONFIG_SURFACES,
                 ),
                 F(
                     "save_vae_frames",
                     "Save normalized pre-postprocess PNG frames",
                     "true or false",
                     False,
+                    persistence="intent",
                     cli_dest="save_vae_frames",
+                    cli=CliBinding("Output", action="boolean"),
+                    default_text="unset, which stays off because save-all excludes this sequence",
                     groups=frozenset({ConfigGroup.SAVE_ALL_CANDIDATE}),
+                    surfaces=CONFIG_SURFACES,
                 ),
                 F(
                     "save_all_sidecars",
                     "Enable every applicable reproducibility sidecar",
                     "true or false",
                     False,
+                    persistence="intent",
                     cli_dest="save_all_sidecars",
+                    cli=CliBinding(
+                        "Output",
+                        flags=("--save-all-sidecars", "--save-debug-sidecars"),
+                        action="boolean",
+                    ),
+                    surfaces=CONFIG_SURFACES,
                 ),
             ),
         ),
-        settings_table(),
+        settings_table(
+            stations=RESTART_PHASE_CHOICES,
+            adapter_weight_check_stations=frozenset({"stage-2"}),
+        ),
         ConfigTableSpec(
             path=("model_settings",),
+            cli_generated=True,
+            cli_group="LTX-2 runtime settings (override env vars)",
             record=LTX2Settings,
             fields=(
                 F(
@@ -587,340 +1100,453 @@ CONFIG_SCHEMA = ModelConfigSpec(
                     "Select the checkpoint generation",
                     "",
                     "2.3",
+                    persistence="intent",
                     cli_dest="model_generation",
-                    choices=MODEL_GENERATION_CHOICES,
+                    choices=field_choices(LTX2Settings, "model_generation"),
                     choice_help=(
                         ("2.3", "Discover and run the LTX-2.3 checkpoint family"),
                         ("2.5", "Discover and run the LTX-2.5 checkpoint family"),
                     ),
                     default_text="unset, which uses 2.3 discovery",
-                    groups=frozenset({ConfigGroup.MODEL_GENERATION_SELECTOR}),
+                    groups=frozenset({LTX2ConfigGroup.MODEL_GENERATION_SELECTOR}),
+                    surfaces=CONFIG_SURFACES,
                 ),
                 F(
                     "weights_path",
                     "Load a monolithic baseline or use an LTX-2.5 pack as the component root",
                     "a compatible safetensors file or local LTX-2.5 pack directory",
                     Path("ltx-2.3.safetensors"),
+                    persistence="intent",
                     cli_dest="weights_path",
-                    default_text="unset or KINO_WEIGHTS_PATH",
+                    default_text="unset or KINO_LTX2_WEIGHTS_PATH",
                     groups=frozenset(
                         {
-                            ConfigGroup.MODEL_SOURCE,
-                            ConfigGroup.MODEL_MONOLITHIC_SOURCE,
+                            LTX2ConfigGroup.MODEL_SOURCE,
+                            LTX2ConfigGroup.MODEL_MONOLITHIC_SOURCE,
                         }
                     ),
+                    surfaces=CONFIG_SURFACES,
                 ),
                 F(
                     "gemma_path",
                     "Load a monolithic Gemma checkpoint",
                     "a path to a compatible safetensors file",
                     Path("gemma.safetensors"),
+                    persistence="intent",
                     cli_dest="gemma_path",
                     default_text="auto-discovered",
                     groups=frozenset(
                         {
-                            ConfigGroup.MODEL_SOURCE,
-                            ConfigGroup.MODEL_GEMMA_SOURCE,
+                            LTX2ConfigGroup.MODEL_SOURCE,
+                            LTX2ConfigGroup.MODEL_GEMMA_SOURCE,
                         }
                     ),
+                    surfaces=CONFIG_SURFACES,
                 ),
                 F(
                     "gemma_variant",
                     "Select the LTX-2.3 Gemma source",
                     "",
                     "qat",
+                    persistence="intent",
                     cli_dest="gemma_variant",
-                    choices=GEMMA_VARIANT_CHOICES,
+                    choices=field_choices(LTX2Settings, "gemma_variant"),
                     choice_help=(
                         ("qat", "Use the QAT-unquantized Gemma source paired with LTX-2.3"),
                         ("plain", "Use the plain instruction-tuned Gemma source"),
                     ),
+                    surfaces=CONFIG_SURFACES,
                 ),
                 F(
                     "spatial_upscaler_path",
                     "Load the spatial latent upscaler",
                     "a path to a compatible safetensors file",
                     Path("spatial-upscaler.safetensors"),
+                    persistence="intent",
                     cli_dest="spatial_upscaler_path",
                     default_text="auto-discovered",
-                    groups=frozenset({ConfigGroup.MODEL_SOURCE}),
+                    groups=frozenset({LTX2ConfigGroup.MODEL_SOURCE}),
+                    surfaces=CONFIG_SURFACES,
                 ),
                 F(
                     "transformer_path",
                     "Load a componentized transformer or override the baseline transformer",
                     "a directory or safetensors path",
                     Path("transformer/"),
+                    persistence="intent",
                     cli_dest="transformer_path",
                     groups=frozenset(
                         {
-                            ConfigGroup.MODEL_SOURCE,
-                            ConfigGroup.MODEL_SPLIT_SOURCE,
+                            LTX2ConfigGroup.MODEL_SOURCE,
+                            LTX2ConfigGroup.MODEL_SPLIT_SOURCE,
                         }
                     ),
+                    surfaces=CONFIG_SURFACES,
                 ),
                 F(
                     "text_encoder_path",
                     "Load a componentized text stack",
                     "a directory or safetensors path",
                     Path("text-encoder/"),
+                    persistence="intent",
                     cli_dest="text_encoder_path",
                     groups=frozenset(
                         {
-                            ConfigGroup.MODEL_SOURCE,
-                            ConfigGroup.MODEL_TEXT_ENCODER_SOURCE,
+                            LTX2ConfigGroup.MODEL_SOURCE,
+                            LTX2ConfigGroup.MODEL_TEXT_ENCODER_SOURCE,
                         }
                     ),
+                    surfaces=CONFIG_SURFACES,
                 ),
                 F(
                     "video_vae",
                     "Select the named video decoder",
                     "",
                     "conv",
+                    persistence="intent",
                     cli_dest="video_vae",
-                    choices=VIDEO_VAE_CHOICES,
+                    cli=CliBinding("LTX-2 artifacts"),
+                    choices=field_choices(LTX2Settings, "video_vae"),
                     choice_help=(
                         ("conv", "Use the convolutional video VAE"),
                         ("diffusion", "Use the compatible LTX-2.5 diffusion decoder"),
                     ),
-                    groups=frozenset({ConfigGroup.MODEL_VIDEO_VAE_SELECTOR}),
+                    groups=frozenset({LTX2ConfigGroup.MODEL_VIDEO_VAE_SELECTOR}),
+                    surfaces=CONFIG_SURFACES,
                 ),
                 F(
                     "video_vae_path",
                     "Load an explicit video VAE",
                     "a directory or safetensors path",
                     Path("video-vae/"),
+                    persistence="intent",
                     cli_dest="video_vae_path",
                     default_text="auto-discovered",
                     groups=frozenset(
                         {
-                            ConfigGroup.MODEL_SOURCE,
-                            ConfigGroup.MODEL_VIDEO_VAE_SOURCE,
+                            LTX2ConfigGroup.MODEL_SOURCE,
+                            LTX2ConfigGroup.MODEL_VIDEO_VAE_SOURCE,
                         }
                     ),
+                    surfaces=CONFIG_SURFACES,
                 ),
                 F(
                     "audio_vae_path",
                     "Load an explicit audio VAE and vocoder",
                     "a directory or safetensors path",
                     Path("audio-vae/"),
+                    persistence="intent",
                     cli_dest="audio_vae_path",
                     default_text="auto-discovered",
-                    groups=frozenset({ConfigGroup.MODEL_SOURCE}),
+                    groups=frozenset({LTX2ConfigGroup.MODEL_SOURCE}),
+                    surfaces=CONFIG_SURFACES,
                 ),
                 F(
                     "temporal_latent_upscaler_path",
                     "Load the temporal x2 latent upscaler",
                     "a path to a compatible safetensors file",
                     Path("temporal-upscaler.safetensors"),
+                    persistence="intent",
                     cli_dest="temporal_latent_upscaler_path",
                     default_text="auto-discovered",
-                    groups=frozenset({ConfigGroup.MODEL_SOURCE}),
+                    groups=frozenset({LTX2ConfigGroup.MODEL_SOURCE}),
+                    surfaces=CONFIG_SURFACES,
                 ),
                 F(
                     "duration_head_path",
                     "Load the automatic-duration head",
                     "a path to a compatible safetensors file",
                     Path("duration-head.safetensors"),
+                    persistence="intent",
                     cli_dest="duration_head_path",
                     default_text="auto-discovered",
-                    groups=frozenset({ConfigGroup.MODEL_SOURCE}),
+                    groups=frozenset({LTX2ConfigGroup.MODEL_SOURCE}),
+                    surfaces=CONFIG_SURFACES,
                 ),
                 F(
                     "fast_mode",
                     "Build one full lazy transformer graph",
                     "true or false",
                     True,
+                    persistence="intent",
                     cli_dest="fast_mode",
+                    surfaces=CONFIG_SURFACES,
                 ),
                 F(
                     "transformer_dtype",
                     "Select transformer storage and compute precision",
                     "",
                     "bfloat16",
+                    persistence="intent",
                     cli_dest="transformer_dtype",
-                    choices=TRANSFORMER_DTYPE_CHOICES,
+                    choices=field_choices(LTX2Settings, "transformer_dtype"),
                     choice_help=(
                         ("bfloat16", "Use bfloat16 transformer storage and compute"),
                         ("float16", "Use float16 transformer storage and compute"),
                         ("float32", "Use float32 transformer storage and compute"),
                     ),
+                    surfaces=CONFIG_SURFACES,
+                ),
+                F(
+                    "adapter_accumulation",
+                    "Select the precision adapter fusion accumulates in",
+                    "",
+                    "auto",
+                    persistence="intent",
+                    cli_dest="adapter_accumulation",
+                    choices=field_choices(LTX2Settings, "adapter_accumulation"),
+                    choice_help=(
+                        ("auto", "float16 for a streamed float16 transformer, float32 otherwise"),
+                        ("float32", "Accumulate every adapter term in float32 and cast once"),
+                        (
+                            "float16",
+                            "Accumulate plain LoRA terms in float16; requires transformer_dtype "
+                            "float16",
+                        ),
+                    ),
+                    surfaces=CONFIG_SURFACES,
                 ),
                 F(
                     "steel_attention",
                     "Enable eligible STEEL attention kernels",
                     "true or false",
                     True,
+                    persistence="intent",
                     cli_dest="steel_attention",
+                    surfaces=CONFIG_SURFACES,
                 ),
                 F(
                     "steel_attention_d64",
                     "Enable the head-dimension-64 STEEL path",
                     "true or false",
                     True,
+                    persistence="intent",
                     cli_dest="steel_attention_d64",
+                    surfaces=CONFIG_SURFACES,
                 ),
                 F(
                     "steel_attention_probe",
                     "Collect STEEL selection diagnostics",
                     "true or false when STEEL attention is enabled",
                     False,
+                    persistence="intent",
                     cli_dest="steel_attention_probe",
+                    surfaces=CONFIG_SURFACES,
                 ),
                 F(
                     "compile_attention",
                     "Compile eligible attention calls",
                     "true or false",
                     True,
+                    persistence="intent",
                     cli_dest="compile_attention",
+                    surfaces=CONFIG_SURFACES,
                 ),
                 F(
                     "video_ff_layout_specs",
-                    "Configure video feed-forward cache layouts",
+                    "Configure video feed-forward weight layouts",
                     ('unique "project_in:pretranspose" or "project_out:pretranspose" entries'),
                     ("project_out:pretranspose",),
+                    persistence="intent",
                     cli_dest="video_ff_layout_specs",
+                    surfaces=CONFIG_SURFACES,
                 ),
                 F(
                     "video_ff_layout_layers",
-                    "Choose video layers for feed-forward cache layouts",
+                    "Choose video layers for feed-forward weight layouts",
                     "unique integers from 0 through 47",
                     (),
+                    persistence="intent",
                     cli_dest="video_ff_layout_layers",
+                    surfaces=CONFIG_SURFACES,
                 ),
                 F(
                     "video_attn_layout_specs",
-                    "Configure video attention cache layouts",
+                    "Configure video attention weight layouts",
                     'unique attention-target entries ending in ":pretranspose"',
                     (),
+                    persistence="intent",
                     cli_dest="video_attn_layout_specs",
+                    surfaces=CONFIG_SURFACES,
                 ),
                 F(
                     "video_attn_layout_layers",
-                    "Choose video layers for attention cache layouts",
+                    "Choose video layers for attention weight layouts",
                     "unique integers from 0 through 47",
                     (),
+                    persistence="intent",
                     cli_dest="video_attn_layout_layers",
+                    surfaces=CONFIG_SURFACES,
                 ),
                 F(
                     "audio_layout_mirror",
-                    "Mirror video cache layouts to audio blocks",
+                    "Mirror video weight layouts to audio blocks",
                     "true or false",
                     True,
+                    persistence="intent",
                     cli_dest="audio_layout_mirror",
+                    surfaces=CONFIG_SURFACES,
                 ),
                 F(
                     "audio_ff_layout_specs",
-                    "Configure audio feed-forward cache layouts",
+                    "Configure audio feed-forward weight layouts",
                     'unique feed-forward target entries ending in ":pretranspose"',
                     (),
+                    persistence="intent",
                     cli_dest="audio_ff_layout_specs",
+                    surfaces=CONFIG_SURFACES,
                 ),
                 F(
                     "audio_ff_layout_layers",
-                    "Choose audio layers for feed-forward cache layouts",
+                    "Choose audio layers for feed-forward weight layouts",
                     "unique integers from 0 through 47",
                     (),
+                    persistence="intent",
                     cli_dest="audio_ff_layout_layers",
+                    surfaces=CONFIG_SURFACES,
                 ),
                 F(
                     "audio_attn_layout_specs",
-                    "Configure audio attention cache layouts",
+                    "Configure audio attention weight layouts",
                     'unique attention-target entries ending in ":pretranspose"',
                     (),
+                    persistence="intent",
                     cli_dest="audio_attn_layout_specs",
+                    surfaces=CONFIG_SURFACES,
                 ),
                 F(
                     "audio_attn_layout_layers",
-                    "Choose audio layers for attention cache layouts",
+                    "Choose audio layers for attention weight layouts",
                     "unique integers from 0 through 47",
                     (),
+                    persistence="intent",
                     cli_dest="audio_attn_layout_layers",
+                    surfaces=CONFIG_SURFACES,
                 ),
                 F(
                     "adaln_pretranspose",
-                    "Pretranspose AdaLN cache tensors",
+                    "Pretranspose AdaLN weights",
                     "true or false",
                     False,
+                    persistence="intent",
                     cli_dest="adaln_pretranspose",
+                    surfaces=CONFIG_SURFACES,
                 ),
                 F(
-                    "transformer_cache_quantize",
-                    "Select whole-cache quantization",
+                    "transformer_quantize",
+                    "Select transformer quantization",
                     "",
                     "off",
-                    cli_dest="transformer_cache_quantize",
-                    choices=TRANSFORMER_CACHE_QUANTIZE_CHOICES,
+                    persistence="intent",
+                    cli_dest="transformer_quantize",
+                    choices=field_choices(LTX2Settings, "transformer_quantize"),
                     choice_help=(
-                        ("off", "Keep transformer caches in their source precision"),
-                        ("mxfp8-blocks", "Quantize transformer block caches to MXFP8"),
+                        ("off", "Keep transformer weights in their source precision"),
+                        ("mxfp8-blocks", "Quantize transformer block weights to MXFP8"),
                         (
                             "mxfp8-blocks-pretranspose",
-                            "Quantize and pretranspose transformer block caches",
+                            "Quantize and pretranspose transformer block weights",
                         ),
                     ),
+                    surfaces=CONFIG_SURFACES,
+                ),
+                F(
+                    "transformer_quantize_exclude_layers",
+                    "Keep selected blocks at the transformer dtype instead of quantizing",
+                    "unique integers from 0 through 47; requires whole-block quantization",
+                    (),
+                    persistence="intent",
+                    cli_dest="transformer_quantize_exclude_layers",
+                    surfaces=CONFIG_SURFACES,
                 ),
                 F(
                     "video_ff_quantize_specs",
                     "Configure targeted video feed-forward quantization",
                     ("unique feed-forward targets using affine, mxfp4, mxfp8, or nvfp4"),
                     (),
+                    persistence="intent",
                     cli_dest="video_ff_quantize_specs",
+                    surfaces=CONFIG_SURFACES,
                 ),
                 F(
                     "video_ff_quantize_layers",
                     "Choose video layers for targeted quantization",
                     "unique integers from 0 through 47",
                     (),
+                    persistence="intent",
                     cli_dest="video_ff_quantize_layers",
+                    surfaces=CONFIG_SURFACES,
                 ),
                 F(
                     "video_ff_quantize_group_size",
                     "Set the targeted quantization group size",
                     "a positive integer when quantization specs are present",
                     64,
+                    persistence="intent",
                     cli_dest="video_ff_quantize_group_size",
+                    surfaces=CONFIG_SURFACES,
                 ),
                 F(
                     "video_ff_quantize_bits",
                     "Set the affine target bit count",
                     "a positive integer when quantization specs are present",
                     4,
+                    persistence="intent",
                     cli_dest="video_ff_quantize_bits",
+                    surfaces=CONFIG_SURFACES,
                 ),
                 F(
                     "stream_transformer",
                     "Use the bounded-residency transformer preset",
                     "true or false",
                     False,
+                    persistence="intent",
                     cli_dest="stream_transformer",
+                    surfaces=CONFIG_SURFACES,
+                ),
+                F(
+                    "transformer_retain",
+                    "Retain selected block tensors across streamed denoising steps",
+                    "small, audio-attention, video-attention, audio-ff, video-ff, or block-relative tensor globs",
+                    (),
+                    persistence="intent",
+                    cli_dest="transformer_retain",
+                    surfaces=CONFIG_SURFACES,
                 ),
                 F(
                     "transformer_resident_blocks",
                     "Set the number of resident transformer blocks",
                     "an integer from 1 through 48",
                     STREAM_TRANSFORMER_RESIDENT_BLOCKS,
+                    persistence="intent",
                     cli_dest="transformer_resident_blocks",
                     default_text=(f"unset, or {STREAM_TRANSFORMER_RESIDENT_BLOCKS} when streaming"),
+                    surfaces=CONFIG_SURFACES,
                 ),
                 F(
                     "transformer_compile_group_size",
                     "Set the compiled transformer group size",
                     "a positive integer no greater than the resident block count",
-                    STREAM_TRANSFORMER_COMPILE_GROUP_SIZE,
+                    4,
+                    persistence="intent",
                     cli_dest="transformer_compile_group_size",
-                    default_text=(f"unset, up to {STREAM_TRANSFORMER_COMPILE_GROUP_SIZE}"),
+                    default_text="unset (streamed groups run uncompiled)",
+                    surfaces=CONFIG_SURFACES,
                 ),
                 F(
                     "compile_block_groups",
                     "Set the number of block groups to compile",
                     "an integer from 1 through 48",
                     48,
+                    persistence="intent",
                     cli_dest="compile_block_groups",
+                    surfaces=CONFIG_SURFACES,
                 ),
             ),
         ),
         ConfigTableSpec(
             path=("model_artifacts",),
+            cli_generated=True,
             record=LTX2ArtifactConfig,
             fields=(
                 F(
@@ -928,29 +1554,46 @@ CONFIG_SCHEMA = ModelConfigSpec(
                     "Save stage-1 and final latents",
                     "true or false",
                     True,
+                    persistence="intent",
                     cli_dest="save_latents",
+                    output_policy=OUTPUT_POLICIES["save_latents"],
+                    cli=CliBinding("LTX-2 artifacts", action="boolean"),
                     default_text="unset, which inherits the save-all setting",
+                    surfaces=CONFIG_SURFACES,
                 ),
                 F(
                     "save_media_conditioning",
                     "Save encoded media conditions",
                     "true or false",
                     True,
+                    persistence="intent",
                     cli_dest="save_media_conditioning",
+                    output_policy=OUTPUT_POLICIES["save_media_conditioning"],
+                    cli=CliBinding("LTX-2 artifacts", action="boolean"),
                     default_text="unset, which inherits the save-all setting",
+                    surfaces=CONFIG_SURFACES,
                 ),
                 F(
                     "save_text_conditioning",
                     "Save prompt tensors and their mask",
                     "true or false",
                     True,
+                    persistence="intent",
                     cli_dest="save_text_conditioning",
+                    output_policy=OUTPUT_POLICIES["save_text_conditioning"],
+                    cli=CliBinding(
+                        "LTX-2 artifacts",
+                        flags=("--save-text-conditioning", "--save-text-embeddings"),
+                        action="boolean",
+                    ),
                     default_text="unset, which inherits the save-all setting",
+                    surfaces=CONFIG_SURFACES,
                 ),
             ),
         ),
         ConfigTableSpec(
             path=("restart",),
+            cli_generated=True,
             record=RestartConfig,
             default_present=False,
             fields=(
@@ -959,41 +1602,60 @@ CONFIG_SCHEMA = ModelConfigSpec(
                     "Load a prior run record",
                     "a completed KinoMLX run-log path",
                     Path("previous_run.json"),
+                    persistence="intent",
                     cli_dest="restart_run",
-                    default_text="unset, which starts a fresh run",
+                    environment_key="restart_run",
+                    groups=frozenset({ConfigGroup.SOURCE_SELECTOR}),
+                    cli=CliBinding("Restart", flags=("--restart",), metavar="RUN_JSON"),
+                    notes=("Omit the whole [restart] table to start a fresh run.",),
+                    surfaces=CONFIG_SURFACES,
                 ),
                 F(
                     "phase",
                     "Select the first station to repeat",
                     "",
                     "decode",
+                    persistence="intent",
                     cli_dest="restart_phase",
-                    choices=RESTART_PHASE_CHOICES,
+                    environment_key="restart_phase",
+                    groups=frozenset({ConfigGroup.SOURCE_SELECTOR}),
+                    cli=CliBinding("Restart", flags=("--restart-from",)),
+                    choices=field_choices(RestartConfig, "phase"),
                     choice_help=(
                         ("decode", "Decode an already generated latent"),
                         ("stage-2", "Resume at the second denoising stage"),
                     ),
+                    surfaces=CONFIG_SURFACES,
                 ),
                 F(
                     "latent_stage",
                     "Select the saved latent used for decode",
                     "",
                     "final",
+                    persistence="intent",
                     cli_dest="latent_stage",
-                    choices=LATENT_STAGE_CHOICES,
+                    groups=frozenset({ConfigGroup.SOURCE_SELECTOR}),
+                    cli=CliBinding("Restart"),
+                    choices=field_choices(RestartConfig, "latent_stage"),
                     choice_help=(
                         ("final", "Decode the saved final latent"),
                         ("stage-1", "Decode the saved stage-1 latent"),
                     ),
                     default_text='"final" when the restart phase is decode',
+                    surfaces=CONFIG_SURFACES,
                 ),
                 F(
                     "latents",
                     "Substitute a latent artifact",
                     "a path to a compatible safetensors file",
                     Path("edited.safetensors"),
+                    persistence="intent",
                     cli_dest="restart_latents",
+                    environment_key="restart_latents",
+                    groups=frozenset({ConfigGroup.SOURCE_SELECTOR}),
+                    cli=CliBinding("Restart", metavar="SAFETENSORS"),
                     default_text="the artifact recorded in the run log",
+                    surfaces=CONFIG_SURFACES,
                 ),
             ),
         ),
@@ -1015,6 +1677,11 @@ CONFIG_SCHEMA = ModelConfigSpec(
                 ("output", "save_vae_frames"),
             ),
             coverage_group=ConfigGroup.SAVE_ALL_CANDIDATE,
+            inherited=(
+                ("model_artifacts", "save_latents"),
+                ("model_artifacts", "save_media_conditioning"),
+                ("model_artifacts", "save_text_conditioning"),
+            ),
         ),
         ConfigImplication(
             trigger=("model_settings", "stream_transformer"),
@@ -1024,14 +1691,57 @@ CONFIG_SCHEMA = ModelConfigSpec(
                     ("model_settings", "transformer_resident_blocks"),
                     STREAM_TRANSFORMER_RESIDENT_BLOCKS,
                 ),
-                (
-                    ("model_settings", "transformer_compile_group_size"),
-                    STREAM_TRANSFORMER_COMPILE_GROUP_SIZE,
-                ),
             ),
         ),
     ),
 )
 
+
+CONFIG_SCHEMA = replace(
+    CONFIG_SCHEMA,
+    api_boundaries=(
+        *RUNNER_API_BOUNDARIES,
+        APIBoundary(
+            "ltx2",
+            prepare_resources,
+            (
+                configuration("settings", LTX2Settings, "model_settings"),
+                configuration("infrastructure", Settings, "settings"),
+            ),
+        ),
+        APIBoundary(
+            "ltx2",
+            generate_distilled,
+            (
+                configuration("request", DistilledRequest, "generate"),
+                runtime("resources", "prepared immutable component inventory"),
+                runtime("components", "component provider"),
+                runtime("text_conditioner", "text-conditioning provider"),
+                runtime("reporter", "progress reporter"),
+                runtime("artifact_sink", "artifact writer"),
+                runtime("conditioning", "prepared shared station conditioning"),
+            ),
+        ),
+        APIBoundary(
+            "ltx2",
+            restart_distilled,
+            (
+                configuration("request", DistilledRequest, "generate"),
+                runtime("resources", "prepared immutable component inventory"),
+                runtime("restart", "typed prepared station handoff"),
+                runtime("components", "component provider"),
+                runtime("text_conditioner", "text-conditioning provider"),
+                runtime("reporter", "progress reporter"),
+                runtime("artifact_sink", "artifact writer"),
+            ),
+        ),
+    ),
+)
+
+
+CONFIG_SCHEMA = replace(
+    CONFIG_SCHEMA,
+    layer_transforms=(*CONFIG_SCHEMA.layer_transforms, source_selection_rule(CONFIG_SCHEMA)),
+)
 
 __all__ = ["CONFIG_SCHEMA"]

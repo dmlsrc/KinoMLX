@@ -1,7 +1,5 @@
 """Video VAE checkpoint architecture contracts."""
 
-from __future__ import annotations
-
 import pytest
 
 from kinomlx.models.ltx2.video_vae.config import (
@@ -82,7 +80,7 @@ def test_config_rejects_residual_on_non_all_decoder_compression() -> None:
         VideoVAEConfig.from_mapping(raw)
 
 
-def test_direct_block_construction_is_validated() -> None:
+def test_block_construction_is_validated() -> None:
     with pytest.raises(ValueError, match="requires num_layers"):
         VideoVAEBlock("res_x")
     with pytest.raises(ValueError, match="cannot set num_layers"):

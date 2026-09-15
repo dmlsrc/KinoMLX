@@ -1,17 +1,16 @@
 """Complete projection and connector loading for both LTX generations."""
 
-from __future__ import annotations
-
 from pathlib import Path
 
-from kinomlx.reporting import Reporter
-
-from ._loading import (
+from kinomlx.modeling.loading import (
     WeightTarget,
     bind_resolved_weights,
     bind_weight_targets,
     resolve_weight_bindings,
+    weight_files,
 )
+from kinomlx.reporting import Reporter
+
 from .connector import Embeddings1DConnector
 from .encoder import AudioVideoGemmaTextEncoderModel
 
@@ -175,7 +174,7 @@ def load_av_text_encoder_v2_weights(
     projection_path: Path | str | None = None,
     reporter: Reporter | None = None,
 ) -> int:
-    """Load all consumed targets from a monolith/cache or split packaged sources."""
+    """Load all consumed targets from a monolithic or split packaged sources."""
     connector_source = Path(path).expanduser().absolute()
     projection_source = (
         connector_source
@@ -183,11 +182,13 @@ def load_av_text_encoder_v2_weights(
         else Path(projection_path).expanduser().absolute()
     )
     for source in {projection_source, connector_source}:
-        if not source.is_file() or source.suffix != ".safetensors":
+        if source.suffix != ".safetensors" or not source.is_file():
             raise FileNotFoundError(f"LTX text-conditioning safetensors not found: {source}")
+    connector_files = weight_files(connector_source, component="LTX connectors")
+    projection_files = weight_files(projection_source, component="LTX text projection")
     if projection_source == connector_source:
         return bind_weight_targets(
-            (connector_source,),
+            connector_files,
             _targets(model),
             lambda logical_key: (logical_key,),
             component="LTX text projection/connectors",
@@ -196,25 +197,25 @@ def load_av_text_encoder_v2_weights(
         )
 
     projection_bindings = resolve_weight_bindings(
-        (projection_source,),
+        projection_files,
         _projection_targets(model),
         lambda logical_key: (logical_key,),
         component="LTX text projection",
     )
     connector_bindings = resolve_weight_bindings(
-        (connector_source,),
+        connector_files,
         _connector_targets_only(model),
         lambda logical_key: (logical_key,),
         component="LTX AV text connectors",
     )
     projection_count = bind_resolved_weights(
-        (projection_source,),
+        projection_files,
         projection_bindings,
-        phase="load LTX text projection",
+        phase="load text projection",
         reporter=reporter,
     )
     connector_count = bind_resolved_weights(
-        (connector_source,),
+        connector_files,
         connector_bindings,
         phase="load AV text connectors",
         reporter=reporter,

@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "kinomlx"
-version = "0.0.1"
+version = "0.0.2"
 description = "Native multimodal MLX inference for video generation and HDR still expansion"
 readme = "README.md"
 requires-python = ">=3.14"
@@ -29,7 +29,7 @@ dependencies = [
 
     # Tokenizer - SentencePiece backs the native Gemma tokenizer.
     "sentencepiece>=0.2.2",
-    # Derived tokenizer caches serialize SentencePiece ModelProto directly.
+    # Tokenizer derivation serializes SentencePiece ModelProto in memory.
     "protobuf>=7.36.0",
 
     # UX (terminal output, progress).
@@ -51,8 +51,13 @@ dependencies = [
 dev = [
     "mypy>=2.3.1",
     "pytest>=9.1.1",
+    # Parallel test execution; the suite runs -n auto by default (see
+    # [tool.pytest.ini_options]). Real-weight tests always run in one process.
+    "pytest-xdist>=3.8.0",
     "ruff>=0.16.4",
-    # Differential oracle for derived SentencePiece caches; never imported by kinomlx/.
+    # Occasional dead-code sweep, configured under [tool.vulture]; not a gate.
+    "vulture>=2.16",
+    # Differential oracle for derived SentencePiece models; never imported by kinomlx/.
     "tokenizers>=0.22.2",
     # numpy is a test-only oracle (test files build reference arrays with it),
     # not a runtime dependency - the package runs MLX-native without it.
@@ -104,13 +109,37 @@ target-version = "py314"
 # goes through kinomlx.ui.console so progress bars and the quiet/theme toggles
 # stay coordinated. RUF001-003 + PLC2401/PLC2403: the workspace plain-ASCII
 # rule (no em-dash, smart quotes, non-ASCII identifiers), enforced at lint time.
+# TID251: keep Python 3.14's native deferred annotations and one runtime/type
+# import graph; the banned-API table below rejects the two obsolete shortcuts.
+# PLC0415: imports live at module scope; only tests may import inside functions.
+# ARG: a parameter the body never reads is either an interface obligation, which
+# says so with a noqa and a reason, or a configuration input the code silently
+# ignores, which is a defect. Tests are exempt: their stubs and fakes legitimately
+# accept arguments they discard.
 select = [
     "E", "W", "F", "I", "B", "C4", "UP", "SIM", "PTH", "RET", "PIE", "PT", "T20",
-    "RUF001", "RUF002", "RUF003", "PLC2401", "PLC2403",
+    "TID251", "PLC0415", "RUF001", "RUF002", "RUF003", "PLC2401", "PLC2403", "ARG",
+    "FURB", "PERF", "RUF",
 ]
 # E501 (line length) is off: the formatter wraps where it matters, and forcing
 # a wrap sometimes hurts readability.
-ignore = ["E501"]
+# RUF043: measured against this suite, all 94 `match=` patterns are either a
+# deliberate `.*` regex or an already-escaped literal, so the rule reports intent
+# declarations rather than weak assertions here.
+ignore = ["E501", "RUF043"]
+
+[tool.ruff.lint.flake8-bugbear]
+# Frozen records are safe to evaluate once as a shared default; RUF009 and B008
+# treat these as immutable so the rules still catch a genuinely mutable default.
+extend-immutable-calls = [
+    "kinomlx.memory_policy.MLXMemoryPolicy",
+    "kinomlx.config_constraints.IntegerConstraint",
+]
+
+[tool.ruff.lint.flake8-tidy-imports.banned-api]
+"__future__.annotations".msg = "Use Python 3.14 native deferred annotations, not PEP 563 stringization."
+"typing.TYPE_CHECKING".msg = "Import annotation dependencies normally and keep one import graph."
+"typing_extensions.TYPE_CHECKING".msg = "Import annotation dependencies normally and keep one import graph."
 
 [tool.ruff.lint.per-file-ignores]
 # Re-export __init__ files pull names into the public surface that they do not
@@ -119,22 +148,28 @@ ignore = ["E501"]
 # Dev/demo scripts are CLI entry points - print() is their legitimate output,
 # not the bare-print-clobbers-bars footgun that T20 guards against in the package.
 "scripts/**" = ["T20"]
+# PLC0415: tests import inside test functions deliberately (isolation, fixtures).
+# ARG: test doubles conform to real signatures while ignoring most arguments.
+# PERF: assertion-building loops are written to be read, not to be fast.
+"tests/**" = ["PLC0415", "ARG", "PERF"]
 
 [tool.pytest.ini_options]
 minversion = "9.1.1"
 # -ra: summarize all non-pass outcomes; --strict-markers: an unregistered
 # marker is an error (catches typos); --strict-config: an unknown ini key is an
-# error.
-addopts = "-ra -q --strict-markers --strict-config"
+# error; -n auto: one xdist worker per physical core. Pass -n 0 for a single
+# process when debugging or under `coverage run`, which only observes the
+# controller process. Heavy tests force a single process (tests/conftest.py).
+addopts = "-ra -q --strict-markers --strict-config -n auto"
 testpaths = ["tests"]
 # Lets the suite run from a source checkout without an editable install.
 pythonpath = "."
 markers = [
     # Registered ahead of the model-lift test tiers; --strict-markers requires
     # a marker to be declared here before a test may use it.
-    "slow: long-running test (deselect with -m 'not slow')",
+    "heavy: loads real checkpoints or runs long GPU work; deselected by default, always one process, selected with --run-heavy",
+    "slow: a heavy test that takes minutes; --run-heavy -m 'heavy and not slow' runs the quick checkpoint checks",
     "requires_metal: executes a Metal GPU kernel (deselect with -m 'not requires_metal')",
-    "requires_weights: needs model weights on disk",
     "requires_avfoundation: needs the required real AVFoundation/CoreMedia stack via PyObjC",
 ]
 
@@ -146,6 +181,8 @@ files = [
     "tests/typecheck/config_contracts.py",
     "examples/ltx2_distilled.py",
     "examples/gmnet_expand.py",
+    "examples/krea2_generate.py",
+    "examples/flux2_generate.py",
 ]
 strict = true
 disallow_any_explicit = true
@@ -170,6 +207,55 @@ module = [
     "objc",
 ]
 ignore_missing_imports = true
+
+[tool.vulture]
+# Occasional dead-code sweep; vulture is not a required dev dependency or a gate.
+# It matches names, so anything resolved dynamically reads as unused. The names
+# below are obligations rather than judgments: the repository cannot stop
+# declaring them, and each has a caller outside our own code.
+paths = ["kinomlx", "examples", "scripts", "tests"]
+# Fixtures are injected by name; hooks are called by pytest.
+ignore_decorators = ["@pytest.fixture"]
+ignore_names = [
+    # pytest, importlib and the pickle machinery call these; nothing here does.
+    "pytest_*",
+    "pytestmark",
+    "find_spec",
+    "find_class",
+    "persistent_load",
+    "persistent_id",
+    # argparse actions and Apple framework callbacks receive parameters their
+    # bodies do not all read. Ruff's ARG rules own that surface, with an
+    # explicit reason recorded at each exception.
+    "option_string",
+    "parser",
+    "sample_buffer",
+    "queue",
+    "rect",
+    "bitmap",
+    "presentation_time",
+    "desc",
+    "media_type",
+    "always_copies",
+    "protocol",
+    # Protocol __call__ keywords, and the station-policy projections that
+    # replay resolves by name from the configuration declarations.
+    "output_shapes",
+    "output_dtypes",
+    "threadgroup",
+    "init_value",
+    "adapter_stage1_profile",
+    "adapter_stage_profiles",
+    # Host-contract Protocol members, a tokenizer double conforming to the
+    # upstream interface, and a sample that exists for the type checker.
+    "save_media_conditioning",
+    "apply_chat_template",
+    "external_example",
+]
+# Fields of declared records still surface as unused attributes or variables,
+# because generic intent capture, digests and serialization reach them by name
+# rather than by attribute access. Read the unused function, method, property
+# and class findings first; those are the ones that mean something here.
 
 [tool.rumdl]
 line-length = 100

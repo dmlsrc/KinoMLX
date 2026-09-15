@@ -29,8 +29,6 @@ first frame is pulled. The first frame is then peeked to verify geometry and
 dtype; the rest are consumed with synchronous backpressure.
 """
 
-from __future__ import annotations
-
 import contextlib
 import io
 import itertools
@@ -49,18 +47,18 @@ from kinomlx.media.signals import (
     EncodedVideoDeliverySpec,
     OutputColorPlan,
     UnsupportedSignalError,
-    VideoCodecProfile,
     VideoSignalSpec,
     validate_sdr_output_plan,
 )
 from kinomlx.reporting import NullReporter, Reporter
 
+from ..audio import DEFAULT_TRIM_MS, mitigate_onset
 from . import pixel_buffers as _pb
 from .audio import AudioTrack
 from .cut_detect import CutDetector
 from .temporal import VtfrcSession
 from .vsr import VsrSession, scale_for_mode
-from .writer import HEVC_PROFILE_MAIN10, HEVC_PROFILE_MAIN422_10, AVWriter
+from .writer import AVWriter, hevc_profile_for
 
 _log = logging.getLogger(__name__)
 
@@ -135,14 +133,6 @@ def _validate_source_frame(frame: mx.array, source_signal: VideoSignalSpec) -> N
         )
 
 
-def _native_hevc_profile(delivery: EncodedVideoDeliverySpec) -> str:
-    return (
-        HEVC_PROFILE_MAIN10
-        if delivery.profile is VideoCodecProfile.MAIN10
-        else HEVC_PROFILE_MAIN422_10
-    )
-
-
 def _output_phase_name(
     *,
     vsr_spatial_mode: str | None,
@@ -194,7 +184,6 @@ def prepare_audio_track(
     if audio_sample_rate is None:
         raise ValueError("audio_sample_rate is required when audio_waveform is provided")
     arr = _normalize_audio_for_track(audio_waveform)
-    from ..audio import DEFAULT_TRIM_MS, mitigate_onset
 
     trim_ms = onset_trim_ms if onset_trim_ms is not None else DEFAULT_TRIM_MS
     onset_result = mitigate_onset(
@@ -366,12 +355,10 @@ def _encode_video_videotoolbox_impl(
         do_temporal = False
         output_fps = fps
 
-    profile = _native_hevc_profile(delivery)
-
     # ---- Setup phase ------------------------------------------------------
     # VsrSession / VtfrcSession / AVWriter constructors each print to stdout
     # unconditionally ("VSR session ready ...", "Temporal session ready ...",
-    # "[encode] AVAssetWriter -> ..."), plus we add the chain description
+    # "Video encode: AVAssetWriter ..."), plus we add the chain description
     # and the optional audio sidecar line.  When `progress_stack` is alive
     # (the caller is showing a "VAE chunks" bar above us), those raw prints
     # would stomp on the bar row.  Redirect them through a StringIO and
@@ -481,12 +468,10 @@ def _encode_video_videotoolbox_impl(
         do_save_original = vsr_save_original and (vsr is not None or vtfrc is not None)
         if do_save_original:
             orig_path = output_path.with_name(f"{output_path.stem}_orig{output_path.suffix}")
-            if delivery.chroma is ChromaSubsampling.YUV422:
-                orig_src_fmt = _pb.PIX_RGBAHALF
-                orig_profile = HEVC_PROFILE_MAIN422_10
-            else:
-                orig_src_fmt = _pb.PIX_NV12
-                orig_profile = HEVC_PROFILE_MAIN10
+            orig_profile = hevc_profile_for(delivery)
+            orig_src_fmt = (
+                _pb.PIX_RGBAHALF if delivery.chroma is ChromaSubsampling.YUV422 else _pb.PIX_NV12
+            )
             orig_yuv_feed = orig_src_fmt == _pb.PIX_RGBAHALF
             writer_orig = AVWriter(
                 orig_path,
@@ -522,10 +507,9 @@ def _encode_video_videotoolbox_impl(
             stages.append(f"VTFRC={fps:g}->{output_fps:g}fps")
         chain = " + ".join(stages) if stages else "passthrough"
         if verbose:
-            _log.info(f"  encode (videotoolbox): {chain} -> HEVC {profile}")
-            _log.info(f"  -> {output_path}")
+            _log.info("Video processing: %s", chain)
             if writer_orig is not None:
-                _log.info(f"  + original passthrough -> HEVC {orig_profile} -> {orig_path}")
+                _log.info(f"Original video: HEVC {orig_profile}; output={orig_path}")
 
     # If we captured the setup output, route it above the caller's bar
     # stack now - single bars.write() call so the bars stay coherent.
@@ -656,7 +640,7 @@ def _encode_video_videotoolbox_impl(
                 f"({n_orig} src frame{'s' if n_orig != 1 else ''})"
             )
         done_msg = (
-            f"  done: {_human_size(size)} in {elapsed:.1f}s "
+            f"Video output: {_human_size(size)} in {elapsed:.1f}s "
             f"({n_in} src frame{'s' if n_in != 1 else ''}, "
             f"{n_out} written){orig_part}"
         )

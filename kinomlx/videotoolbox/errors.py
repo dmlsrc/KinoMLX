@@ -1,7 +1,5 @@
 """Typed VideoToolbox failures and narrow native-error classification."""
 
-from __future__ import annotations
-
 import objc
 
 from kinomlx.errors import KinoMLXError

@@ -1,7 +1,5 @@
 """Exact static pickle-global scanning for tensor checkpoint gates."""
 
-from __future__ import annotations
-
 import pickletools
 
 from kinomlx.errors import KinoMLXError

@@ -1,7 +1,5 @@
 """Raw-to-encoded condition product and ownership contracts."""
 
-from __future__ import annotations
-
 import gc
 import weakref
 from dataclasses import fields, is_dataclass
@@ -75,7 +73,8 @@ def test_prepare_conditions_returns_only_encoded_products_and_drops_encoder(
     expected_type,
     monkeypatch,
 ) -> None:
-    def encode_image(_path, encoder, *, width, height, compute_dtype, reporter):
+    def encode_image(_path, encoder, *, width, height, compute_dtype, reporter, hdr_authoring):
+        assert hdr_authoring is None
         del width, height, compute_dtype, reporter
         return encoder(mx.zeros((1, 3, 1, 64, 64)))
 

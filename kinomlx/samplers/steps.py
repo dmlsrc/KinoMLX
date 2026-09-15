@@ -1,10 +1,36 @@
 """Deterministic and RF-ancestral Euler diffusion steps."""
 
-from __future__ import annotations
-
 import math
 
 import mlx.core as mx
+
+
+def euler_velocity_step(
+    sample: mx.array,
+    velocity: mx.array,
+    sigma: float,
+    sigma_next: float,
+) -> mx.array:
+    """Advance a flow ODE with a low-precision-compatible Euler update.
+
+    The scalar delta and multiplication use FP32. The scaled velocity is then
+    narrowed to ``velocity.dtype`` before it is added to ``sample``. This is
+    the update boundary used by model loops whose native low-precision graph
+    computes ``sample + (sigma_next - sigma) * velocity`` directly.
+    """
+    if not math.isfinite(sigma) or not math.isfinite(sigma_next):
+        raise ValueError("Euler velocity sigmas must be finite")
+    if tuple(sample.shape) != tuple(velocity.shape):
+        raise ValueError(
+            f"velocity shape {tuple(velocity.shape)} does not match sample {tuple(sample.shape)}"
+        )
+    if sample.dtype != velocity.dtype:
+        raise ValueError(
+            f"velocity dtype {velocity.dtype} does not match sample dtype {sample.dtype}"
+        )
+    delta = mx.array(sigma_next - sigma, dtype=mx.float32)
+    scaled = (delta * velocity.astype(mx.float32)).astype(velocity.dtype)
+    return sample + scaled
 
 
 def euler_step(
@@ -113,4 +139,4 @@ def euler_ancestral_rf_step(
     return result.astype(sample_dtype)
 
 
-__all__ = ["euler_ancestral_rf_step", "euler_step"]
+__all__ = ["euler_ancestral_rf_step", "euler_step", "euler_velocity_step"]

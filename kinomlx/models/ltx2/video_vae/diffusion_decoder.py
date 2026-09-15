@@ -6,21 +6,19 @@ windows on stock MLX scaled-dot-product attention; no NATTEN, Triton, CuTe, or
 CUDA runtime is required.
 """
 
-from __future__ import annotations
-
 import gc
 import logging
 import math
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import TYPE_CHECKING, cast
+from typing import cast
 
 import mlx.core as mx
 from mlx.utils import tree_flatten
 
 import kinomlx._mlx_nn as nn
-from kinomlx._typing import TensorTree
+from kinomlx._tensor_tree import TensorTree
 from kinomlx.io.safetensors import load_weights
 from kinomlx.kernels import rms_norm, silu
 from kinomlx.reporting import NullReporter, Reporter
@@ -33,9 +31,7 @@ from kinomlx.types import DEFAULT_NOISE_BACKEND, NoiseBackend
 
 from .config import VideoVAEConfig
 from .ops import PerChannelStatistics
-
-if TYPE_CHECKING:
-    from .tiling import TilingConfig, TilingPlanReceipt
+from .tiling import TilingConfig, TilingPlanReceipt
 
 _log = logging.getLogger(__name__)
 
@@ -1149,8 +1145,6 @@ class NativeDiffusionVideoDecoder(nn.Module):
         noise_state_callback: Callable[[NoiseStreamState], None] | None,
     ) -> Iterator[mx.array]:
         """Yield bounded stage-4/stage-5 temporal groups in BCFHW layout."""
-        from .tiling import TilingConfig, TilingPlanReceipt
-
         latent = self._validate_input(latent)
         if isinstance(seed, bool) or not isinstance(seed, int) or not 0 <= seed < 2**64:
             raise ValueError("diffusion decoder seed must be an unsigned 64-bit integer")
@@ -1168,6 +1162,7 @@ class NativeDiffusionVideoDecoder(nn.Module):
                 output_height,
                 output_width,
                 output_frames,
+                compute_dtype=self.compute_dtype,
             )
             tiling_config = TilingConfig() if automatic is None else automatic
         if not isinstance(tiling_config, TilingConfig):
@@ -1448,7 +1443,7 @@ WeightSource = Mapping[str, mx.array] | Path | str
 def _weights_from_source(source: WeightSource) -> Mapping[str, mx.array]:
     if isinstance(source, Mapping):
         return source
-    return load_weights(source)
+    return load_weights(Path(source))
 
 
 def _flatten_to_nested(flat: dict[str, mx.array]) -> dict[str, TensorTree]:
@@ -1606,6 +1601,10 @@ def load_diffusion_video_decoder_weights(
         raise ValueError(f"diffusion video decoder weights are incomplete: {preview}{suffix}")
 
     decoder.update(_flatten_to_nested(bound))
+    if decoder.compute_dtype == mx.float16:
+        # Mixed BF16 weights and FP16 inputs promote to FP32 in MLX. Cast the
+        # loaded BF16 parameters too, while retaining explicit FP32 arithmetic.
+        decoder.set_dtype(mx.float16, predicate=lambda dtype: dtype == mx.bfloat16)
     ignored = tuple(
         sorted(
             key
@@ -1640,10 +1639,10 @@ def load_diffusion_video_decoder_weights(
 
 
 __all__ = [
-    "AttentionTilePlan",
-    "AttentionTilingStats",
     "DEFAULT_ATTENTION_SCORE_BUDGET",
     "DEFAULT_SWIGLU_TOKEN_BUDGET",
+    "AttentionTilePlan",
+    "AttentionTilingStats",
     "DiffusionDecoderLoadReceipt",
     "NativeDiffusionVideoDecoder",
     "NeighborhoodAttention3D",

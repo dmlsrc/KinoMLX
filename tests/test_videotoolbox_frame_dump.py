@@ -1,7 +1,5 @@
 """Decoded-frame PNG dump behavior before the media terminal."""
 
-from __future__ import annotations
-
 import json
 from pathlib import Path
 
@@ -25,7 +23,6 @@ def test_png_frame_dump_maps_frames_and_writes_manifest(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    from kinomlx.videotoolbox import images
 
     first = mx.array(
         [
@@ -43,7 +40,7 @@ def test_png_frame_dump_maps_frames_and_writes_manifest(
         saved[path.name] = image
         return path
 
-    monkeypatch.setattr(images, "save_image", save_image)
+    monkeypatch.setattr("kinomlx.videotoolbox.frame_dump.save_image", save_image)
     directory = tmp_path / "vae_frames"
     stream = PNGFrameDumpStream(source, directory)
 
@@ -72,7 +69,6 @@ def test_png_frame_dump_failure_removes_only_its_new_directory(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    from kinomlx.videotoolbox import images
 
     source = _source(mx.zeros((2, 2, 3), dtype=mx.float16))
     directory = tmp_path / "vae_frames"
@@ -80,7 +76,7 @@ def test_png_frame_dump_failure_removes_only_its_new_directory(
     def fail(_image: mx.array, _path: Path) -> Path:
         raise OSError("disk full")
 
-    monkeypatch.setattr(images, "save_image", fail)
+    monkeypatch.setattr("kinomlx.videotoolbox.frame_dump.save_image", fail)
     stream = PNGFrameDumpStream(source, directory)
     with pytest.raises(FrameDumpError, match="disk full"):
         next(stream)

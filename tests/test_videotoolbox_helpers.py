@@ -11,8 +11,6 @@ alone carries the requires_avfoundation marker; the rest are dependency-free and
 run anywhere MLX imports.
 """
 
-from __future__ import annotations
-
 import logging
 import subprocess
 import sys
@@ -983,19 +981,19 @@ def test_human_size(n, text):
 
 
 # --------------------------------------------------------------------------- #
-# encode._native_hevc_profile
+# writer.hevc_profile_for
 # --------------------------------------------------------------------------- #
 
 
 @pytest.mark.parametrize(
     ("delivery", "expected"),
     [
-        (BT709_SDR_420_DELIVERY, encode.HEVC_PROFILE_MAIN10),
-        (BT709_SDR_422_DELIVERY, encode.HEVC_PROFILE_MAIN422_10),
+        (BT709_SDR_420_DELIVERY, writer.HEVC_PROFILE_MAIN10),
+        (BT709_SDR_422_DELIVERY, writer.HEVC_PROFILE_MAIN422_10),
     ],
 )
-def test_native_hevc_profile_comes_from_delivery(delivery, expected):
-    assert encode._native_hevc_profile(delivery) == expected
+def test_hevc_profile_comes_from_delivery(delivery, expected):
+    assert writer.hevc_profile_for(delivery) == expected
 
 
 # --------------------------------------------------------------------------- #
@@ -1033,7 +1031,7 @@ def test_peek_frames_4d_array():
 
 
 def test_peek_frames_list():
-    first, it, total = encode._peek_frames([mx.zeros((4, 4, 3))] * 3)
+    _first, it, total = encode._peek_frames([mx.zeros((4, 4, 3))] * 3)
     assert total == 3
     assert sum(1 for _ in it) == 3
 
@@ -1043,7 +1041,7 @@ def test_peek_frames_generator_has_unknown_total():
         yield mx.zeros((4, 4, 3))
         yield mx.ones((4, 4, 3))
 
-    first, it, total = encode._peek_frames(gen())
+    _first, it, total = encode._peek_frames(gen())
     assert total is None
     assert sum(1 for _ in it) == 2  # first frame chained back in
 
@@ -1078,5 +1076,5 @@ def test_hevc_video_settings_embeds_geometry_and_profile():
     assert settings[av.AVVideoWidthKey] == 640
     assert settings[av.AVVideoHeightKey] == 480
     compression = settings[av.AVVideoCompressionPropertiesKey]
-    assert compression[av.AVVideoProfileLevelKey] == encode.HEVC_PROFILE_MAIN10
+    assert compression[av.AVVideoProfileLevelKey] == writer.HEVC_PROFILE_MAIN10
     assert compression[av.AVVideoQualityKey] == pytest.approx(0.7)

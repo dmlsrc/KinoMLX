@@ -1,24 +1,32 @@
 """Generic checkpoint-conversion command and model-specific dispatch."""
 
-from __future__ import annotations
-
 import argparse
 import logging
 import time
 from contextlib import ExitStack
 from pathlib import Path
 
-from kinomlx.cli.common import format_elapsed, render_error
+from kinomlx.cli.machine_output import emit_json
+from kinomlx.cli.presentation import format_elapsed, render_error
 from kinomlx.errors import KinoMLXError
-from kinomlx.settings import Settings, add_argparse_args
+from kinomlx.memory_policy import apply_memory_policy
+from kinomlx.models.gmnet.converter_cli import run_gmnet_convert_command
+from kinomlx.reporter_stack import command_reporter
+from kinomlx.ui import configure_logging, configure_logging_from_settings
+from kinomlx.weights.convert import convert_checkpoint
 
-from .host import apply_mlx_cache_limit, conversion_reporter, resolve_conversion_settings
+from .host import (
+    add_checkpoint_safety_arguments,
+    add_conversion_arguments,
+    bootstrap_json_output,
+    resolve_conversion_settings,
+)
 
 _log = logging.getLogger(__name__)
 
 
 def build_weights_parser() -> argparse.ArgumentParser:
-    """Build the model-neutral discovery parser without importing MLX."""
+    """Build the model-neutral discovery parser."""
     parser = argparse.ArgumentParser(
         prog="kinomlx weights",
         description="Safely convert tensor-only PyTorch checkpoints to safetensors.",
@@ -35,7 +43,7 @@ def build_weights_parser() -> argparse.ArgumentParser:
 
 
 def build_generic_convert_parser() -> argparse.ArgumentParser:
-    """Build the generic conversion parser without importing MLX."""
+    """Build the generic conversion parser."""
     parser = argparse.ArgumentParser(
         prog="kinomlx weights convert",
         description=(
@@ -74,41 +82,17 @@ def build_generic_convert_parser() -> argparse.ArgumentParser:
         default="",
         help="Keep only tensor keys beginning with this prefix.",
     )
-    parser.add_argument(
-        "--allow-suspicious-globals",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help=(
-            "Proceed past static-scan findings for a trusted file; the restricted "
-            "unpickler still refuses non-allowlisted globals."
-        ),
-    )
-    parser.add_argument(
-        "--force",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help="Replace an existing regular output; otherwise refuse before loading.",
-    )
-    add_argparse_args(parser)
+    add_checkpoint_safety_arguments(parser)
+    add_conversion_arguments(parser)
     return parser
-
-
-def _bootstrap_json(options: object) -> bool:
-    try:
-        base = Settings.from_env_fields("json_output")
-    except TypeError, ValueError:
-        base = Settings()
-    explicit = getattr(options, "json_output", None)
-    return base.json_output if explicit is None else bool(explicit)
 
 
 def run_generic_convert(argv: list[str]) -> int:
     """Run the generic converter and return a process exit code."""
-    from kinomlx.ui import configure_logging, configure_logging_from_settings
 
     configure_logging()
     options = build_generic_convert_parser().parse_args(argv)
-    json_output = _bootstrap_json(options)
+    json_output = bootstrap_json_output(options)
     try:
         settings = resolve_conversion_settings(options)
     except (TypeError, ValueError) as exc:
@@ -117,11 +101,9 @@ def run_generic_convert(argv: list[str]) -> int:
 
     started = time.perf_counter()
     try:
-        apply_mlx_cache_limit(settings)
-        from kinomlx.weights.convert import convert_checkpoint
-
+        apply_memory_policy(settings)
         with ExitStack() as stack:
-            reporter = conversion_reporter(stack, settings)
+            reporter = command_reporter(stack, settings)
             reporter.memory_checkpoint("conversion_start")
             receipt = convert_checkpoint(
                 options.input,
@@ -161,8 +143,6 @@ def run_generic_convert(argv: list[str]) -> int:
         "diagnostics": {"memory": diagnostics} if diagnostics else {},
     }
     if settings.json_output:
-        from kinomlx.cli.output import emit_json
-
         emit_json(payload)
     else:
         _log.info("Source: %s (sha256 %s...)", receipt.source, receipt.source_sha256[:12])
@@ -197,8 +177,6 @@ def run_weights_command(argv: list[str]) -> int:
         return 2
     convert_arguments = argv[1:]
     if convert_arguments and convert_arguments[0] == "gmnet":
-        from kinomlx.models.gmnet.converter_cli import run_gmnet_convert_command
-
         return run_gmnet_convert_command(convert_arguments[1:])
     return run_generic_convert(convert_arguments)
 

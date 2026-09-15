@@ -1,7 +1,5 @@
 """LTX-2 BigVGAN vocoder and bandwidth-extension composition."""
 
-from __future__ import annotations
-
 import json
 import math
 from collections.abc import Mapping, Sequence
@@ -268,7 +266,9 @@ class Vocoder(nn.Module):
                 f"vocoder expects (B, 2, T, {self.config.mel_bins}), got {tuple(mel.shape)}"
             )
         sink = reporter if reporter is not None else NullReporter()
-        sink.phase_start(phase, total=len(self.ups) + 1, unit="stage")
+        # Indeterminate phase: one lazy graph, evaluated once at the waveform.
+        # VocoderWithBWE keeps its own bounded stage reporting on top.
+        sink.phase_start(phase)
         try:
             mel = mel.astype(self.compute_dtype).transpose(0, 1, 3, 2)
             batch, channels, mel_bins, frames = mel.shape
@@ -280,14 +280,10 @@ class Vocoder(nn.Module):
                     self.resblocks[index](x) for index in range(start, start + self.num_kernels)
                 ]
                 x = mx.stack(outputs, axis=0).mean(axis=0)
-                mx.eval(x)
-                sink.phase_advance(phase)
             x = self.conv_post(self.act_post(x))
-            mx.eval(x)
-            sink.phase_advance(phase)
             if self.config.apply_final_activation:
                 x = mx.tanh(x) if self.config.use_tanh_at_final else mx.clip(x, -1, 1)
-                mx.eval(x)
+            mx.eval(x)
             return x
         finally:
             sink.phase_end(phase)

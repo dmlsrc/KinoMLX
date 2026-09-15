@@ -1,32 +1,67 @@
 """LTX-2 artifact vocabulary and output-adjacent path contribution."""
 
-from __future__ import annotations
-
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Protocol
+from types import MappingProxyType
+from typing import Literal, Protocol
+
+import mlx.core as mx
 
 from kinomlx.artifacts import TensorArtifact
+from kinomlx.config.stations import OutputPolicy
+from kinomlx.config_records import config_record
+from kinomlx.types import VideoPixelShape
 
-if TYPE_CHECKING:
-    import mlx.core as mx
-
-    from kinomlx.types import VideoPixelShape
-
-    from .conditioning import EncodedCondition, RawConditionSource
-
+from .conditioning import (
+    EncodedCondition,
+    HDRReferenceConditionSource,
+    ImageConditionSource,
+    RawConditionSource,
+    VideoConditionByKeyframeIndex,
+    VideoConditionByLatentIndex,
+    VideoConditionByReferenceLatent,
+)
 
 TEXT_CONDITIONING = "text_conditioning"
 STAGE_1_CONDITIONING = "stage_1_conditioning"
 STAGE_2_CONDITIONING = "stage_2_conditioning"
 STAGE_1_LATENTS = "stage_1_latents"
 FINAL_LATENTS = "final_latents"
+
+# A restart station re-emits what it consumed and still holds, so a bundle it
+# writes can itself be restarted. Stage-2 reloads saved text and the stage-1
+# latent before it runs; decode reloads exactly one latent product and
+# ``requested_artifacts`` narrows the pair below to the stage it consumed.
+ARTIFACT_STATIONS = MappingProxyType(
+    {
+        TEXT_CONDITIONING: OutputPolicy(frozenset({"generate", "stage-2"})),
+        STAGE_1_CONDITIONING: OutputPolicy(frozenset({"generate"})),
+        STAGE_2_CONDITIONING: OutputPolicy(frozenset({"generate", "stage-2"})),
+        STAGE_1_LATENTS: OutputPolicy(frozenset({"generate", "stage-2", "decode"})),
+        FINAL_LATENTS: OutputPolicy(frozenset({"generate", "stage-2", "decode"})),
+    }
+)
+ARTIFACT_GROUPS = MappingProxyType(
+    {
+        "save_latents": (STAGE_1_LATENTS, FINAL_LATENTS),
+        "save_text_conditioning": (TEXT_CONDITIONING,),
+        "save_media_conditioning": (STAGE_1_CONDITIONING, STAGE_2_CONDITIONING),
+    }
+)
+OUTPUT_POLICIES = MappingProxyType(
+    {
+        field: OutputPolicy(
+            frozenset(
+                station for name in artifacts for station in ARTIFACT_STATIONS[name].produced_at
+            )
+        )
+        for field, artifacts in ARTIFACT_GROUPS.items()
+    }
+)
 _TEXT_CONDITIONING_V3_FIELDS = frozenset(
     {
         "tokenizer_source_sha256",
-        "tokenizer_model_sha256",
-        "tokenizer_metadata_sha256",
         "tokenization_policy",
         "text_artifact_identity",
         "projection_source_identity",
@@ -38,9 +73,14 @@ _TEXT_CONDITIONING_V3_FIELDS = frozenset(
 class ArtifactOptions(Protocol):
     """Host output selections consumed by the LTX-2 artifact contribution."""
 
-    save_latents: bool | None
-    save_media_conditioning: bool | None
-    save_text_conditioning: bool | None
+    @property
+    def save_latents(self) -> bool | None: ...
+
+    @property
+    def save_media_conditioning(self) -> bool | None: ...
+
+    @property
+    def save_text_conditioning(self) -> bool | None: ...
 
 
 class NoiseArtifactState(Protocol):
@@ -53,6 +93,7 @@ class NoiseArtifactState(Protocol):
     ) -> tuple[tuple[str, str], ...]: ...
 
 
+@config_record
 @dataclass(frozen=True)
 class LTX2ArtifactConfig:
     """Optional LTX-2 artifact selections resolved beside the recipe schema."""
@@ -80,33 +121,36 @@ def requested_artifacts(
     *,
     save_all: bool = False,
     has_media_conditioning: bool = False,
+    station: Literal["generate", "decode", "stage-2"] = "generate",
+    source_latent_stage: Literal["stage-1", "final"] = "final",
 ) -> frozenset[str]:
-    """Resolve enabled LTX-2 tensor artifacts from host output selections."""
+    """Resolve enabled LTX-2 tensor artifacts from host output selections.
+
+    ``source_latent_stage`` names the latent product a decode restart consumed.
+    Decode re-emits that one product and never the other, so a requested
+    artifact is always one the station can actually write.
+    """
+    if station not in {"generate", "decode", "stage-2"}:
+        raise ValueError(f"unknown artifact station {station!r}")
     requested: set[str] = set()
-    if options.save_latents is True or (options.save_latents is None and save_all):
-        requested.update((STAGE_1_LATENTS, FINAL_LATENTS))
-    if options.save_text_conditioning is True or (
-        options.save_text_conditioning is None and save_all
-    ):
-        requested.add(TEXT_CONDITIONING)
-    if options.save_media_conditioning is True or (
-        has_media_conditioning and options.save_media_conditioning is None and save_all
-    ):
-        requested.update((STAGE_1_CONDITIONING, STAGE_2_CONDITIONING))
+    for field, artifacts in ARTIFACT_GROUPS.items():
+        value = getattr(options, field)
+        media = field == "save_media_conditioning"
+        selected = OUTPUT_POLICIES[field].selected(
+            value,
+            save_all=save_all and (not media or has_media_conditioning),
+            station=station,
+            field=field,
+        )
+        if selected and media and not has_media_conditioning:
+            raise ValueError("save_media_conditioning requires --image or --hdr-reference")
+        if selected:
+            requested.update(
+                name for name in artifacts if station in ARTIFACT_STATIONS[name].produced_at
+            )
+    if station == "decode":
+        requested.discard(STAGE_1_LATENTS if source_latent_stage == "final" else FINAL_LATENTS)
     return frozenset(requested)
-
-
-def restart_artifacts(
-    requested: frozenset[str],
-    *,
-    phase: str,
-) -> frozenset[str]:
-    """Return only artifacts newly produced after a selected restart point."""
-    if phase == "stage-2":
-        return requested & {FINAL_LATENTS, STAGE_2_CONDITIONING}
-    if phase == "decode":
-        return frozenset()
-    raise ValueError(f"unknown restart phase {phase!r}")
 
 
 def text_conditioning_artifact(
@@ -182,13 +226,6 @@ def media_conditioning_artifact(
     fps: float,
 ) -> TensorArtifact:
     """Build one stage's ordered VAE-encoded media-conditioning product."""
-    from .conditioning import (
-        HDRReferenceConditionSource,
-        ImageConditionSource,
-        VideoConditionByKeyframeIndex,
-        VideoConditionByLatentIndex,
-        VideoConditionByReferenceLatent,
-    )
 
     if stage not in {1, 2}:
         raise ValueError("media-conditioning stage must be 1 or 2")
@@ -261,15 +298,14 @@ def media_conditioning_artifact(
 
 __all__ = [
     "FINAL_LATENTS",
-    "LTX2ArtifactConfig",
     "STAGE_1_CONDITIONING",
     "STAGE_1_LATENTS",
     "STAGE_2_CONDITIONING",
     "TEXT_CONDITIONING",
+    "LTX2ArtifactConfig",
     "distilled_stage_latents_artifact",
     "media_conditioning_artifact",
     "requested_artifacts",
-    "restart_artifacts",
     "sidecar_paths",
     "text_conditioning_artifact",
 ]

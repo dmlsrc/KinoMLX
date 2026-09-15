@@ -5,8 +5,6 @@ sequence, the histogram/thumbnail shapes and determinism, and the frame-format
 coercion on deterministic frames.
 """
 
-from __future__ import annotations
-
 import mlx.core as mx
 import pytest
 

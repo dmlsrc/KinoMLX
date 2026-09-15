@@ -5,8 +5,7 @@ the Apple frameworks this project already requires:
 
   - decode / encode   ImageIO (CGImageSource / CGImageDestination), via Quartz
   - Lanczos resize    CoreImage CILanczosScaleTransform (GPU, shared CIContext)
-  - text annotation   AppKit NSStringDrawing (lazy-imported; diagnostic
-                      contact-sheet tooling only)
+  - text annotation   AppKit NSStringDrawing (diagnostic contact-sheet tooling)
 
 Pixels cross into MLX straight from the CoreGraphics bitmap buffer
 (`memoryview` -> `mx.array`), no numpy. `load_image_rgb` and `resize_lanczos`
@@ -18,10 +17,9 @@ rest of the videotoolbox subsystem. Alpha is dropped rather than premultiplied,
 so the result mirrors Pillow's `convert("RGB")`.
 """
 
-from __future__ import annotations
-
 from pathlib import Path
 
+import AppKit
 import Foundation
 import mlx.core as mx
 import objc
@@ -182,6 +180,39 @@ def load_image_rgb(path: str | Path) -> mx.array:
         return mx.contiguous(_apply_exif_orientation(image, orientation))
 
 
+def _oriented_size(width: int, height: int, orientation: int) -> tuple[int, int]:
+    """Return the displayed (width, height) once the EXIF orientation is applied."""
+    if orientation in (5, 6, 7, 8):
+        return height, width
+    return width, height
+
+
+def image_size(path: str | Path) -> tuple[int, int]:
+    """Return an image file's displayed ``(width, height)`` without decoding pixels.
+
+    Reads the ImageIO properties (pixel dimensions and EXIF orientation), so the
+    result matches the shape ``load_image_rgb`` returns for the same file.
+    """
+    if not Path(path).exists():
+        raise FileNotFoundError(f"Image not found: {path}")
+    with objc.autorelease_pool():
+        src = Quartz.CGImageSourceCreateWithURL(_url(path), None)
+        if src is None:
+            raise ValueError(f"Failed to open image {path}: unrecognized format")
+        properties = Quartz.CGImageSourceCopyPropertiesAtIndex(src, 0, None)
+        if properties is None:
+            raise ValueError(f"Failed to read image properties for {path}")
+        width = properties.get(Quartz.kCGImagePropertyPixelWidth)
+        height = properties.get(Quartz.kCGImagePropertyPixelHeight)
+        if width is None or height is None:
+            cg = Quartz.CGImageSourceCreateImageAtIndex(src, 0, None)
+            if cg is None:
+                raise ValueError(f"Failed to decode image {path}")
+            width, height = Quartz.CGImageGetWidth(cg), Quartz.CGImageGetHeight(cg)
+        orientation = int(properties.get(Quartz.kCGImagePropertyOrientation, 1))
+        return _oriented_size(int(width), int(height), orientation)
+
+
 def resize_lanczos(img: mx.array, width: int, height: int) -> mx.array:
     """Lanczos-resample an (H, W, C) uint8 array to (height, width, 3) uint8.
 
@@ -247,10 +278,8 @@ def draw_labels(
 
     Native NSStringDrawing replacement for `PIL.ImageDraw.Draw(img).text(...)`.
     `labels` is a list of (x, y, text) in top-left pixel coordinates (y grows
-    downward, like Pillow). Returns a new (H, W, 3) uint8 array. AppKit is
-    imported lazily so the runtime image path (load/resize/save) never loads it.
+    downward, like Pillow). Returns a new (H, W, 3) uint8 array.
     """
-    import AppKit  # lazy: diagnostic contact-sheet tooling only
 
     a = _require_uint8_image(img)
     h, w = int(a.shape[0]), int(a.shape[1])

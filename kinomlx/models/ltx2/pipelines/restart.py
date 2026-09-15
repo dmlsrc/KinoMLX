@@ -1,25 +1,26 @@
 """Restart the distilled recipe from a saved stage checkpoint."""
 
-from __future__ import annotations
-
-from dataclasses import dataclass, replace
+from dataclasses import replace
 from pathlib import Path
-from typing import Literal
 
 import mlx.core as mx
 
 from kinomlx.artifacts import ArtifactSink, NullArtifactSink
-from kinomlx.reporting import NullReporter, Reporter
+from kinomlx.config_rules import validate_record
+from kinomlx.io.safetensors import load_weights_with_metadata
+from kinomlx.memory_policy import memory_managed
+from kinomlx.reporting import NullReporter, Reporter, reported_phase
 from kinomlx.samplers.noise import NoiseStreamState
-from kinomlx.samplers.noisers import GaussianNoiser
 from kinomlx.types import VideoPixelShape
 
 from ..artifacts import distilled_stage_latents_artifact, media_conditioning_artifact
 from ..components import DistilledComponents, NativeLTX2Components
+from ..generation import GenerationOutput
 from ..hdr_profile import resolve_hdr_recipe, validate_hdr_adapter_placement
+from ..noising import GaussianNoiser
 from ..resources import LTX2Resources
-from ..runner import GenerationOutput
-from ..sigmas import DISTILLED_STAGE_2_SIGMAS
+from ..restart import DistilledRestart, LatentStage
+from ..sigmas import stage_sigmas
 from ..text_conditioning import NativeTextConditioner, TextConditioner
 from ..types import AudioLatentShape, DistilledRequest, video_latent_shape_from_pixel
 from .distilled import (
@@ -31,81 +32,14 @@ from .distilled import (
     prepare_stage_conditions,
     prepare_text_conditioning,
     release_stage_temporaries,
-    reported_phase,
+    resolve_adapter_profiles,
     resolve_distilled_sampler_plan,
-    resolve_lora_profiles,
     run_stage,
     upscale_between_stages,
     validate_distilled_request,
 )
 
-RestartPhase = Literal["decode", "stage-2"]
-LatentStage = Literal["stage-1", "final"]
 _LATENT_DTYPES = frozenset({mx.bfloat16, mx.float16, mx.float32})
-
-
-@dataclass(frozen=True)
-class DistilledRestart:
-    """One public, typed entry point into the distilled station graph."""
-
-    latents: Path
-    phase: RestartPhase = "decode"
-    latent_stage: LatentStage | None = None
-    text_conditioning: Path | None = None
-    source_model_generation: str | None = None
-
-    def __post_init__(self) -> None:
-        if isinstance(self.latents, str):
-            object.__setattr__(self, "latents", Path(self.latents))
-        if isinstance(self.text_conditioning, str):
-            object.__setattr__(self, "text_conditioning", Path(self.text_conditioning))
-        if self.phase not in {"decode", "stage-2"}:
-            raise ValueError("restart phase must be decode or stage-2")
-        latent_stage = self.latent_stage
-        if latent_stage is None:
-            latent_stage = "stage-1" if self.phase == "stage-2" else "final"
-            object.__setattr__(self, "latent_stage", latent_stage)
-        if latent_stage not in {"stage-1", "final"}:
-            raise ValueError("restart latent_stage must be stage-1 or final")
-        if self.phase == "stage-2" and latent_stage != "stage-1":
-            raise ValueError("stage-2 restart requires stage-1 latents")
-        if self.phase == "stage-2" and self.text_conditioning is None:
-            raise ValueError("stage-2 restart requires text conditioning")
-        if self.phase == "decode" and self.text_conditioning is not None:
-            raise ValueError("decode restart does not consume text conditioning")
-
-    @classmethod
-    def decode(
-        cls,
-        latents: Path | str,
-        *,
-        latent_stage: LatentStage = "final",
-        source_model_generation: str | None = None,
-    ) -> DistilledRestart:
-        """Select direct decoding of a final or stage-1 latent product."""
-        return cls(
-            latents=Path(latents),
-            phase="decode",
-            latent_stage=latent_stage,
-            source_model_generation=source_model_generation,
-        )
-
-    @classmethod
-    def stage_2(
-        cls,
-        latents: Path | str,
-        *,
-        text_conditioning: Path | str,
-        source_model_generation: str | None = None,
-    ) -> DistilledRestart:
-        """Select stage 2 from a saved stage-1 latent and text product."""
-        return cls(
-            latents=Path(latents),
-            phase="stage-2",
-            latent_stage="stage-1",
-            text_conditioning=Path(text_conditioning),
-            source_model_generation=source_model_generation,
-        )
 
 
 def load_stage_latents(
@@ -120,7 +54,6 @@ def load_stage_latents(
     source_model_generation: str | None,
 ) -> StageLatents:
     """Load and structurally validate one KinoMLX distilled latent sidecar."""
-    from kinomlx.io.safetensors import load_weights_with_metadata
 
     generation_label = (
         "unknown-generation"
@@ -219,6 +152,7 @@ def _decode_saved_stage(
     source_model_generation: str | None,
     factory: DistilledComponents,
     reporter: Reporter,
+    artifacts: ArtifactSink,
 ) -> GenerationOutput:
     if request.frames is None:
         raise ValueError("decode restart requires a resolved source frame count")
@@ -238,6 +172,17 @@ def _decode_saved_stage(
         reference_aligned_audio=request.reference_aligned_audio,
         reporter=reporter,
         source_model_generation=source_model_generation,
+    )
+    # Re-emit the one latent product this station read, so the bundle it writes
+    # can itself be decode-restarted.
+    artifacts.save(
+        distilled_stage_latents_artifact(
+            1 if latent_stage == "stage-1" else 2,
+            video_latent=latents.video,
+            audio_latent=latents.audio,
+            final=latent_stage != "stage-1",
+            noise_state=latents.initial_noise_state,
+        )
     )
     output = decode_stage_latents(
         request,
@@ -294,17 +239,27 @@ def _restart_stage_2(
             "legacy stage-1 latents have no Torch-MPS noise position; "
             "use noise_backend='mlx' or regenerate stage 1"
         )
+    # Stage-2 re-emits the saved text and the stage-1 latent it consumed, so
+    # the bundle it writes can itself be restarted at stage 2.
     text = prepare_text_conditioning(
         request,
         resources,
         text_conditioner=text_conditioner,
         reporter=reporter,
         artifacts=artifacts,
-        emit_artifact=False,
     )
     text_conditioning_receipt = text.replay_receipt
     sources = condition_sources(request)
 
+    artifacts.save(
+        distilled_stage_latents_artifact(
+            1,
+            video_latent=stage_1_latents.video,
+            audio_latent=stage_1_latents.audio,
+            final=False,
+            noise_state=stage_1_latents.initial_noise_state,
+        )
+    )
     with factory.spatial_upscaler(resources) as upscaler:
         upscaled = upscale_between_stages(
             stage_1_latents,
@@ -355,21 +310,21 @@ def _restart_stage_2(
 
     sampler = resolve_distilled_sampler_plan(request, resources)
     hdr_recipe = resolve_hdr_recipe(request, resources)
-    stage_2_profile = resolve_lora_profiles(request)[1]
-    lora_receipts: list[dict[str, object]] = []
+    stage_2_profile = resolve_adapter_profiles(request)[1]
+    adapter_receipts: list[dict[str, object]] = []
     transformer = None
     try:
         with reported_phase(reporter, "load stage 2 transformer"):
             transformer = factory.transformer(resources, stage_2_profile)
             validate_hdr_adapter_placement(
                 hdr_recipe,
-                transformer.value.lora_receipts,
+                transformer.value.adapter_receipts,
                 stage=2,
             )
-            for receipt in transformer.value.lora_receipts:
+            for receipt in transformer.value.adapter_receipts:
                 metadata = receipt.to_metadata()
                 metadata["stages"] = (2,)
-                lora_receipts.append(metadata)
+                adapter_receipts.append(metadata)
         legacy_noise_position = initial_noise_state is None
         noiser = GaussianNoiser(
             request.seed,
@@ -386,7 +341,7 @@ def _restart_stage_2(
             stage_2,
             transformer.value,
             text,
-            DISTILLED_STAGE_2_SIGMAS,
+            stage_sigmas(request.stage_1_sigmas, request.stage_2_sigmas)[1],
             noiser=noiser,
             reporter=reporter,
             phase="distilled stage 2",
@@ -417,7 +372,7 @@ def _restart_stage_2(
         geometry=stage_2_geometry,
         components=factory,
         reporter=reporter,
-        lora_receipts=lora_receipts,
+        adapter_receipts=adapter_receipts,
         text_conditioning_receipt=text_conditioning_receipt,
         execution_mode="restart-stage-2",
         source_latent_stage="stage-1",
@@ -430,6 +385,7 @@ def _restart_stage_2(
     )
 
 
+@memory_managed
 def restart_distilled(
     request: DistilledRequest,
     resources: LTX2Resources,
@@ -441,6 +397,8 @@ def restart_distilled(
     artifact_sink: ArtifactSink | None = None,
 ) -> GenerationOutput:
     """Restart at stage 2 or decode one selected saved latent directly."""
+    validate_record(request, location="[generate]")
+    validate_record(restart, location="[restart]")
     if not restart.latents.is_file():
         raise ValueError(f"restart latent artifact does not exist: {restart.latents}")
     if (
@@ -456,16 +414,15 @@ def restart_distilled(
     factory = components if components is not None else NativeLTX2Components(reporter=sink)
     validate_distilled_request(request, resources, condition_sources(request))
     if restart.phase == "decode":
-        if restart.latent_stage is None:
-            raise AssertionError("validated decode restart has no latent stage")
         return _decode_saved_stage(
             request,
             resources,
-            latent_stage=restart.latent_stage,
+            latent_stage=restart.selected_latent_stage,
             latent_path=restart.latents,
             source_model_generation=restart.source_model_generation,
             factory=factory,
             reporter=sink,
+            artifacts=artifacts,
         )
     if restart.phase == "stage-2":
         if restart.text_conditioning is None:
@@ -490,9 +447,6 @@ def restart_distilled(
 
 
 __all__ = [
-    "LatentStage",
-    "DistilledRestart",
-    "RestartPhase",
     "load_stage_latents",
     "restart_distilled",
 ]

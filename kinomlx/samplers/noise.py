@@ -7,8 +7,6 @@ semantics come from ``c10/metal/random.h`` and
 BSD-style license; see ``THIRD_PARTY_LICENSES.md``.
 """
 
-from __future__ import annotations
-
 import math
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -381,10 +379,10 @@ def create_normal_noise_stream(
 
 
 __all__ = [
-    "MLXNormalNoiseStream",
-    "NormalNoiseStream",
-    "NoiseStreamState",
     "TORCH_MPS_COMPATIBILITY_PROFILE",
+    "MLXNormalNoiseStream",
+    "NoiseStreamState",
+    "NormalNoiseStream",
     "TorchMPSNormalNoiseStream",
     "create_normal_noise_stream",
     "noise_compatibility_profile",

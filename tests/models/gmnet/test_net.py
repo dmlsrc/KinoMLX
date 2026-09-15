@@ -1,7 +1,5 @@
 """GMNet architecture: key map, primitive ops, forward shapes, strict load."""
 
-from __future__ import annotations
-
 import math
 
 import mlx.core as mx

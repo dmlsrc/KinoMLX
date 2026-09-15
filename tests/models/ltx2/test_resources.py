@@ -1,10 +1,7 @@
 """Immutable LTX-2 resource preparation and inventory contracts."""
 
-from __future__ import annotations
-
 from dataclasses import fields, is_dataclass
 from pathlib import Path
-from types import SimpleNamespace
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -20,7 +17,6 @@ from kinomlx.models.ltx2.metadata import (
     LTX2CheckpointConfig,
     TextEncoderHeaderConfig,
     TextProjectionHeaderConfig,
-    TransformerConstructorConfig,
 )
 from kinomlx.models.ltx2.resources import (
     CheckpointLayout,
@@ -29,9 +25,17 @@ from kinomlx.models.ltx2.resources import (
     ComponentMetadata,
 )
 from kinomlx.models.ltx2.settings import LTX2Settings
-from kinomlx.models.ltx2.text_encoder.tokenizer_cache import TokenizerCache
+from kinomlx.models.ltx2.transformer_config import TransformerConstructorConfig
 from kinomlx.models.ltx2.video_vae.config import LTX23_VIDEO_VAE_CONFIG
 from kinomlx.settings import Settings
+
+
+@pytest.fixture(autouse=True)
+def _isolate_huggingface_environment(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("HF_HOME", str(tmp_path / "hf"))
 
 
 def _transformer(
@@ -89,15 +93,6 @@ def _split_paths(tmp_path: Path, *names: str) -> dict[str, Path]:
     for path in paths.values():
         path.touch()
     return paths
-
-
-def _tokenizer_cache(root: Path) -> TokenizerCache:
-    return TokenizerCache(
-        model_path=root / "tokenizer.model",
-        metadata_path=root / "tokenizer.metadata.json",
-        source_json_sha256="source-json",
-        model_sha256="model",
-    )
 
 
 def _stub_compatibility(
@@ -221,30 +216,10 @@ def _stub_compatibility(
     monkeypatch.setattr(resources, "inspect_ltx2_compatibility", inspect)
     monkeypatch.setattr(
         resources,
-        "_artifact_fingerprint",
+        "artifact_fingerprint",
         lambda path: f"sha256:{path.name}",
     )
-    monkeypatch.setattr(
-        resources,
-        "ensure_tokenizer_cache",
-        lambda path, **kwargs: _tokenizer_cache(Path(kwargs["cache_root"])),
-    )
 
-    def transformer_cache(path, **kwargs):
-        assert kwargs["constructor_config"] is parsed.transformer
-        cache_root = Path(kwargs["cache_root"])
-        return SimpleNamespace(cache_path=cache_root / f"transformer-{generation}.safetensors")
-
-    def component_families(path, *, families, cache_root, **kwargs):
-        root = Path(cache_root)
-        return SimpleNamespace(
-            cache_paths={
-                family: root / f"{Path(path).stem}-{family}.safetensors" for family in families
-            }
-        )
-
-    monkeypatch.setattr(resources, "ensure_weight_family_caches", component_families)
-    monkeypatch.setattr(resources, "ensure_transformer_cache", transformer_cache)
     return calls
 
 
@@ -269,35 +244,12 @@ def test_prepare_resources_returns_deeply_immutable_values_without_live_weights(
     upscaler.touch()
     gemma.mkdir()
     (gemma / "config.json").touch()
-    family_paths = {
-        family: tmp_path / "cache" / f"{family}.safetensors"
-        for family in ("connector", "video_vae", "audio_vae", "vocoder")
-    }
-    transformer_cache = tmp_path / "cache" / "identity" / "transformer.safetensors"
-    calls: dict[str, object] = {}
-
     _stub_compatibility(
         monkeypatch,
         generation="2.3",
         embedded_video_vae=True,
     )
 
-    def ensure_families(*args, **kwargs):
-        calls["families"] = kwargs
-        return SimpleNamespace(cache_paths=family_paths)
-
-    monkeypatch.setattr(resources, "ensure_weight_family_caches", ensure_families)
-
-    def ensure_transformer(*args, **kwargs):
-        calls["transformer"] = kwargs
-        return SimpleNamespace(cache_path=transformer_cache)
-
-    monkeypatch.setattr(resources, "ensure_transformer_cache", ensure_transformer)
-    monkeypatch.setattr(
-        resources,
-        "ensure_tokenizer_cache",
-        lambda *args, **kwargs: _tokenizer_cache(tmp_path / "cache"),
-    )
     settings = LTX2Settings(
         weights_path=checkpoint,
         gemma_path=gemma,
@@ -316,20 +268,14 @@ def test_prepare_resources_returns_deeply_immutable_values_without_live_weights(
 
     plan = resources.prepare_resources(
         settings,
-        infrastructure=Settings(cache_dir=tmp_path / "cache", cache_mode="rebuild"),
+        infrastructure=Settings(),
     )
 
     assert plan.checkpoint.layout is CheckpointLayout.MONOLITHIC
     assert plan.checkpoint.model_version == "2.3.0"
     assert plan.dtype_policy.transformer == mx.float16
-    assert plan.transformer_cache_path == transformer_cache.resolve()
     assert plan.require(ComponentKind.TEXT_ENCODER).source_path == gemma.resolve()
     assert plan.require(ComponentKind.SPATIAL_UPSCALER).source_path == upscaler.resolve()
-    assert plan.tokenizer_cache == _tokenizer_cache(tmp_path / "cache")
-    assert calls["transformer"]["cache_mode"] == "rebuild"
-    assert calls["transformer"]["video_ff_layout_specs"] == (("project_in", "pretranspose"),)
-    assert calls["transformer"]["audio_ff_layout_specs"] == (("project_out", "pretranspose"),)
-    assert calls["transformer"]["video_ff_quantize_specs"] == (("project_out", "mxfp8"),)
 
     owned = tuple(_walk(plan))
     assert not any(isinstance(value, nn.Module) for value in owned)
@@ -345,7 +291,7 @@ def test_optional_recipe_components_do_not_block_resource_preparation(
 ) -> None:
     checkpoint = tmp_path / "model.safetensors"
     checkpoint.touch()
-    cache_paths = {
+    {
         family: tmp_path / f"{family}.safetensors"
         for family in ("connector", "video_vae", "audio_vae", "vocoder")
     }
@@ -355,25 +301,18 @@ def test_optional_recipe_components_do_not_block_resource_preparation(
         version="2.3.1",
         embedded_video_vae=True,
     )
-    monkeypatch.setattr(
-        resources,
-        "ensure_weight_family_caches",
-        lambda *args, **kwargs: SimpleNamespace(cache_paths=cache_paths),
-    )
-    monkeypatch.setattr(
-        resources,
-        "ensure_transformer_cache",
-        lambda *args, **kwargs: SimpleNamespace(cache_path=tmp_path / "transformer.safetensors"),
-    )
-    monkeypatch.setattr(resources, "_cached_snapshots", lambda *args: ())
+    monkeypatch.setattr(resources, "cached_snapshots", lambda *args: ())
 
-    plan = resources.prepare_resources(LTX2Settings(weights_path=checkpoint))
+    plan = resources.prepare_resources(
+        LTX2Settings(weights_path=checkpoint),
+        infrastructure=Settings(hf_home=tmp_path / "hf"),
+    )
 
     assert plan.optional(ComponentKind.TEXT_ENCODER) is None
     assert plan.optional(ComponentKind.SPATIAL_UPSCALER) is None
 
 
-def test_huggingface_snapshot_symlink_keeps_logical_cache_identity(
+def test_huggingface_snapshot_symlink_keeps_logical_weights_identity(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
@@ -381,8 +320,7 @@ def test_huggingface_snapshot_symlink_keeps_logical_cache_identity(
     checkpoint = tmp_path / "model.safetensors"
     blob.touch()
     checkpoint.symlink_to(blob)
-    seen: list[tuple[str, Path]] = []
-    family_paths = {
+    {
         family: tmp_path / f"{family}.safetensors"
         for family in ("connector", "video_vae", "audio_vae", "vocoder")
     }
@@ -392,33 +330,16 @@ def test_huggingface_snapshot_symlink_keeps_logical_cache_identity(
         version="2.3.1",
         embedded_video_vae=True,
     )
-    monkeypatch.setattr(
-        resources,
-        "ensure_weight_family_caches",
-        lambda path, **kwargs: (
-            seen.append(("families", path)) or SimpleNamespace(cache_paths=family_paths)
-        ),
-    )
-    monkeypatch.setattr(
-        resources,
-        "ensure_transformer_cache",
-        lambda path, **kwargs: (
-            seen.append(("transformer", path))
-            or SimpleNamespace(cache_path=tmp_path / "transformer.safetensors")
-        ),
-    )
-    monkeypatch.setattr(resources, "_cached_snapshots", lambda *args: ())
+    monkeypatch.setattr(resources, "cached_snapshots", lambda *args: ())
 
-    plan = resources.prepare_resources(LTX2Settings(weights_path=checkpoint))
+    plan = resources.prepare_resources(
+        LTX2Settings(weights_path=checkpoint),
+        infrastructure=Settings(hf_home=tmp_path / "hf"),
+    )
 
     assert inspection_calls == [
         ("config", checkpoint),
         ("compatibility", checkpoint),
-    ]
-    assert seen == [
-        ("transformer", checkpoint),
-        ("families", checkpoint),
-        ("families", checkpoint),
     ]
     assert plan.weights_path == checkpoint.absolute()
     assert plan.weights_path.is_symlink()
@@ -456,7 +377,7 @@ def test_monolithic_and_future_split_sources_share_the_inventory_protocol(
     assert len({item.source_path for item in split}) == 2
 
 
-def test_generation_selector_chooses_the_requested_cached_pack_without_exact_paths(
+def test_generation_selector_chooses_the_requested_weightsd_pack_without_exact_paths(
     tmp_path: Path,
 ) -> None:
     root_23 = tmp_path / "hub" / "models--Lightricks--LTX-2.3" / "snapshots" / "revision-23"
@@ -736,7 +657,7 @@ def test_generation_does_not_select_packaging_layout(
 
     plan = resources.prepare_resources(
         LTX2Settings(model_generation=generation, **paths),
-        infrastructure=Settings(cache_dir=tmp_path / "cache", hf_home=tmp_path / "hf"),
+        infrastructure=Settings(hf_home=tmp_path / "hf"),
     )
 
     assert plan.checkpoint.model_generation == generation
@@ -771,7 +692,7 @@ def test_ltx23_monolithic_baseline_accepts_every_component_override(
             weights_path=baseline,
             **paths,
         ),
-        infrastructure=Settings(cache_dir=tmp_path / "cache", hf_home=tmp_path / "hf"),
+        infrastructure=Settings(hf_home=tmp_path / "hf"),
     )
 
     assert calls == [
@@ -804,7 +725,7 @@ def test_ltx23_monolithic_baseline_accepts_every_component_override(
         _ = plan.weights_path
 
 
-def test_split_pack_prepares_transformer_cache_without_live_model_state(
+def test_split_pack_prepares_transformer_weights_without_live_model_state(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
@@ -822,7 +743,7 @@ def test_split_pack_prepares_transformer_cache_without_live_model_state(
 
     plan = resources.prepare_resources(
         LTX2Settings(**paths),
-        infrastructure=Settings(cache_dir=tmp_path / "cache"),
+        infrastructure=Settings(),
     )
 
     assert compatibility_calls == [
@@ -834,24 +755,6 @@ def test_split_pack_prepares_transformer_cache_without_live_model_state(
     assert plan.checkpoint.model_version == "2.5.0"
     assert plan.transformer_config == _transformer_25()
     assert {component.kind for component in plan.components} == set(ComponentKind)
-    assert (
-        plan.transformer_cache_path
-        == (tmp_path / "cache" / "transformer-2.5.safetensors").resolve()
-    )
-    assert plan.require(ComponentKind.VIDEO_VAE).cache_path is not None
-    assert plan.require(ComponentKind.AUDIO_VAE).cache_path is not None
-    assert plan.require(ComponentKind.VOCODER).cache_path is not None
-    assert all(
-        component.cache_path is None
-        for component in plan.components
-        if component.kind
-        not in {
-            ComponentKind.TRANSFORMER,
-            ComponentKind.VIDEO_VAE,
-            ComponentKind.AUDIO_VAE,
-            ComponentKind.VOCODER,
-        }
-    )
     assert (
         plan.require(ComponentKind.TRANSFORMER).source_path == paths["transformer_path"].resolve()
     )
@@ -871,7 +774,6 @@ def test_split_pack_prepares_transformer_cache_without_live_model_state(
     assert plan.capabilities.duration_available
     assert plan.capabilities.temporal_latent_upscaler_available
     assert plan.transformer_path == paths["transformer_path"].resolve()
-    assert plan.tokenizer_cache == _tokenizer_cache(tmp_path / "cache")
     with pytest.raises(LookupError, match="monolithic weights_path"):
         _ = plan.weights_path
 
@@ -895,7 +797,10 @@ def test_split_pack_keeps_optional_components_absent(
     )
     _stub_compatibility(monkeypatch)
 
-    plan = resources.prepare_resources(LTX2Settings(**paths))
+    plan = resources.prepare_resources(
+        LTX2Settings(**paths),
+        infrastructure=Settings(hf_home=tmp_path / "hf"),
+    )
 
     assert plan.optional(ComponentKind.AUDIO_VAE) is None
     assert plan.optional(ComponentKind.VOCODER) is None
@@ -920,14 +825,15 @@ def test_componentized_pack_requires_an_external_or_embedded_video_vae(
         raise AssertionError("preflight continued after a missing required component")
 
     monkeypatch.setattr(resources, "inspect_ltx2_compatibility", unexpected)
-    monkeypatch.setattr(resources, "ensure_weight_family_caches", unexpected)
-    monkeypatch.setattr(resources, "ensure_transformer_cache", unexpected)
 
     with pytest.raises(ValueError, match="video_vae_path is required"):
-        resources.prepare_resources(LTX2Settings(**paths))
+        resources.prepare_resources(
+            LTX2Settings(**paths),
+            infrastructure=Settings(hf_home=tmp_path / "hf"),
+        )
 
 
-def test_split_pack_rejects_cross_component_dimensions_before_cache_work(
+def test_split_pack_rejects_cross_component_dimensions_before_weights_work(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
@@ -943,7 +849,10 @@ def test_split_pack_rejects_cross_component_dimensions_before_cache_work(
     )
 
     with pytest.raises(ValueError, match="text encoder hidden size"):
-        resources.prepare_resources(LTX2Settings(**paths))
+        resources.prepare_resources(
+            LTX2Settings(**paths),
+            infrastructure=Settings(hf_home=tmp_path / "hf"),
+        )
 
 
 def test_split_pack_accepts_unseen_same_schema_fingerprints_and_isolates_receipts(
@@ -953,7 +862,7 @@ def test_split_pack_accepts_unseen_same_schema_fingerprints_and_isolates_receipt
     _stub_compatibility(monkeypatch)
     monkeypatch.setattr(
         resources,
-        "_artifact_fingerprint",
+        "artifact_fingerprint",
         lambda path: f"sha256:{path.parent.name}:{path.name}",
     )
 
@@ -968,7 +877,7 @@ def test_split_pack_accepts_unseen_same_schema_fingerprints_and_isolates_receipt
             path.touch()
         return resources.prepare_resources(
             LTX2Settings(**paths),
-            infrastructure=Settings(cache_dir=tmp_path / "cache"),
+            infrastructure=Settings(),
         )
 
     first = prepare("community-a")
@@ -1026,3 +935,118 @@ def test_gemma_discovery_never_falls_back_across_variants(tmp_path: Path) -> Non
     resolved = resources._discover_gemma_path(LTX2Settings(), Settings(hf_home=tmp_path))
 
     assert resolved is None
+
+
+def test_prepare_resources_describes_every_component_by_source_only(
+    tmp_path: Path, monkeypatch
+) -> None:
+    checkpoint = tmp_path / "model.safetensors"
+    upscaler = tmp_path / "upscaler.safetensors"
+    gemma = tmp_path / "gemma"
+    checkpoint.touch()
+    upscaler.touch()
+    gemma.mkdir()
+    (gemma / "config.json").touch()
+    _stub_compatibility(monkeypatch, generation="2.3", embedded_video_vae=True)
+
+    settings = LTX2Settings(
+        weights_path=checkpoint,
+        gemma_path=gemma,
+        spatial_upscaler_path=upscaler,
+        transformer_dtype="float16",
+    )
+
+    plan = resources.prepare_resources(settings, infrastructure=Settings())
+
+    assert plan.checkpoint.layout is CheckpointLayout.MONOLITHIC
+    assert {component.kind for component in plan.components} >= {
+        ComponentKind.TRANSFORMER,
+        ComponentKind.CONNECTOR,
+        ComponentKind.VIDEO_VAE,
+        ComponentKind.TEXT_ENCODER,
+        ComponentKind.TEXT_PROJECTION,
+        ComponentKind.AUDIO_VAE,
+        ComponentKind.VOCODER,
+        ComponentKind.SPATIAL_UPSCALER,
+    }
+    assert plan.require(ComponentKind.VIDEO_VAE).source_path == checkpoint.resolve()
+    assert plan.require(ComponentKind.TEXT_ENCODER).source_path == gemma.resolve()
+    owned = tuple(_walk(plan))
+    assert not any(isinstance(value, nn.Module) for value in owned)
+    assert not any(isinstance(value, mx.array) for value in owned)
+    assert not any(isinstance(value, (dict, list, set)) for value in owned)
+
+
+@pytest.mark.parametrize("cache", [0.0, 1.0, 4.0, 8.0, None])
+def test_streaming_keeps_the_configured_allocator_cache_limit(
+    tmp_path: Path, monkeypatch, cache: float | None
+) -> None:
+    """Resource preparation must preserve explicit streaming memory controls."""
+    checkpoint = tmp_path / "model.safetensors"
+    upscaler = tmp_path / "upscaler.safetensors"
+    gemma = tmp_path / "gemma"
+    checkpoint.touch()
+    upscaler.touch()
+    gemma.mkdir()
+    (gemma / "config.json").touch()
+    _stub_compatibility(monkeypatch, generation="2.3", embedded_video_vae=True)
+    settings = LTX2Settings(
+        weights_path=checkpoint,
+        gemma_path=gemma,
+        spatial_upscaler_path=upscaler,
+        stream_transformer=True,
+    )
+    plan = resources.prepare_resources(
+        settings,
+        infrastructure=Settings(mlx_cache_limit_gb=cache, mlx_wired_limit_gb=0.0),
+    )
+    assert plan.memory_policy.cache_limit_gb == cache
+    assert plan.memory_policy.wired_limit_gb == 0.0
+
+
+def test_weight_policy_carries_the_resolved_adapter_accumulation() -> None:
+    from kinomlx.models.ltx2.resources import _weight_policy
+    from kinomlx.models.ltx2.settings import LTX2Settings
+
+    streamed_half = LTX2Settings(stream_transformer=True, transformer_dtype="float16")
+    assert _weight_policy(streamed_half.resolve_presets()).adapter_accumulation == "float16"
+    resident_half = LTX2Settings(transformer_dtype="float16")
+    assert _weight_policy(resident_half).adapter_accumulation == "float32"
+    streamed_wide = LTX2Settings(stream_transformer=True)
+    assert _weight_policy(streamed_wide.resolve_presets()).adapter_accumulation == "float32"
+
+
+@pytest.mark.parametrize("field", tuple(resources._LTX25_COMPONENT_PATHS))
+def test_component_override_autodiscovers_every_other_ltx25_component(tmp_path, field):
+    snapshot = tmp_path / "hub/models--Lightricks--LTX-2.5/snapshots/revision"
+    expected = {}
+    for name, relative in resources._LTX25_COMPONENT_PATHS.items():
+        path = snapshot / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if name != field:
+            path.touch()
+        expected[name] = path
+    override = tmp_path / "replacement.safetensors"
+    override.touch()
+    expected[field] = override
+    settings = LTX2Settings(model_generation="2.5", **{field: override})
+    selected = resources._discover_generation_selection(settings, Settings(hf_home=tmp_path))
+    assert {name: getattr(selected, name) for name in expected} == expected
+
+
+def test_transformer_override_prefers_its_local_pack_without_hub(tmp_path):
+    pack = tmp_path / "local-pack"
+    for relative in resources._LTX25_COMPONENT_PATHS.values():
+        path = pack / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.touch()
+    dev = pack / "diffusion_models/dev.safetensors"
+    dev.touch()
+    selected = resources._discover_generation_selection(
+        LTX2Settings(model_generation="2.5", transformer_path=dev),
+        Settings(hf_home=tmp_path / "empty-hub"),
+    )
+    assert selected.transformer_path == dev
+    assert (
+        selected.text_encoder_path == pack / resources._LTX25_COMPONENT_PATHS["text_encoder_path"]
+    )

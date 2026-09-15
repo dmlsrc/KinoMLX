@@ -1,12 +1,11 @@
 """Reporter-level Instruments signpost tests."""
 
-from __future__ import annotations
-
 import json
 from pathlib import Path
 
 from kinomlx.profiling import SignpostEmitter, SignpostReporter
-from kinomlx.reporting import RecordingReporter, Reporter
+from kinomlx.reporting import Reporter
+from tests._reporting import RecordingReporter
 
 
 class _Backend:

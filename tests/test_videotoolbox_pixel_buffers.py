@@ -18,8 +18,6 @@ Everything here drives CoreVideo / CoreImage / CoreMedia, so the module is
 tagged ``requires_avfoundation`` for explicit native-test selection.
 """
 
-from __future__ import annotations
-
 import CoreMedia
 import mlx.core as mx
 import pytest

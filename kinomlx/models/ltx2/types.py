@@ -7,25 +7,47 @@ carries only model-agnostic primitives so future models can reuse
 them without inheriting LTX-2's numbers.
 """
 
-from __future__ import annotations
-
 import math
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, NamedTuple, overload
+from typing import ClassVar, Literal, NamedTuple
 
-if TYPE_CHECKING:
-    from .settings import LTX2Settings
-    from .video_vae.tiling import TilingConfig
+import mlx.core as mx
 
+from kinomlx.adapters.lora import LoRAProfile
+from kinomlx.config_constraints import (
+    ChoiceConstraint,
+    IntegerConstraint,
+    NumberConstraint,
+    NumberSequenceConstraint,
+)
+from kinomlx.config_records import config_record
+from kinomlx.config_rules import validate_record
+from kinomlx.request_rules import UNCONDITIONAL_PROMPT
+from kinomlx.samplers.config import SigmaScheduleConstraint
+from kinomlx.seeds import resolve_seeds
 from kinomlx.types import (
     DEFAULT_NOISE_BACKEND,
     NOISE_BACKEND_CHOICES,
+    VAE_TILING_MODE_CHOICES,
     NoiseBackend,
     SpatioTemporalScaleFactors,
+    VAETilingMode,
     VideoLatentShape,
     VideoPixelShape,
 )
+
+from .adapters.inputs import LTX2AdapterConfig
+from .adapters.selection import LTX2AdapterSelection, lora_profile_for_stage
+from .request_rules import (
+    DISTILLED_CAPABILITIES,
+    HDR_SOURCES,
+    IMAGE_FRAME_BOUNDS,
+    KEYFRAME_POSITIONS,
+    VAE_TILING,
+    custom_temporal_tile_frames,
+)
+from .video_vae.tiling import SpatialTilingConfig, TemporalChunkConfig, TilingConfig
 
 # ---------------------------------------------------------------------------
 # Video model constants
@@ -50,14 +72,44 @@ def resolved_frame_count_for_duration(duration: float, fps: float) -> int:
 # Latent channels at the video VAE bottleneck.
 VIDEO_LATENT_CHANNELS: int = 128
 
-# RGB output of the video VAE decode.
-VIDEO_PIXEL_CHANNELS: int = 3
-
 # ``auto`` preserves the checkpoint generation's published sampler behavior.
 # Explicit modes are useful for controlled A/B diagnostics without changing
 # checkpoint selection or the literal sigma schedules.
 DISTILLED_SAMPLER_CHOICES = ("auto", "deterministic", "ancestral")
 DistilledSampler = Literal["auto", "deterministic", "ancestral"]
+
+
+@dataclass(frozen=True)
+class LatentState:
+    """State of an LTX-2 latent tensor during diffusion denoising.
+
+    Fields:
+        latent: The currently noisy latent being denoised.
+        denoise_mask: Per-token denoising strength (1 = full, 0 = none).
+        positions: Positional indices used for positional embeddings.
+        clean_latent: Initial latent before denoising; may include image or
+            keyframe conditioning latents.
+        uniform_mask: Python-side flag that is true iff every mask entry is 1.
+            It is not derived in the hot path because that would force an
+            evaluation boundary. LTX-2 uses it to select scalar versus
+            per-token timestep work and preserve A/V cross-attention semantics.
+
+    When replacing ``denoise_mask`` with a mixed mask, callers must explicitly
+    set ``uniform_mask=False``. The flag does not update itself::
+
+        state = dataclasses.replace(
+            state,
+            denoise_mask=new_mask,
+            uniform_mask=False,
+        )
+    """
+
+    latent: mx.array
+    denoise_mask: mx.array
+    positions: mx.array
+    clean_latent: mx.array
+    uniform_mask: bool = True
+
 
 # HDR selects both the explicit EXR condition interpretation and the output
 # sequence authoring space in the first public HDR profile. The model's working
@@ -72,146 +124,125 @@ HDRAuthoring = Literal["SRGB_LINEAR", "ACESCG", "ACESCCT"]
 # ``auto`` keeps the precision contract recipe-aware: BF16 for ordinary SDR
 # decode and FP32 for HDR decode. Explicit values are controlled diagnostics
 # and are also useful for decode-only restarts.
-VAE_DECODE_DTYPE_CHOICES = ("auto", "bfloat16", "float32")
-VideoVAEDecodeDType = Literal["auto", "bfloat16", "float32"]
-
-VAE_TILING_MODE_CHOICES = ("auto", "single", "custom")
-
-LORA_EXCLUDE_CATEGORIES = frozenset(
-    {
-        "video",
-        "audio",
-        "cross",
-        "attn",
-        "gate",
-        "ff",
-        "attn1",
-        "attn2",
-        "audio_attn1",
-        "audio_attn2",
-        "video_to_audio_attn",
-        "audio_to_video_attn",
-        "audio_ff",
-        "to_q",
-        "to_k",
-        "to_v",
-        "to_out",
-        "to_gate_logits",
-        "project_in",
-        "project_out",
-        "adaln",
-        "prompt_adaln",
-        "scale_shift",
-        "prompt_scale_shift",
-        "gate_adaln",
-        "av_ca",
-        "cross_control",
-        "distill_control",
-    }
-)
+VAE_DECODE_DTYPE_CHOICES = ("auto", "bfloat16", "float16", "float32")
+VideoVAEDecodeDType = Literal["auto", "bfloat16", "float16", "float32"]
 
 
+@config_record
 @dataclass(frozen=True)
 class ImageConditioningConfig:
     """One image-conditioning input for the distilled pipeline."""
 
     path: Path
-    frame_index: int = 0
-    strength: float = 0.95
-
-    def __post_init__(self) -> None:
-        if isinstance(self.path, str):
-            object.__setattr__(self, "path", Path(self.path))
-        if self.frame_index < 0:
-            raise ValueError("image frame_index must be non-negative")
-        if not 0.0 <= self.strength <= 1.0:
-            raise ValueError("image strength must be between 0 and 1")
+    frame_index: int = field(
+        default=0, metadata={"config_constraints": (IntegerConstraint(minimum=0),)}
+    )
+    strength: float = field(
+        default=0.95, metadata={"config_constraints": (NumberConstraint(0, 1),)}
+    )
 
 
+@config_record
 @dataclass(frozen=True)
 class HDRReferenceConditioningConfig:
     """One SDR reference video for the explicit LTX-2.3 HDR IC-LoRA recipe."""
 
     path: Path
-    strength: float = 1.0
+    strength: float = field(default=1.0, metadata={"config_constraints": (NumberConstraint(0, 1),)})
+
+
+@dataclass(frozen=True, kw_only=True)
+class TilingGridConstraint(IntegerConstraint):
+    """Tile and overlap values follow a VAE grid, with zero as an admitted sentinel."""
+
+    minimum: float | None = 0
+    grid: int
+    nonzero_minimum: int = 0
 
     def __post_init__(self) -> None:
-        if isinstance(self.path, str):
-            object.__setattr__(self, "path", Path(self.path))
-        if not 0.0 <= self.strength <= 1.0:
-            raise ValueError("HDR reference strength must be between 0 and 1")
+        super().__post_init__()
+        if type(self.grid) is not int or self.grid < 1:
+            raise ValueError("tiling grid must be a positive integer")
+        if type(self.nonzero_minimum) is not int or self.nonzero_minimum < 0:
+            raise ValueError("nonzero tile minimum must be a nonnegative integer")
+
+    def validate(self, value: object) -> None:
+        super().validate(value)
+        if isinstance(value, int) and value and (value < self.nonzero_minimum or value % self.grid):
+            raise ValueError(
+                f"must be zero or at least {self.nonzero_minimum} and divisible by {self.grid}"
+            )
+
+    def describe(self) -> dict[str, object]:
+        return {
+            **super().describe(),
+            "multiple_of": self.grid,
+            "nonzero_minimum": self.nonzero_minimum,
+            "zero_allowed": True,
+        }
 
 
+@config_record
 @dataclass(frozen=True)
 class VideoVAETilingConfig:
     """Resolved user policy for memory-bounded video VAE decoding.
 
     ``auto`` lets the native decoder select a memory-aware plan, ``single``
     forces one decode, and ``custom`` builds the requested temporal/spatial
-    plan. Runtime tiling types are imported only when decoding so importing the
-    data-only CLI schema does not initialize MLX.
+    plan. Local field constraints admit tile values; final rules validate
+    relationships before runtime conversion.
     """
 
-    mode: Literal["auto", "single", "custom"] = "auto"
-    temporal_tile_frames: int | None = None
-    temporal_overlap_frames: int = 24
-    spatial_tile_pixels: int | None = None
-    spatial_overlap_pixels: int = 64
-
-    def __post_init__(self) -> None:
-        if self.mode not in VAE_TILING_MODE_CHOICES:
-            valid = ", ".join(VAE_TILING_MODE_CHOICES)
-            raise ValueError(f"VAE tiling mode must be one of: {valid}")
-        for name in (
-            "temporal_tile_frames",
-            "temporal_overlap_frames",
-            "spatial_tile_pixels",
-            "spatial_overlap_pixels",
-        ):
-            value = getattr(self, name)
-            if value is not None and (isinstance(value, bool) or not isinstance(value, int)):
-                raise ValueError(f"VAE {name} must be an integer")
-            if value is not None and value < 0:
-                raise ValueError(f"VAE {name} must be non-negative")
-
-        temporal_size = self.temporal_tile_frames
-        if self.mode == "custom" and temporal_size is None:
-            temporal_size = 256
-        if temporal_size not in (None, 0):
-            if temporal_size < 16 or temporal_size % VIDEO_VAE_SCALE.time:
-                raise ValueError("VAE temporal_tile_frames must be at least 16 and divisible by 8")
-            if self.temporal_overlap_frames >= temporal_size:
-                raise ValueError("VAE temporal overlap must be smaller than its tile size")
-        if self.temporal_overlap_frames % VIDEO_VAE_SCALE.time:
-            raise ValueError("VAE temporal_overlap_frames must be divisible by 8")
-
-        spatial_size = self.spatial_tile_pixels
-        if spatial_size not in (None, 0):
-            if spatial_size < 64 or spatial_size % VIDEO_VAE_SCALE.height:
-                raise ValueError("VAE spatial_tile_pixels must be at least 64 and divisible by 32")
-            if self.spatial_overlap_pixels >= spatial_size:
-                raise ValueError("VAE spatial overlap must be smaller than its tile size")
-        if self.spatial_overlap_pixels % VIDEO_VAE_SCALE.height:
-            raise ValueError("VAE spatial_overlap_pixels must be divisible by 32")
-
-        if self.mode == "custom" and temporal_size == 0 and spatial_size in (None, 0):
-            raise ValueError("custom VAE tiling needs a temporal or spatial tile size")
+    mode: VAETilingMode = field(
+        default="auto",
+        metadata={
+            "config_constraints": (ChoiceConstraint(VAE_TILING_MODE_CHOICES),),
+            "config_rules": (VAE_TILING,),
+        },
+    )
+    temporal_tile_frames: int | None = field(
+        default=None,
+        metadata={
+            "config_constraints": (
+                TilingGridConstraint(grid=VIDEO_VAE_SCALE.time, nonzero_minimum=16),
+            )
+        },
+    )
+    temporal_overlap_frames: int = field(
+        default=24,
+        metadata={
+            "config_constraints": (
+                TilingGridConstraint(grid=VIDEO_VAE_SCALE.time, nonzero_minimum=0),
+            )
+        },
+    )
+    spatial_tile_pixels: int | None = field(
+        default=None,
+        metadata={
+            "config_constraints": (
+                TilingGridConstraint(grid=VIDEO_VAE_SCALE.height, nonzero_minimum=64),
+            )
+        },
+    )
+    spatial_overlap_pixels: int = field(
+        default=64,
+        metadata={
+            "config_constraints": (
+                TilingGridConstraint(grid=VIDEO_VAE_SCALE.height, nonzero_minimum=0),
+            )
+        },
+    )
 
     def to_runtime_config(self) -> TilingConfig | None:
         """Build the decoder's native tiling config for this policy."""
-        from .video_vae.tiling import (
-            SpatialTilingConfig,
-            TemporalChunkConfig,
-            TilingConfig,
-        )
-
+        validate_record(self, location="[generate].vae_tiling")
         if self.mode == "auto":
             return None
         if self.mode == "single":
             # A non-None empty plan bypasses decode_streaming's auto planner.
             return TilingConfig()
 
-        temporal_size = 256 if self.temporal_tile_frames is None else self.temporal_tile_frames
+        temporal_size = custom_temporal_tile_frames(self.temporal_tile_frames)
         temporal = (
             TemporalChunkConfig(temporal_size, self.temporal_overlap_frames)
             if temporal_size > 0
@@ -227,228 +258,153 @@ class VideoVAETilingConfig:
 
 
 @dataclass(frozen=True)
-class LoRASelection:
-    """One fully expanded per-run community adapter selection."""
+class VideoDimensionConstraint(IntegerConstraint):
+    """LTX two-stage dimensions follow the combined spatial grid."""
 
-    path: Path
-    strength: float
-    stage_1_strength: float | None
-    stage_2_strength: float | None
-    exclude: tuple[str, ...]
+    minimum: float | None = 1
+
+    def validate(self, value: object) -> None:
+        super().validate(value)
+        if isinstance(value, int) and value % 64:
+            raise ValueError("two-stage resolution must be divisible by 64")
+
+    def describe(self) -> dict[str, object]:
+        return {**super().describe(), "multiple_of": 64}
 
 
+@dataclass(frozen=True)
+class VideoFrameCountConstraint(IntegerConstraint):
+    """LTX frame counts align with temporal VAE compression."""
+
+    minimum: float | None = 1
+
+    def validate(self, value: object) -> None:
+        super().validate(value)
+        if isinstance(value, int) and value % VIDEO_VAE_SCALE.time != 1:
+            raise ValueError(f"frames must be 8*k + 1 for LTX-2, got {value}")
+
+    def describe(self) -> dict[str, object]:
+        return {**super().describe(), "modulus": VIDEO_VAE_SCALE.time, "remainder": 1}
+
+
+@config_record
 @dataclass(frozen=True)
 class DistilledRequest:
     """Resolved public distilled LTX-2 generation parameters."""
 
+    config_table: ClassVar[str] = "[generate]"
+
     prompt: str = ""
-    width: int = 1024
-    height: int = 576
-    frames: int | None = 121
-    duration: float | None = None
-    fps: float = NATIVE_FPS
-    seed: int = 42
-    noise_backend: NoiseBackend = DEFAULT_NOISE_BACKEND
-    sampler: DistilledSampler = "auto"
-    hdr: HDRAuthoring | None = None
-    generate_audio: bool = False
+    prompt_unconditional: bool = field(
+        default=False, metadata={"config_rules": (UNCONDITIONAL_PROMPT,)}
+    )
+    width: int = field(default=1024, metadata={"config_constraints": (VideoDimensionConstraint(),)})
+    height: int = field(default=576, metadata={"config_constraints": (VideoDimensionConstraint(),)})
+    frames: int | None = field(
+        default=121, metadata={"config_constraints": (VideoFrameCountConstraint(),)}
+    )
+    duration: float | None = field(
+        default=None,
+        metadata={"config_constraints": (NumberConstraint(minimum=0, exclusive_minimum=True),)},
+    )
+    fps: float = field(
+        default=NATIVE_FPS,
+        metadata={"config_constraints": (NumberConstraint(minimum=0, exclusive_minimum=True),)},
+    )
+    seed: int = field(
+        default=42,
+        metadata={"config_constraints": (IntegerConstraint(minimum=0, maximum=2**64 - 1),)},
+    )
+    seeds: tuple[int, ...] | None = field(
+        default=None,
+        metadata={
+            "config_constraints": (
+                NumberSequenceConstraint(
+                    minimum_length=1, item=IntegerConstraint(minimum=0, maximum=2**64 - 1)
+                ),
+            )
+        },
+    )
+    noise_backend: NoiseBackend = field(
+        default=DEFAULT_NOISE_BACKEND,
+        metadata={"config_constraints": (ChoiceConstraint(NOISE_BACKEND_CHOICES),)},
+    )
+    sampler: DistilledSampler = field(
+        default="auto",
+        metadata={"config_constraints": (ChoiceConstraint(DISTILLED_SAMPLER_CHOICES),)},
+    )
+    stage_1_sigmas: tuple[float, ...] = field(
+        default=(), metadata={"config_constraints": (SigmaScheduleConstraint(),)}
+    )
+    stage_2_sigmas: tuple[float, ...] = field(
+        default=(), metadata={"config_constraints": (SigmaScheduleConstraint(),)}
+    )
+    hdr: HDRAuthoring | None = field(
+        default=None,
+        metadata={
+            "config_constraints": (ChoiceConstraint(HDR_AUTHORING_CHOICES),),
+            "config_rules": (HDR_SOURCES,),
+        },
+    )
+    generate_audio: bool = field(
+        default=False, metadata={"config_rules": (DISTILLED_CAPABILITIES,)}
+    )
     reference_aligned_audio: bool = False
-    image: ImageConditioningConfig | None = None
+    image: ImageConditioningConfig | None = field(
+        default=None, metadata={"config_rules": (IMAGE_FRAME_BOUNDS,)}
+    )
     hdr_reference: HDRReferenceConditioningConfig | None = None
-    generated_keyframes: int = 0
+    generated_keyframes: int = field(
+        default=0,
+        metadata={
+            "config_constraints": (IntegerConstraint(minimum=0),),
+            "config_rules": (KEYFRAME_POSITIONS,),
+        },
+    )
     text_conditioning: Path | None = None
-    vae_decode_dtype: VideoVAEDecodeDType = "auto"
+    vae_decode_dtype: VideoVAEDecodeDType = field(
+        default="auto",
+        metadata={"config_constraints": (ChoiceConstraint(VAE_DECODE_DTYPE_CHOICES),)},
+    )
     vae_tiling: VideoVAETilingConfig = field(default_factory=VideoVAETilingConfig)
     pad_prompt_to_max: bool = True
-    lora_paths: tuple[Path, ...] = ()
-    lora_strengths: tuple[float, ...] = ()
-    lora_stage1_strengths: tuple[float, ...] = ()
-    lora_stage2_strengths: tuple[float, ...] = ()
-    lora_exclusions: tuple[str, ...] = ()
+    adapters: tuple[LTX2AdapterConfig, ...] = ()
+
+    def selected_seeds(self) -> tuple[int, ...]:
+        """Ordered seeds for each prompt."""
+        return resolve_seeds(self.seed, self.seeds)
 
     def __post_init__(self) -> None:
-        if isinstance(self.seed, bool) or not isinstance(self.seed, int) or self.seed < 0:
-            raise ValueError("seed must be a non-negative integer")
-        if self.seed >= 2**64:
-            raise ValueError("seed must be smaller than 2**64")
-        if self.noise_backend not in NOISE_BACKEND_CHOICES:
-            choices = ", ".join(NOISE_BACKEND_CHOICES)
-            raise ValueError(f"noise_backend must be one of: {choices}")
-        if self.sampler not in DISTILLED_SAMPLER_CHOICES:
-            choices = ", ".join(DISTILLED_SAMPLER_CHOICES)
-            raise ValueError(f"sampler must be one of: {choices}")
-        if self.hdr not in (None, *HDR_AUTHORING_CHOICES):
-            choices = ", ".join(HDR_AUTHORING_CHOICES)
-            raise ValueError(f"hdr must be one of: {choices}")
-        if self.vae_decode_dtype not in VAE_DECODE_DTYPE_CHOICES:
-            choices = ", ".join(VAE_DECODE_DTYPE_CHOICES)
-            raise ValueError(f"vae_decode_dtype must be one of: {choices}")
-        if not math.isfinite(self.fps) or self.fps <= 0:
-            raise ValueError("fps must be finite and positive")
         if self.duration is not None:
-            if not math.isfinite(self.duration) or self.duration <= 0:
-                raise ValueError("duration must be finite and positive")
             resolved_frames = resolved_frame_count_for_duration(self.duration, self.fps)
             object.__setattr__(self, "frames", resolved_frames)
-        if isinstance(self.text_conditioning, str):
-            object.__setattr__(self, "text_conditioning", Path(self.text_conditioning))
-        if self.width <= 0 or self.height <= 0:
-            raise ValueError("width and height must be positive")
-        if self.width % 64 != 0 or self.height % 64 != 0:
-            raise ValueError(
-                f"two-stage resolution {self.width}x{self.height} must be divisible by 64"
-            )
-        if self.frames is not None:
-            if isinstance(self.frames, bool) or not isinstance(self.frames, int):
-                raise ValueError("frames must be an integer or None for auto-duration")
-            if self.frames < 1 or self.frames % VIDEO_VAE_SCALE.time != 1:
-                raise ValueError(f"frames must be 8*k + 1 for LTX-2, got {self.frames}")
-        if (
-            isinstance(self.generated_keyframes, bool)
-            or not isinstance(self.generated_keyframes, int)
-            or self.generated_keyframes < 0
-        ):
-            raise ValueError("generated_keyframes must be a non-negative integer")
-        if (
-            self.image is not None
-            and self.frames is not None
-            and self.image.frame_index >= self.frames
-        ):
-            raise ValueError(
-                f"image frame_index {self.image.frame_index} is outside {self.frames} frames"
-            )
-        if not self.lora_paths and any(
-            (
-                self.lora_strengths,
-                self.lora_stage1_strengths,
-                self.lora_stage2_strengths,
-                self.lora_exclusions,
-            )
-        ):
-            raise ValueError("LoRA strengths or exclusions require lora_paths")
-        self.resolved_loras()
+        self.resolved_adapters()
 
-    @staticmethod
-    @overload
-    def _expand_lora_values(
-        values: tuple[float, ...],
-        count: int,
-        *,
-        label: str,
-        default: float,
-    ) -> tuple[float, ...]: ...
-
-    @staticmethod
-    @overload
-    def _expand_lora_values(
-        values: tuple[float, ...],
-        count: int,
-        *,
-        label: str,
-        default: None,
-    ) -> tuple[float | None, ...]: ...
-
-    @staticmethod
-    def _expand_lora_values(
-        values: tuple[float, ...],
-        count: int,
-        *,
-        label: str,
-        default: float | None,
-    ) -> tuple[float | None, ...]:
-        if not values:
-            return (default,) * count
-        if len(values) == 1:
-            return values * count
-        if len(values) != count:
-            raise ValueError(
-                f"{label} must contain one value or one per LoRA ({count}), got {len(values)}"
-            )
-        return values
-
-    @staticmethod
-    def _parse_lora_exclusion(value: str) -> tuple[str, ...]:
-        if value.strip().lower() in {"", "none", "off"}:
-            return ()
-        categories = tuple(category.strip() for category in value.split(",") if category.strip())
-        unknown = sorted(set(categories) - LORA_EXCLUDE_CATEGORIES)
-        if unknown:
-            valid = ", ".join(sorted(LORA_EXCLUDE_CATEGORIES))
-            raise ValueError(f"unknown LoRA exclusion categories {unknown}; valid values: {valid}")
-        return categories
-
-    def resolved_loras(self) -> tuple[LoRASelection, ...]:
-        """Expand one-or-N LoRA values into ordered adapter selections."""
-        count = len(self.lora_paths)
-        if count == 0:
-            return ()
-        strengths = self._expand_lora_values(
-            self.lora_strengths,
-            count,
-            label="lora_strengths",
-            default=1.0,
+    def resolved_adapters(self) -> tuple[LTX2AdapterSelection, ...]:
+        """Resolve ordered records with independent common and stage strengths."""
+        return tuple(
+            adapter.selection(location=f"[generate].adapters[{index}]")
+            for index, adapter in enumerate(self.adapters)
         )
-        stage_1 = self._expand_lora_values(
-            self.lora_stage1_strengths,
-            count,
-            label="lora_stage1_strengths",
-            default=None,
-        )
-        stage_2 = self._expand_lora_values(
-            self.lora_stage2_strengths,
-            count,
-            label="lora_stage2_strengths",
-            default=None,
-        )
-        exclusions: tuple[tuple[str, ...], ...]
-        if not self.lora_exclusions:
-            exclusions = ((),) * count
-        elif len(self.lora_exclusions) == 1:
-            exclusions = (self._parse_lora_exclusion(self.lora_exclusions[0]),) * count
-        elif len(self.lora_exclusions) == count:
-            exclusions = tuple(self._parse_lora_exclusion(value) for value in self.lora_exclusions)
-        else:
-            raise ValueError(
-                "lora_exclusions must contain one value or one per LoRA "
-                f"({count}), got {len(self.lora_exclusions)}"
-            )
 
-        selections = []
-        for path, strength, stage_1_strength, stage_2_strength, exclude in zip(
-            self.lora_paths,
-            strengths,
-            stage_1,
-            stage_2,
-            exclusions,
-            strict=True,
-        ):
-            if not isinstance(path, Path):
-                path = Path(path)
-            normalized_strength = float(strength)
-            normalized_stage_1 = None if stage_1_strength is None else float(stage_1_strength)
-            normalized_stage_2 = None if stage_2_strength is None else float(stage_2_strength)
-            for label, value in (
-                ("strength", normalized_strength),
-                ("stage 1 strength", normalized_stage_1),
-                ("stage 2 strength", normalized_stage_2),
-            ):
-                if value is not None and not math.isfinite(value):
-                    raise ValueError(f"LoRA {label} must be finite, got {value}")
-            selections.append(
-                LoRASelection(
-                    path=path,
-                    strength=normalized_strength,
-                    stage_1_strength=normalized_stage_1,
-                    stage_2_strength=normalized_stage_2,
-                    exclude=exclude,
-                )
-            )
-        return tuple(selections)
+    @property
+    def adapter_stage1_profile(self) -> LoRAProfile:
+        """The effective first-stage profile, including zero-strength filtering."""
+        return lora_profile_for_stage(self.resolved_adapters(), 1)
+
+    @property
+    def adapter_stage_profiles(self) -> tuple[LoRAProfile, LoRAProfile]:
+        """Both completed-stage profiles used by decode restart policy."""
+        selections = self.resolved_adapters()
+        return lora_profile_for_stage(selections, 1), lora_profile_for_stage(selections, 2)
 
     def validate_for_generation(self) -> None:
         """Validate fields that may be omitted while printing a template."""
-        if self.text_conditioning is None and (
-            not isinstance(self.prompt, str) or not self.prompt.strip()
+        validate_record(self, location="[generate]")
+        if (
+            self.text_conditioning is None
+            and not self.prompt_unconditional
+            and (not isinstance(self.prompt, str) or not self.prompt.strip())
         ):
             raise ValueError("prompt or text_conditioning is required")
         if self.text_conditioning is not None and not self.text_conditioning.is_file():
@@ -457,20 +413,9 @@ class DistilledRequest:
             raise ValueError(f"image does not exist: {self.image.path}")
         if self.hdr_reference is not None and not self.hdr_reference.path.is_file():
             raise ValueError(f"HDR reference video does not exist: {self.hdr_reference.path}")
-        for selection in self.resolved_loras():
+        for selection in self.resolved_adapters():
             if not selection.path.is_file():
-                raise ValueError(f"LoRA does not exist: {selection.path}")
-
-    def validate_with_settings(self, settings: LTX2Settings) -> None:
-        """Validate per-run features against the selected load/cache mode."""
-        if not self.lora_paths:
-            return
-        if settings.stream_transformer or settings.transformer_resident_blocks is not None:
-            raise ValueError("LoRA fusion cannot be combined with transformer block streaming")
-        if settings.transformer_cache_quantize != "off":
-            raise ValueError("LoRA fusion requires an unquantized transformer cache")
-        if settings.video_ff_quantize_specs:
-            raise ValueError("LoRA fusion cannot be combined with targeted FF quantization")
+                raise ValueError(f"adapter does not exist: {selection.path}")
 
 
 def video_latent_shape_from_pixel(pixel: VideoPixelShape) -> VideoLatentShape:

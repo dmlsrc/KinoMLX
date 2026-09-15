@@ -1,20 +1,18 @@
 """Test-owned synthetic parameter materialization for transformer graphs."""
 
-from __future__ import annotations
-
 import math
 from collections.abc import Callable
 
 import mlx.core as mx
 
 import kinomlx._mlx_nn as nn
-from kinomlx.models.ltx2.cache.keys import flatten_to_nested
 from kinomlx.models.ltx2.transformer import (
     AdaLayerNormSingle,
     Attention,
     FeedForward,
     LTXAVModel,
 )
+from kinomlx.models.ltx2.weights.keys import flatten_to_nested
 
 
 def _weight(

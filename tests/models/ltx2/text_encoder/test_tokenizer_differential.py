@@ -1,7 +1,5 @@
 """Real tokenizer.json differentials for the shared LTX tokenizer station."""
 
-from __future__ import annotations
-
 import hashlib
 import json
 import random
@@ -10,12 +8,14 @@ from pathlib import Path
 
 import pytest
 
+from kinomlx.models.ltx2.resources import ComponentKind
+from kinomlx.models.ltx2.settings import LTX2Settings
 from kinomlx.models.ltx2.text_encoder import GemmaTokenizer
-from kinomlx.models.ltx2.text_encoder.tokenizer_cache import (
-    ensure_tokenizer_cache,
+from kinomlx.models.ltx2.text_encoder.tokenizer_derivation import (
+    derive_tokenizer,
     resolve_tokenizer_source,
 )
-from kinomlx.settings import Settings
+from tests.models.ltx2._source_weights import ltx2_resources
 
 tokenizers = pytest.importorskip("tokenizers")
 Tokenizer = tokenizers.Tokenizer
@@ -100,34 +100,20 @@ def _corpus_sha256(corpus: tuple[str, ...]) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
-def _snapshot_with(root: Path, relative: str) -> Path | None:
-    if not root.is_dir():
-        return None
-    return next(
-        (snapshot for snapshot in sorted(root.iterdir()) if (snapshot / relative).is_file()),
-        None,
-    )
-
-
 def _real_source(generation: str) -> Path:
-    hf_home = Settings.from_env().hf_home
+    """The tokenizer source the product selects for one generation."""
     if generation == "2.3":
-        snapshot = _snapshot_with(
-            hf_home / "hub/models--google--gemma-3-12b-it/snapshots",
-            "tokenizer.json",
-        )
-        if snapshot is None:
-            pytest.skip("Gemma 3 tokenizer.json is not cached")
-        return snapshot
+        resources = ltx2_resources()
+        encoder = None if resources is None else resources.optional(ComponentKind.TEXT_ENCODER)
+        if encoder is None or not (encoder.source_path / "tokenizer.json").is_file():
+            pytest.skip("the product selects no cached Gemma 3 tokenizer for LTX-2.3")
+        return encoder.source_path
     if generation == "2.5":
-        relative = "text_encoders/gemma4-12b-with-proj-ltx-2.5-bf16.safetensors"
-        snapshot = _snapshot_with(
-            hf_home / "hub/models--Lightricks--LTX-2.5/snapshots",
-            relative,
-        )
-        if snapshot is None:
-            pytest.skip("LTX-2.5 text artifact is not cached")
-        return snapshot / relative
+        resources = ltx2_resources(LTX2Settings(model_generation="2.5"))
+        encoder = None if resources is None else resources.optional(ComponentKind.TEXT_ENCODER)
+        if encoder is None:
+            pytest.skip("the product selects no cached LTX-2.5 text artifact")
+        return encoder.source_path
     raise AssertionError(f"unknown test generation {generation}")
 
 
@@ -138,7 +124,7 @@ def _reference_ids(reference, text: str, *, bos_id: int, max_length: int) -> lis
     return ids
 
 
-@pytest.mark.requires_weights
+@pytest.mark.heavy
 @pytest.mark.parametrize("generation", ["2.3", "2.5"])
 def test_real_tokenizer_json_matches_ids_masks_and_decode(
     generation: str,
@@ -149,7 +135,9 @@ def test_real_tokenizer_json_matches_ids_masks_and_decode(
     source = _real_source(generation)
     source_json = resolve_tokenizer_source(source).read_json_bytes()
     reference = Tokenizer.from_str(source_json.decode("utf-8"))
-    cache = ensure_tokenizer_cache(source, cache_root=tmp_path / "cache")
+    cache = derive_tokenizer(
+        source,
+    )
     candidate = GemmaTokenizer(cache)
 
     for text in corpus:
@@ -180,10 +168,11 @@ def test_real_tokenizer_json_matches_ids_masks_and_decode(
             assert actual_mask.tolist() == [expected_mask]
 
 
-@pytest.mark.requires_weights
 def test_derived_ltx23_changes_only_literal_special_token_prompts(tmp_path: Path) -> None:
     gemma3 = _real_source("2.3")
-    cache = ensure_tokenizer_cache(gemma3, cache_root=tmp_path / "cache")
+    cache = derive_tokenizer(
+        gemma3,
+    )
     candidate = GemmaTokenizer(cache)
 
     import sentencepiece

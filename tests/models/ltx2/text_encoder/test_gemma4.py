@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import mlx.core as mx
 import pytest
 from mlx.utils import tree_flatten
@@ -10,7 +8,7 @@ from kinomlx.models.ltx2.text_encoder import (
     Gemma4RMSNorm,
     load_gemma4_weights,
 )
-from kinomlx.reporting import RecordingReporter
+from tests._reporting import RecordingReporter
 
 from ._synthetic import initialize_test_parameters
 
@@ -39,7 +37,7 @@ def _model() -> Gemma4Model:
     return model
 
 
-def test_gemma4_rms_norm_uses_direct_checkpoint_scale() -> None:
+def test_gemma4_rms_norm_uses_checkpoint_scale() -> None:
     norm = Gemma4RMSNorm(2, 1e-6)
     norm.weight = mx.array([2.0, 3.0], dtype=mx.float32)
     value = mx.array([[3.0, 4.0]], dtype=mx.float32)
@@ -70,12 +68,10 @@ def test_gemma4_returns_exact_projection_states_and_named_boundaries() -> None:
     assert mx.array_equal(final, states[-1]).item()
     assert tuple(boundaries) == ("embedding", "layer.00", "layer.01", "final_norm")
     assert mx.array_equal(final, boundaries["final_norm"]).item()
-    assert reporter.events[0] == (
-        "start",
-        "encode prompt with Gemma 4",
-        {"total": 2, "unit": "layer"},
-    )
-    assert reporter.events[-1] == ("end", "encode prompt with Gemma 4", {})
+    assert reporter.events == [
+        ("start", "encode prompt with Gemma 4", {"total": None, "unit": "it"}),
+        ("end", "encode prompt with Gemma 4", {}),
+    ]
 
 
 def test_gemma4_left_padding_drives_positions_and_masks() -> None:

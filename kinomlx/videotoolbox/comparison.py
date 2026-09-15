@@ -9,8 +9,6 @@ Accepts pre as either (H,W,3) uint8 RGB or (H,W,4) fp16/fp32 RGBA so it
 works with both --video (uint8) and --latent HQ (fp16) chunk formats.
 """
 
-from __future__ import annotations
-
 import Foundation
 import mlx.core as mx
 import Quartz

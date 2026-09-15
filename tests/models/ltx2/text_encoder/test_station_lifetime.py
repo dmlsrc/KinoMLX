@@ -1,13 +1,11 @@
 """Prompt station releases each concrete text model before its next boundary."""
 
-from __future__ import annotations
-
 import weakref
 
 import mlx.core as mx
 import pytest
 
-import kinomlx.models.ltx2.text_encoder.encoder as encoder_module
+import kinomlx.models.ltx2.text_encoder.prompt as prompt_module
 from kinomlx.models.ltx2.text_encoder.encoder import AudioVideoGemmaEncoderOutput
 
 
@@ -54,13 +52,13 @@ def test_prompt_encoding_releases_gemma_then_connectors_before_return(
         assert gemma_ref() is None
         return _Connector()
 
-    monkeypatch.setattr(encoder_module, "GemmaTokenizer", _Tokenizer)
-    monkeypatch.setattr(encoder_module, "Gemma3Model", _Gemma)
-    monkeypatch.setattr(encoder_module, "Gemma4Model", _Gemma)
-    monkeypatch.setattr(encoder_module, "load_gemma3_weights", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(encoder_module, "load_gemma4_weights", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(prompt_module, "GemmaTokenizer", _Tokenizer)
+    monkeypatch.setattr(prompt_module, "Gemma3Model", _Gemma)
+    monkeypatch.setattr(prompt_module, "Gemma4Model", _Gemma)
+    monkeypatch.setattr(prompt_module, "load_gemma3_weights", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(prompt_module, "load_gemma4_weights", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(
-        encoder_module,
+        prompt_module,
         "create_av_text_encoder_v2_from_checkpoint",
         create_connector,
     )
@@ -69,7 +67,7 @@ def test_prompt_encoding_releases_gemma_then_connectors_before_return(
         lambda *_args, **_kwargs: None,
     )
 
-    output = encoder_module.encode_prompt(
+    output = prompt_module.encode_prompt(
         "prompt",
         gemma_path="gemma",
         connector_path="connector.safetensors",
@@ -134,13 +132,13 @@ def test_prompt_encoding_releases_each_model_when_its_station_fails(
         if failure_point == "connector load":
             raise RuntimeError(failure_point)
 
-    monkeypatch.setattr(encoder_module, "GemmaTokenizer", _Tokenizer)
-    monkeypatch.setattr(encoder_module, "Gemma3Model", _Gemma)
-    monkeypatch.setattr(encoder_module, "Gemma4Model", _Gemma)
-    monkeypatch.setattr(encoder_module, "load_gemma3_weights", load_gemma)
-    monkeypatch.setattr(encoder_module, "load_gemma4_weights", load_gemma)
+    monkeypatch.setattr(prompt_module, "GemmaTokenizer", _Tokenizer)
+    monkeypatch.setattr(prompt_module, "Gemma3Model", _Gemma)
+    monkeypatch.setattr(prompt_module, "Gemma4Model", _Gemma)
+    monkeypatch.setattr(prompt_module, "load_gemma3_weights", load_gemma)
+    monkeypatch.setattr(prompt_module, "load_gemma4_weights", load_gemma)
     monkeypatch.setattr(
-        encoder_module,
+        prompt_module,
         "create_av_text_encoder_v2_from_checkpoint",
         create_connector,
     )
@@ -150,7 +148,7 @@ def test_prompt_encoding_releases_each_model_when_its_station_fails(
     )
 
     with pytest.raises(RuntimeError, match=failure_point):
-        encoder_module.encode_prompt(
+        prompt_module.encode_prompt(
             "prompt",
             gemma_path="gemma",
             connector_path="connector.safetensors",

@@ -1,19 +1,16 @@
 """Lossless diagnostic PNG sequence at the decoded-frame boundary."""
 
-from __future__ import annotations
-
 import json
 import logging
 import shutil
 from contextlib import suppress
 from pathlib import Path
-from typing import TYPE_CHECKING
+
+import mlx.core as mx
 
 from kinomlx.io.atomic import write_text_atomic
 from kinomlx.media.frames import CloseableVideoFrameStream
-
-if TYPE_CHECKING:
-    import mlx.core as mx
+from kinomlx.videotoolbox.images import save_image
 
 _log = logging.getLogger(__name__)
 
@@ -80,10 +77,6 @@ class PNGFrameDumpStream:
 
         path = self.directory / f"frame_{self._written:0{self._digits}d}.png"
         try:
-            import mlx.core as mx
-
-            from kinomlx.videotoolbox.images import save_image
-
             pixels = (mx.clip(frame.astype(mx.float32), 0.0, 1.0) * 255.0 + 0.5).astype(mx.uint8)
             save_image(pixels, path)
         except Exception as exc:

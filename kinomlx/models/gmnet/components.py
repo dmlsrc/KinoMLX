@@ -1,7 +1,5 @@
 """Public GMNet component lease and the default native provider."""
 
-from __future__ import annotations
-
 import gc
 from dataclasses import dataclass
 from typing import Protocol
@@ -44,12 +42,10 @@ def load_generator(
 ) -> ComponentLease[GMNetPort]:
     """Load, evaluate, and lease one GMNet generator."""
     sink = reporter if reporter is not None else NullReporter()
-    phase = "load GMNet"
+    phase = "load model"
     sink.phase_start(phase, total=1, unit="model")
     model: GMNet | None = None
     try:
-        if resources.mlx_cache_limit_bytes is not None:
-            mx.set_cache_limit(resources.mlx_cache_limit_bytes)
         model, _metadata = load_gmnet_weights(resources.weights_path)
         sink.phase_advance(phase)
         port: GMNetPort = model

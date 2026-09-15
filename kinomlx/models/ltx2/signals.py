@@ -1,7 +1,5 @@
 """LTX-family signal constants and checkpoint-resolved geometry helpers."""
 
-from __future__ import annotations
-
 from dataclasses import replace
 from fractions import Fraction
 
@@ -151,8 +149,8 @@ __all__ = [
     "LOGC3_WORKING_SIGNAL",
     "LTX23_SDR_SIGNAL",
     "SCENE_LINEAR_HDR_SIGNAL",
-    "ltx_hdr_working_signal",
     "ltx23_sdr_signal",
-    "validate_ltx_hdr_working_signal",
+    "ltx_hdr_working_signal",
     "validate_ltx23_sdr_signal",
+    "validate_ltx_hdr_working_signal",
 ]

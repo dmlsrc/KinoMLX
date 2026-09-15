@@ -12,8 +12,6 @@ given resolves against that collection relative to the working
 directory, so documented commands work with bare filenames.
 """
 
-from __future__ import annotations
-
 import hashlib
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -31,15 +29,12 @@ from kinomlx.models.gmnet.catalog import (
 )
 from kinomlx.models.gmnet.net import EXPECTED_CHECKPOINT_KEYS, load_gmnet_weights
 from kinomlx.reporting import NullReporter, Reporter
+from kinomlx.settings import Settings
 from kinomlx.weights.convert import WeightConversionError
 from kinomlx.weights.convert import resolve_source as resolve_generic_source
 from kinomlx.weights.output import WeightOutputError, reserved_weight_output
-from kinomlx.weights.torch_checkpoint import (
-    RestrictedCheckpointError,
-    load_restricted_checkpoint,
-    scan_pickle_globals,
-    suspicious_globals,
-)
+from kinomlx.weights.pickle_scan import RestrictedCheckpointError
+from kinomlx.weights.torch_checkpoint import load_restricted_checkpoint
 
 
 class CheckpointConversionError(KinoMLXError, RuntimeError):
@@ -97,7 +92,7 @@ def convert_checkpoint(
     declared_variant: GMNetVariant | None = None,
     allow_suspicious: bool = False,
     force: bool = False,
-    cache_dir: Path | str | None = None,
+    app_cache_dir: Path | str | None = None,
     reporter: Reporter | None = None,
 ) -> ConversionReceipt:
     """Convert one GMNet ``.pth`` checkpoint into a verified safetensors file.
@@ -130,11 +125,9 @@ def convert_checkpoint(
         if output is not None:
             target = Path(output).expanduser()
         elif variant is not None:
-            if cache_dir is None:
-                from kinomlx.settings import Settings
-
-                cache_dir = Settings.from_env_fields("cache_dir").cache_dir
-            target = variant_weights_path(variant, cache_dir)
+            if app_cache_dir is None:
+                app_cache_dir = Settings.from_env_fields("app_cache_dir").app_cache_dir
+            target = variant_weights_path(variant, app_cache_dir)
         else:
             raise CheckpointConversionError(
                 f"{source_path} (sha256 {digest[:12]}...) is not a published GMNet "
@@ -211,6 +204,4 @@ __all__ = [
     "ConversionReceipt",
     "convert_checkpoint",
     "resolve_source",
-    "scan_pickle_globals",
-    "suspicious_globals",
 ]

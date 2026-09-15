@@ -1,14 +1,13 @@
 """Synthetic second-recipe composition proof."""
 
-from __future__ import annotations
-
 from dataclasses import dataclass, fields
 
 import mlx.core as mx
 
 from kinomlx.media.frames import VideoFrameStream
+from kinomlx.models.ltx2.generation import GenerationOutput
 from kinomlx.models.ltx2.pipelines.distilled import prepare_stage, run_stage
-from kinomlx.models.ltx2.runner import GenerationOutput, LTX2Runner
+from kinomlx.models.ltx2.runner import LTX2Runner
 from kinomlx.models.ltx2.signals import ltx23_sdr_signal
 from kinomlx.models.ltx2.types import DistilledRequest as ProductDistilledRequest
 from kinomlx.types import VideoPixelShape

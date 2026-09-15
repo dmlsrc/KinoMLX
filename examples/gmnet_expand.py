@@ -1,20 +1,18 @@
 """Public GMNet recipe plus transactional still-output composition."""
 
-from __future__ import annotations
-
 from pathlib import Path
 
-from kinomlx import (
+from kinomlx import Settings
+from kinomlx.models.gmnet import (
     GMNetArtifactSet,
     GMNetOutputConfig,
     GMNetOutputSink,
     GMNetRequest,
     GMNetRunner,
     GMNetSettings,
-    Settings,
     expand_gmnet,
     plan_gmnet_output,
-    prepare_gmnet_resources,
+    prepare_resources,
 )
 
 
@@ -25,8 +23,10 @@ def expand_still(
     output_directory: Path = Path("outputs"),
 ) -> GMNetArtifactSet:
     """Expand one SDR still and publish its selected HDR artifacts."""
+    # Both MLX limits travel with resources. The runner applies them once before
+    # model work, including when these resources are reused for another call.
     infrastructure = Settings.from_env()
-    resources = prepare_gmnet_resources(
+    resources = prepare_resources(
         GMNetSettings.from_env(),
         infrastructure=infrastructure,
     )

@@ -1,7 +1,5 @@
 """Native Conv3d video VAE model and loading tests."""
 
-from __future__ import annotations
-
 import json
 from pathlib import Path
 from typing import Any
@@ -22,7 +20,7 @@ from kinomlx.models.ltx2.video_vae.encoder import (
     load_native_vae_encoder_weights,
 )
 from kinomlx.models.ltx2.video_vae.loading import load_native_video_vae
-from kinomlx.reporting import RecordingReporter
+from tests._reporting import RecordingReporter
 
 from ._fixtures import mini_vae_config, mini_vae_mapping
 
@@ -313,7 +311,7 @@ def test_checkpoint_loader_accepts_explicit_config_for_split_artifact(
     assert bundle.config is config
 
 
-def test_checkpoint_loader_does_not_take_constructor_authority_from_cache_sidecar(
+def test_checkpoint_loader_does_not_take_constructor_authority_from_weights_sidecar(
     tmp_path: Path,
 ) -> None:
     checkpoint = tmp_path / "video_vae.safetensors"
@@ -328,7 +326,7 @@ def test_checkpoint_loader_does_not_take_constructor_authority_from_cache_sideca
         ),
         encoding="utf-8",
     )
-    with pytest.raises(ValueError, match="family caches do not carry constructor authority"):
+    with pytest.raises(ValueError, match="weight-only files do not carry constructor authority"):
         load_native_video_vae(checkpoint, compute_dtype=mx.float32)
 
 

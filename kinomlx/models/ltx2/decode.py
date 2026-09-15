@@ -1,19 +1,17 @@
 """Pure audio operations and LTX-specific lazy video decode composition."""
 
-from __future__ import annotations
-
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
-from typing import Literal
 
 import mlx.core as mx
 
 from kinomlx.components import ComponentLease
 from kinomlx.media.frames import VideoFrameStream
 from kinomlx.media.signals import VideoSignalSpec
+from kinomlx.modeling.memory import capture_decode_memory_budget
 from kinomlx.reporting import Reporter
 from kinomlx.samplers.noise import NoiseStreamState, noise_compatibility_profile
-from kinomlx.types import DEFAULT_NOISE_BACKEND, NoiseBackend
+from kinomlx.types import DEFAULT_NOISE_BACKEND, NoiseBackend, VAETilingMode
 
 from .components import AudioDecoderPort, VideoDecoderPort, VocoderPort
 from .signals import validate_ltx23_sdr_signal, validate_ltx_hdr_working_signal
@@ -31,6 +29,8 @@ class VAEEntryMemoryReceipt:
     recommended_working_set_bytes: int | None
     available_bytes: int
     planner_budget_bytes: int
+    system_reclaimable_bytes: int | None = None
+    memory_limit_bytes: int | None = None
     latent_bytes: int = 0
     decoder_parameter_bytes: int = 0
     live_assets: frozenset[str] = frozenset({"final_video_latent", "video_decoder"})
@@ -57,22 +57,14 @@ class VAEEntryMemoryReceipt:
             "recommended_working_set_bytes": self.recommended_working_set_bytes,
             "available_bytes": self.available_bytes,
             "planner_budget_bytes": self.planner_budget_bytes,
+            "system_reclaimable_bytes": self.system_reclaimable_bytes,
+            "memory_limit_bytes": self.memory_limit_bytes,
             "latent_bytes": self.latent_bytes,
             "decoder_parameter_bytes": self.decoder_parameter_bytes,
             "accounted_asset_bytes": self.accounted_asset_bytes,
             "unaccounted_active_bytes": self.unaccounted_active_bytes,
             "live_assets": sorted(self.live_assets),
         }
-
-
-def _mlx_memory_bytes(name: str) -> int:
-    getter = getattr(mx, name, None)
-    if getter is None:
-        return 0
-    try:
-        return max(0, int(getter()))
-    except RuntimeError, TypeError, ValueError:
-        return 0
 
 
 def _owned_array_bytes(*values: object) -> int:
@@ -100,42 +92,20 @@ def capture_vae_entry_memory_receipt(
     latent: mx.array | None = None,
     decoder: object | None = None,
 ) -> VAEEntryMemoryReceipt:
-    """Capture reclaim-aware memory available to the VAE station.
-
-    The recommended working set is the hard ceiling when MLX reports one.
-    Half of the remaining capacity is offered to the calibrated Conv3d
-    planner; the other half covers output assembly, native sinks, and error
-    in the fitted model.
-    """
-    try:
-        info = dict(mx.device_info())
-    except AttributeError, RuntimeError, TypeError, ValueError:
-        info = {}
-    total = info.get("memory_size")
-    recommended = info.get("max_recommended_working_set_size")
-    total_bytes = int(total) if isinstance(total, (int, float)) and total > 0 else None
-    recommended_bytes = (
-        int(recommended) if isinstance(recommended, (int, float)) and recommended > 0 else None
-    )
-    active = _mlx_memory_bytes("get_active_memory")
-    cache = _mlx_memory_bytes("get_cache_memory")
-    peak = _mlx_memory_bytes("get_peak_memory")
-    ceilings = [value for value in (total_bytes, recommended_bytes) if value is not None]
-    # A 12 GB fallback preserves the prior conservative behavior on runtimes
-    # that do not report unified-memory limits.
-    ceiling = min(ceilings) if ceilings else 12_000_000_000
-    available = max(0, ceiling - active - cache)
-    planner_budget = available // 2
+    """Capture the shared reclaim-aware budget after decoder materialization."""
+    budget = capture_decode_memory_budget()
     decoder_parameters = getattr(decoder, "parameters", None)
     decoder_tree = decoder_parameters() if callable(decoder_parameters) else ()
     return VAEEntryMemoryReceipt(
-        active_bytes=active,
-        cache_bytes=cache,
-        peak_bytes=peak,
-        total_bytes=total_bytes,
-        recommended_working_set_bytes=recommended_bytes,
-        available_bytes=available,
-        planner_budget_bytes=planner_budget,
+        active_bytes=budget.active_bytes,
+        cache_bytes=budget.cache_bytes,
+        peak_bytes=int(mx.get_peak_memory()),
+        total_bytes=budget.total_bytes,
+        recommended_working_set_bytes=budget.recommended_working_set_bytes,
+        available_bytes=budget.available_bytes,
+        planner_budget_bytes=budget.available_bytes,
+        system_reclaimable_bytes=budget.system_reclaimable_bytes,
+        memory_limit_bytes=budget.limit_bytes,
         latent_bytes=_owned_array_bytes(latent),
         decoder_parameter_bytes=_owned_array_bytes(decoder_tree),
     )
@@ -194,7 +164,7 @@ def _decode_ltx_frames(
     contract_name: str,
     tiling_config: TilingConfig | None = None,
     auto_tiling: bool = False,
-    tiling_mode: Literal["auto", "single", "custom"] | None = None,
+    tiling_mode: VAETilingMode | None = None,
     reporter: Reporter | None = None,
     decoder_seed: int = 0,
     noise_backend: NoiseBackend = DEFAULT_NOISE_BACKEND,
@@ -225,6 +195,7 @@ def _decode_ltx_frames(
                             spec.width,
                             frame_count,
                             memory_budget_gb=receipt.planner_budget_gb,
+                            compute_dtype=getattr(decoder, "compute_dtype", mx.bfloat16),
                         )
                     else:
                         planned_tiling = TilingConfig.auto_native_conv3d(
@@ -304,7 +275,7 @@ def decode_ltx23_sdr_frames(
     frame_count: int,
     tiling_config: TilingConfig | None = None,
     auto_tiling: bool = False,
-    tiling_mode: Literal["auto", "single", "custom"] | None = None,
+    tiling_mode: VAETilingMode | None = None,
     reporter: Reporter | None = None,
     decoder_seed: int = 0,
     noise_backend: NoiseBackend = DEFAULT_NOISE_BACKEND,
@@ -335,7 +306,7 @@ def decode_ltx_hdr_working_frames(
     frame_count: int,
     tiling_config: TilingConfig | None = None,
     auto_tiling: bool = False,
-    tiling_mode: Literal["auto", "single", "custom"] | None = None,
+    tiling_mode: VAETilingMode | None = None,
     reporter: Reporter | None = None,
     decoder_seed: int = 0,
     noise_backend: NoiseBackend = DEFAULT_NOISE_BACKEND,

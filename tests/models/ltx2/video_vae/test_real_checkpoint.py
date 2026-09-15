@@ -1,28 +1,19 @@
 """Opt-in regression canary for the official LTX-2.3 checkpoint."""
 
-from __future__ import annotations
-
 import gc
-from pathlib import Path
 
 import mlx.core as mx
 import pytest
 
-from kinomlx.models.ltx2.cache import (
-    ensure_weight_family_caches,
-    weight_family_cache_paths,
-)
-from kinomlx.models.ltx2.settings import LTX2Settings
-from kinomlx.models.ltx2.video_vae.config import VideoVAEConfig
 from kinomlx.models.ltx2.video_vae.loading import load_native_video_vae
-from kinomlx.settings import Settings
+from tests.models.ltx2._source_weights import NO_LTX23_CHECKPOINT, ltx23_checkpoint
 
 
-@pytest.mark.requires_weights
+@pytest.mark.heavy
 def test_real_ltx23_video_vae_round_trip() -> None:
-    checkpoint = LTX2Settings.from_env().weights_path
-    if checkpoint is None or not checkpoint.is_file():
-        pytest.skip("KINO_WEIGHTS_PATH does not name an LTX-2.3 checkpoint file")
+    checkpoint = ltx23_checkpoint()
+    if checkpoint is None:
+        pytest.skip(NO_LTX23_CHECKPOINT)
 
     bundle = None
     video = None
@@ -49,42 +40,5 @@ def test_real_ltx23_video_vae_round_trip() -> None:
         assert mx.any(decoded != 0).item()
     finally:
         del bundle, video, latent, decoded
-        gc.collect()
-        mx.clear_cache()
-
-
-@pytest.mark.requires_weights
-def test_real_ltx23_compatible_family_cache_is_reused_and_loadable() -> None:
-    infrastructure = Settings.from_env()
-    checkpoint = LTX2Settings.from_env().weights_path
-    if checkpoint is None or not checkpoint.is_file():
-        pytest.skip("KINO_WEIGHTS_PATH does not name an LTX-2.3 checkpoint file")
-    cache_file, metadata_file, _payload = weight_family_cache_paths(
-        checkpoint,
-        infrastructure.cache_dir,
-        "video_vae",
-    )
-    if not cache_file.is_file() or not metadata_file.is_file():
-        pytest.skip("KINO_CACHE_DIR does not contain a matching schema-v3 video VAE cache")
-
-    result = ensure_weight_family_caches(
-        checkpoint,
-        families=("video_vae",),
-        cache_mode="auto",
-        cache_root=infrastructure.cache_dir,
-    )
-    assert not result.rebuilt
-    assert result.cache_paths["video_vae"] == cache_file
-
-    bundle = None
-    try:
-        bundle = load_native_video_vae(
-            Path(cache_file),
-            config=VideoVAEConfig.from_checkpoint(checkpoint),
-        )
-        assert bundle.encoder.conv_in.conv.weight.shape == (128, 3, 3, 3, 48)
-        assert bundle.decoder.conv_in.conv.weight.shape == (1024, 3, 3, 3, 128)
-    finally:
-        del bundle
         gc.collect()
         mx.clear_cache()

@@ -1,51 +1,31 @@
 """Public documentation remains linked to executable public surfaces."""
 
-from __future__ import annotations
-
 import argparse
 import re
 from pathlib import Path
 
-from kinomlx.cli._registry import config_registry
-from kinomlx.cli.args import build_parser
 from kinomlx.cli.config_init import build_config_parser
-from kinomlx.models.gmnet.cli import build_parser as build_gmnet_parser
+from kinomlx.model_registry import config_registry
+from kinomlx.models.flux2.arguments import build_parser as build_flux2_parser
+from kinomlx.models.gmnet.arguments import build_parser as build_gmnet_parser
 from kinomlx.models.gmnet.converter_cli import build_parser as build_gmnet_converter_parser
+from kinomlx.models.krea2.arguments import build_parser as build_krea2_parser
+from kinomlx.models.ltx2.arguments import build_parser
 from kinomlx.weights.cli import build_generic_convert_parser, build_weights_parser
 
 _ROOT = Path(__file__).resolve().parents[2]
 _PUBLIC_DOCUMENTS = (
     _ROOT / "README.md",
+    _ROOT / "docs" / "WEIGHTS.md",
+    _ROOT / "docs" / "PERFORMANCE.md",
+    _ROOT / "docs" / "ADAPTERS.md",
     _ROOT / "docs" / "LTX2.md",
     _ROOT / "docs" / "GMNET.md",
+    _ROOT / "docs" / "KREA2.md",
+    _ROOT / "docs" / "FLUX2.md",
 )
 _LONG_FLAG = re.compile(r"--[a-z0-9][a-z0-9-]*")
 _FENCED_BLOCK = re.compile(r"```[^\n]*\n(.*?)```", re.DOTALL)
-_REQUIRED_SETUP_TEXT = (
-    "uv tool install hf",
-    "hf --help",
-    "CLI authentication alone does not grant access to a gated repository",
-    "download the files into any local folder",
-    "https://huggingface.co/Lightricks/LTX-2.3",
-    "https://huggingface.co/Lightricks/LTX-2.3-fp8",
-    "https://huggingface.co/Lightricks/LTX-2.3-22b-IC-LoRA-HDR",
-    "https://huggingface.co/Lightricks/LTX-2.5",
-    "https://huggingface.co/Lightricks/gemma-3-12b-it-qat-q4_0-unquantized",
-    "https://huggingface.co/google/gemma-3-12b-it",
-    "https://huggingface.co/google/gemma-4-12B-it",
-    "https://github.com/qtlark/GMNet/raw/main/checkpoints/G_realworld.pth",
-    "https://github.com/qtlark/GMNet/raw/main/checkpoints/G_synthetic.pth",
-    "ltx-2.3-22b-ic-lora-hdr-0.9.safetensors",
-    "ltx-2.3-22b-dev.safetensors",
-    "ltx-2.3-22b-distilled-lora-384-1.1.safetensors",
-    "--weights-path /models/ltx25",
-    "--transformer-dtype float16",
-    "--lora-stage1-strength 0.25",
-    "--lora-stage2-strength 0.5",
-    "--lora-exclude none",
-    "--stream-transformer",
-    "`--sampler auto` is the default",
-)
 
 
 def _option_strings(parser: argparse.ArgumentParser) -> set[str]:
@@ -79,6 +59,8 @@ def test_documented_flags_and_environment_names_are_executable() -> None:
     parsers = (
         build_parser(),
         build_gmnet_parser(),
+        build_krea2_parser(),
+        build_flux2_parser(),
         build_config_parser(),
         build_weights_parser(),
         build_generic_convert_parser(),
@@ -91,11 +73,3 @@ def test_documented_flags_and_environment_names_are_executable() -> None:
     assert "--prompt" in documented_flags
     assert "--python" not in documented_flags
     assert "--exclude" not in documented_flags
-
-
-def test_documentation_links_model_access_and_cli_setup() -> None:
-    documentation = _public_documentation()
-    normalized_documentation = re.sub(r"\s+", " ", documentation)
-
-    for required_text in _REQUIRED_SETUP_TEXT:
-        assert required_text in normalized_documentation

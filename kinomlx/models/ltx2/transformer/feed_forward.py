@@ -1,8 +1,4 @@
-"""LTX-2 GELU feed-forward network with cache-baked layouts."""
-
-from __future__ import annotations
-
-from typing import cast
+"""LTX-2 GELU feed-forward network with pretransposed weight slots."""
 
 import mlx.core as mx
 
@@ -96,55 +92,6 @@ class FeedForward(nn.Module):
                 f"feed-forward produced width {output.shape[-1]}, expected {self.output_dim}"
             )
         return output.astype(residual_dtype)
-
-    def _pretranspose(self, target: str) -> list[mx.array]:
-        if target == "project_in":
-            layer = self.project_in.proj
-            attribute = "_project_in_weight_t"
-        elif target == "project_out":
-            layer = self.project_out
-            attribute = "_project_out_weight_t"
-        else:
-            raise ValueError(f"unsupported feed-forward layout target: {target}")
-        cached = getattr(self, attribute)
-        if cached is None:
-            if "weight" not in layer:
-                raise ValueError(f"{target} weight is unavailable for pretranspose")
-            cached = mx.contiguous(layer.weight.T)
-            setattr(self, attribute, cached)
-        arrays = [cached]
-        bias = cast(mx.array | None, layer.get("bias"))
-        if bias is not None:
-            arrays.append(bias)
-        return arrays
-
-    def apply_layouts(
-        self,
-        specs: tuple[tuple[str, str], ...],
-    ) -> list[mx.array]:
-        """Materialize selected same-math FF layouts."""
-        arrays: list[mx.array] = []
-        for target, layout in specs:
-            if layout != "pretranspose":
-                raise ValueError(f"unsupported feed-forward layout: {target}:{layout}")
-            arrays.extend(self._pretranspose(target))
-        return arrays
-
-    def drop_layout_sources(self, specs: tuple[tuple[str, str], ...]) -> None:
-        """Release dense source weights replaced by baked layouts."""
-        for target, layout in specs:
-            if target == "project_in":
-                layer = self.project_in.proj
-                cached = self._project_in_weight_t
-            elif target == "project_out":
-                layer = self.project_out
-                cached = self._project_out_weight_t
-            else:
-                raise ValueError(f"unsupported feed-forward layout: {target}:{layout}")
-            if layout != "pretranspose":
-                raise ValueError(f"unsupported feed-forward layout: {target}:{layout}")
-            if cached is not None and "weight" in layer:
-                del layer.weight
 
 
 __all__ = ["FeedForward", "GELUApprox"]

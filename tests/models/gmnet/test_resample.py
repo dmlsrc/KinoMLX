@@ -1,7 +1,5 @@
 """Resampler parity against direct NumPy oracles of the reference kernels."""
 
-from __future__ import annotations
-
 import math
 
 import mlx.core as mx

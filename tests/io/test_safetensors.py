@@ -1,7 +1,5 @@
 """Behavioral tests for ``kinomlx.io.safetensors``."""
 
-from __future__ import annotations
-
 import json
 import struct
 from pathlib import Path
@@ -11,6 +9,7 @@ import pytest
 
 import kinomlx.io.safetensors as safetensors_module
 from kinomlx.io.safetensors import (
+    inspect_safetensors,
     load_weights,
     load_weights_with_metadata,
     read_header,
@@ -72,8 +71,6 @@ def test_save_failure_preserves_previous_safetensors(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    import kinomlx.io.safetensors as safetensors_module
-
     out = tmp_path / "weights.safetensors"
     out.write_bytes(b"previous")
 
@@ -81,7 +78,7 @@ def test_save_failure_preserves_previous_safetensors(
         Path(path).write_bytes(b"partial")
         raise RuntimeError("injected save failure")
 
-    monkeypatch.setattr(safetensors_module.mx, "save_safetensors", fail_after_partial_write)
+    monkeypatch.setattr(mx, "save_safetensors", fail_after_partial_write)
     with pytest.raises(RuntimeError, match="injected save failure"):
         save_weights(out, _sample_weights())
 
@@ -170,6 +167,22 @@ def test_read_u8_tensor_rejects_offsets_beyond_file_payload(tmp_path: Path) -> N
 
     with pytest.raises(ValueError, match="extends beyond the file payload"):
         read_u8_tensor(path, "asset")
+
+
+def test_header_inspection_rejects_oversized_headers_and_payload_gaps(tmp_path: Path) -> None:
+    oversized = tmp_path / "oversized-header.safetensors"
+    oversized.write_bytes(struct.pack("<Q", 100_000_001))
+    with pytest.raises(ValueError, match="header exceeds"):
+        read_header(oversized)
+
+    gap = tmp_path / "payload-gap.safetensors"
+    _write_raw_safetensors(
+        gap,
+        {"asset": {"dtype": "U8", "shape": [1], "data_offsets": [1, 2]}},
+        payload=b"xx",
+    )
+    with pytest.raises(ValueError, match="leaves a gap"):
+        inspect_safetensors(gap)
 
 
 @pytest.mark.parametrize("error_type", [RecursionError, ValueError])

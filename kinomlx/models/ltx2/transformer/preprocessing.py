@@ -1,7 +1,5 @@
 """Input preprocessing for LTX-2 transformer modalities."""
 
-from __future__ import annotations
-
 from collections.abc import Callable
 from dataclasses import replace
 

@@ -1,15 +1,13 @@
 """Distilled joint denoise-loop contracts."""
 
-from __future__ import annotations
-
 import mlx.core as mx
 import pytest
 
 from kinomlx.models.ltx2.denoise import denoise_loop, denoise_step
 from kinomlx.models.ltx2.state import post_process_latent
-from kinomlx.reporting import RecordingReporter
+from kinomlx.models.ltx2.types import LatentState
 from kinomlx.samplers.steps import euler_ancestral_rf_step
-from kinomlx.types import LatentState
+from tests._reporting import RecordingReporter
 
 
 def _state(*, mixed: bool = False) -> LatentState:
@@ -159,3 +157,86 @@ def test_loop_rejects_nonpositive_current_sigmas(sigmas: tuple[float, ...]) -> N
             transformer=_ZeroX0(),
             video_context=mx.zeros((1, 1, 4)),
         )
+
+
+@pytest.mark.parametrize("modality", ["video", "audio"])
+@pytest.mark.parametrize("invalid", [float("nan"), float("inf")])
+def test_nonfinite_step_stops_loop_before_callback(modality, invalid):
+    from kinomlx.models.ltx2.denoise import LTX2DenoiseError
+
+    calls = []
+    callbacks = []
+    reporter = RecordingReporter()
+
+    def transformer(video, audio):
+        calls.append(1)
+        return tuple(
+            mx.full_like(state.latent, invalid if name == modality else 0.0)
+            for name, state in (("video", video), ("audio", audio))
+        )
+
+    with pytest.raises(LTX2DenoiseError, match=f"stage 2, step 1: .*nonfinite {modality}"):
+        denoise_loop(
+            _state(),
+            _state(),
+            (1.0, 0.5, 0.0),
+            transformer=transformer,
+            video_context=mx.zeros((1, 1, 4)),
+            audio_context=mx.zeros((1, 1, 4)),
+            stage=2,
+            reporter=reporter,
+            callback=lambda *args: callbacks.append(args),
+        )
+    assert len(calls) == 1
+    assert callbacks == []
+    assert reporter.events[-1] == ("end", "denoise", {})
+
+
+@pytest.mark.parametrize("video_enabled", [True, False])
+def test_step_checks_only_enabled_modalities(video_enabled):
+    from dataclasses import replace
+
+    from kinomlx.models.ltx2.denoise import LTX2DenoiseError
+
+    bad = replace(_state(), latent=mx.full((1, 2, 3), float("nan")))
+    states = (bad, _state()) if video_enabled else (_state(), bad)
+    kwargs = {
+        "sigma": 1.0,
+        "sigma_next": 0.5,
+        "transformer": _ZeroX0(),
+        "video_context": mx.zeros((1, 1, 4)),
+        "audio_context": mx.zeros((1, 1, 4)),
+    }
+    with pytest.raises(LTX2DenoiseError, match="nonfinite"):
+        denoise_step(*states, **kwargs)
+    denoise_step(*states, **kwargs, video_enabled=not video_enabled, audio_enabled=video_enabled)
+
+
+def test_adapter_weight_scan_is_once_per_retained_transformer_and_restarts_for_new_weights():
+    from kinomlx.adapters.validation import AdapterWeightCheck
+    from kinomlx.modeling.loading import WeightTarget
+
+    reporter = RecordingReporter()
+    model = _ZeroX0()
+    model.weight = mx.ones((2, 2))
+    model.adapter_weight_check = AdapterWeightCheck()
+    model.adapter_weight_check.add("projection.weight", WeightTarget(model, "weight", (2, 2)))
+
+    def run(stage):
+        denoise_loop(
+            _state(),
+            None,
+            (1.0, 0.5, 0.0),
+            transformer=model,
+            video_context=mx.zeros((1, 1, 4)),
+            stage=stage,
+            reporter=reporter,
+        )
+
+    run(1)
+    run(2)
+    assert sum(event[:2] == ("start", "check adapter weights") for event in reporter.events) == 1
+    model.adapter_weight_check = AdapterWeightCheck()
+    model.adapter_weight_check.add("projection.weight", WeightTarget(model, "weight", (2, 2)))
+    run(2)
+    assert sum(event[:2] == ("start", "check adapter weights") for event in reporter.events) == 2

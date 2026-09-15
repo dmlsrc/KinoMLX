@@ -1,6 +1,4 @@
-"""Ownership and prepared-cache contracts for public component leases."""
-
-from __future__ import annotations
+"""Ownership and source-loading contracts for public component leases."""
 
 import weakref
 from dataclasses import replace
@@ -11,9 +9,8 @@ import mlx.core as mx
 import pytest
 
 import kinomlx.models.ltx2.components as components
+from kinomlx.adapters.lora import LoRAConfig
 from kinomlx.components import ComponentLease
-from kinomlx.lora.loading import LoRAConfig
-from kinomlx.models.ltx2.metadata import TransformerConstructorConfig
 from kinomlx.models.ltx2.resources import (
     CheckpointIdentity,
     CheckpointLayout,
@@ -22,10 +19,27 @@ from kinomlx.models.ltx2.resources import (
     ComponentResource,
     LTX2Capabilities,
     LTX2Resources,
-    TransformerCachePolicy,
     TransformerExecutionPolicy,
+    TransformerWeightPolicy,
 )
+from kinomlx.models.ltx2.transformer_config import TransformerConstructorConfig
 from kinomlx.models.ltx2.video_vae.config import LTX23_VIDEO_VAE_CONFIG
+
+
+@pytest.fixture(autouse=True)
+def synthetic_sources(monkeypatch):
+    monkeypatch.setattr(
+        components,
+        "transformer_source_loader",
+        lambda *a, **k: SimpleNamespace(
+            load=lambda _index: {}, prepared_targets={}, streamed_targets=frozenset()
+        ),
+    )
+    monkeypatch.setattr(
+        components,
+        "family_source_weights",
+        lambda resources, kind, **kwargs: resources.require(kind).source_path,
+    )
 
 
 def _transformer_config(generation: str) -> TransformerConstructorConfig:
@@ -65,7 +79,6 @@ def _resources(
     generation: str = "2.3",
 ) -> LTX2Resources:
     checkpoint = tmp_path / "model.safetensors"
-    transformer_cache = tmp_path / "cache-id" / "transformer.safetensors"
     entries = []
     for kind in (
         ComponentKind.TRANSFORMER,
@@ -74,17 +87,11 @@ def _resources(
         ComponentKind.AUDIO_VAE,
         ComponentKind.VOCODER,
     ):
-        cache_path = (
-            transformer_cache
-            if kind is ComponentKind.TRANSFORMER
-            else tmp_path / f"{kind.value}.safetensors"
-        )
         entries.append(
             ComponentResource(
                 kind=kind,
                 source_path=checkpoint,
                 source_fingerprint="checkpoint-fingerprint",
-                cache_path=cache_path,
                 metadata=ComponentMetadata(),
             )
         )
@@ -93,7 +100,6 @@ def _resources(
             kind=ComponentKind.SPATIAL_UPSCALER,
             source_path=tmp_path / "upscaler.safetensors",
             source_fingerprint="upscaler-fingerprint",
-            cache_path=None,
             metadata=ComponentMetadata(),
         )
     )
@@ -107,7 +113,6 @@ def _resources(
                     kind=kind,
                     source_path=tmp_path / filename,
                     source_fingerprint=f"{kind.value}-fingerprint",
-                    cache_path=None,
                     metadata=ComponentMetadata(),
                 )
             )
@@ -133,7 +138,7 @@ def _resources(
             generates_audio=True,
         ),
         dtype_policy=LTX2DTypePolicy.reference(transformer=dtype),
-        cache_policy=TransformerCachePolicy(
+        weight_policy=TransformerWeightPolicy(
             include_audio=True,
             video_ff_layout_specs=(),
             video_ff_layout_layers=(),
@@ -144,7 +149,7 @@ def _resources(
             audio_attn_layout_specs=None,
             audio_attn_layout_layers=None,
             adaln_pretranspose=False,
-            transformer_cache_quantize="off",
+            transformer_quantize="off",
             video_ff_quantize_specs=(),
             video_ff_quantize_layers=(),
             video_ff_quantize_group_size=None,
@@ -159,7 +164,6 @@ def _resources(
             fast_mode=True,
             compile_block_groups=None,
             transformer_compile_group_size=None,
-            mlx_cache_limit_bytes=None,
         ),
         video_vae_config=LTX23_VIDEO_VAE_CONFIG,
         transformer_config=_transformer_config(generation),
@@ -234,7 +238,7 @@ def test_transformer_lease_releases_callback_capture_before_cleanup(
 
     monkeypatch.setattr(components, "LTXAVModel", _ModelFactory)
     monkeypatch.setattr(components, "X0Model", _X0)
-    monkeypatch.setattr(components, "bind_transformer_cache", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(components, "bind_transformer", lambda *_args, **_kwargs: None)
 
     def observe_cleanup() -> None:
         cleanup_observations.append(model_refs[0]() is None)
@@ -249,9 +253,11 @@ def test_transformer_lease_releases_callback_capture_before_cleanup(
     assert model_refs[0]() is None
 
 
-def test_transformer_loader_binds_prepared_cache_and_passes_fp16_owner_explicitly(
+@pytest.mark.parametrize("streamed", [False, True])
+def test_transformer_loader_binds_prepared_weights_and_passes_fp16_owner_explicitly(
     tmp_path: Path,
     monkeypatch,
+    streamed,
 ) -> None:
     plan = _resources(tmp_path, dtype=mx.float16)
     adapter = tmp_path / "adapter.safetensors"
@@ -270,6 +276,18 @@ def test_transformer_loader_binds_prepared_cache_and_passes_fp16_owner_explicitl
             return args, kwargs
 
     model = _Model()
+    model.transformer_block_streamer = SimpleNamespace(on_evaluated=None) if streamed else None
+    monkeypatch.setattr(
+        components,
+        "transformer_source_loader",
+        lambda *args, **kwargs: SimpleNamespace(
+            load=lambda _index: {},
+            prepared_targets={},
+            streamed_targets=frozenset({"transformer_blocks.0.ff.project_out.weight"})
+            if streamed
+            else frozenset(),
+        ),
+    )
 
     class _ModelFactory:
         @staticmethod
@@ -280,8 +298,8 @@ def test_transformer_loader_binds_prepared_cache_and_passes_fp16_owner_explicitl
     monkeypatch.setattr(components, "LTXAVModel", _ModelFactory)
     monkeypatch.setattr(
         components,
-        "bind_transformer_cache",
-        lambda received, path, **kwargs: events.append(("bind", received, path, kwargs)),
+        "bind_transformer",
+        lambda received, **kwargs: events.append(("bind", received, kwargs)),
     )
     monkeypatch.setattr(
         components,
@@ -299,17 +317,19 @@ def test_transformer_loader_binds_prepared_cache_and_passes_fp16_owner_explicitl
     )
 
     bind_event = next(event for event in events if event[0] == "bind")
-    assert bind_event[2] == plan.transformer_cache_path
-    assert bind_event[3]["include_audio"] is True
+    assert callable(bind_event[2]["weight_loader"])
+    assert bind_event[2]["include_audio"] is True
     fuse_event = next(event for event in events if event[0] == "fuse")
-    assert fuse_event[3]["transformer_cache_path"] == plan.transformer_cache_path
+    assert fuse_event[3]["pending"].enabled is True
     assert fuse_event[3]["model_generation"] == "2.3"
+    if streamed:
+        assert callable(model.transformer_block_streamer.on_evaluated)
     lease.close()
     lease.close()
     assert events[-2:] == ["close streamer", "cleanup"]
 
 
-def test_ltx25_transformer_fuses_nonempty_lora_after_cache_binding(
+def test_ltx25_transformer_fuses_nonempty_lora_after_weights_binding(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
@@ -329,7 +349,7 @@ def test_ltx25_transformer_fuses_nonempty_lora_after_cache_binding(
     monkeypatch.setattr(components.LTXAVModel, "from_config", lambda *args, **kwargs: _Model())
     monkeypatch.setattr(
         components,
-        "bind_transformer_cache",
+        "bind_transformer",
         lambda *_args, **_kwargs: events.append("bind"),
     )
     monkeypatch.setattr(
@@ -377,7 +397,7 @@ def test_spatial_upscaler_loads_only_video_vae_statistics(
     assert lease.per_channel_statistics is statistics
     assert events == [
         ("upscaler", plan.spatial_upscaler_path),
-        ("statistics", plan.require(ComponentKind.VIDEO_VAE).cache_path),
+        ("statistics", plan.require(ComponentKind.VIDEO_VAE).source_path),
     ]
     lease.close()
 
@@ -414,7 +434,7 @@ def test_temporal_upscaler_loads_only_video_vae_statistics(
     assert lease.per_channel_statistics is statistics
     assert events == [
         ("upscaler", plan.temporal_upscaler_path),
-        ("statistics", plan.require(ComponentKind.VIDEO_VAE).cache_path),
+        ("statistics", plan.require(ComponentKind.VIDEO_VAE).source_path),
     ]
     lease.close()
 
@@ -495,13 +515,13 @@ def test_split_audio_leases_construct_from_resolved_logical_source(
 
     assert events == [
         ("decoder constructor", audio_source),
-        ("decoder weights", plan.require(ComponentKind.AUDIO_VAE).cache_path),
+        ("decoder weights", plan.require(ComponentKind.AUDIO_VAE).source_path),
         ("vocoder constructor", audio_source),
-        ("vocoder weights", plan.require(ComponentKind.VOCODER).cache_path),
+        ("vocoder weights", plan.require(ComponentKind.VOCODER).source_path),
     ]
 
 
-def test_phase_e_component_leases_each_close_exactly_once(
+def test_component_parity_component_leases_each_close_exactly_once(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
@@ -557,3 +577,81 @@ def test_phase_e_component_leases_each_close_exactly_once(
         lease.close()
 
     assert cleanups == ["cleanup"] * 5
+
+
+def test_family_components_bind_prepared_source_tensors(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    plan = _resources(tmp_path)
+    prepared = {kind: {f"{kind.value}.weight": mx.zeros((1,))} for kind in ComponentKind}
+    events: list[object] = []
+
+    def fake_family_weights(resources, kind, **kwargs):
+        events.append(("select", kind))
+        return prepared[kind]
+
+    class _Model:
+        output_sample_rate = 48_000
+
+        def parameters(self):
+            return ()
+
+    monkeypatch.setattr(components, "family_source_weights", fake_family_weights)
+    monkeypatch.setattr(components, "NativeConv3dVideoEncoder", lambda *a, **k: _Model())
+    monkeypatch.setattr(components, "NativeConv3dVideoDecoder", lambda *a, **k: _Model())
+    monkeypatch.setattr(
+        components,
+        "load_native_vae_encoder_weights",
+        lambda model, source: events.append(("encoder", source)) or 1,
+    )
+    monkeypatch.setattr(
+        components,
+        "load_native_vae_decoder_weights",
+        lambda model, source: events.append(("decoder", source)) or 1,
+    )
+    monkeypatch.setattr(
+        components,
+        "load_native_vae_encoder_statistics",
+        lambda source, **kwargs: (
+            events.append(("statistics", source)) or SimpleNamespace(per_channel_statistics=None)
+        ),
+    )
+    monkeypatch.setattr(components, "_load_spatial_upscaler_model", lambda path, **k: _Model())
+    monkeypatch.setattr(components, "create_audio_decoder_from_checkpoint", lambda p, **k: _Model())
+    monkeypatch.setattr(
+        components,
+        "load_audio_decoder_weights",
+        lambda model, source, **kwargs: events.append(("audio", source)) or 1,
+    )
+    monkeypatch.setattr(components, "create_vocoder_from_checkpoint", lambda p: _Model())
+    monkeypatch.setattr(
+        components,
+        "load_vocoder_weights",
+        lambda model, source, **kwargs: events.append(("vocoder", source)) or 1,
+    )
+    monkeypatch.setattr(components, "_cleanup_mlx", lambda: None)
+
+    for loader in (
+        components.load_video_encoder,
+        components.load_video_decoder,
+        components.load_spatial_upscaler,
+        components.load_audio_decoder,
+        components.load_vocoder,
+    ):
+        with loader(plan):
+            pass
+
+    video = prepared[ComponentKind.VIDEO_VAE]
+    assert events == [
+        ("select", ComponentKind.VIDEO_VAE),
+        ("encoder", video),
+        ("select", ComponentKind.VIDEO_VAE),
+        ("decoder", video),
+        ("select", ComponentKind.VIDEO_VAE),
+        ("statistics", video),
+        ("select", ComponentKind.AUDIO_VAE),
+        ("audio", prepared[ComponentKind.AUDIO_VAE]),
+        ("select", ComponentKind.VOCODER),
+        ("vocoder", prepared[ComponentKind.VOCODER]),
+    ]

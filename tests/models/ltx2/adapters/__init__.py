@@ -1,0 +1,1 @@
+"""LTX-specific adapter tests."""

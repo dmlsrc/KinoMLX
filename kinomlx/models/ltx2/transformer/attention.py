@@ -1,14 +1,12 @@
 """MLX attention backends used by the LTX-2 diffusion transformer."""
 
-from __future__ import annotations
-
 from typing import Protocol, cast
 
 import mlx.core as mx
 
 import kinomlx._mlx_nn as nn
 from kinomlx.kernels import rms_norm as precise_rms_norm
-from kinomlx.kernels.steel_attention import maybe_steel_attention
+from kinomlx.models.ltx2.kernels.steel_attention import maybe_steel_attention
 
 from .rope import LTXRopeType, apply_rotary_emb
 
@@ -240,14 +238,6 @@ def scaled_dot_product_attention(
 class Attention(nn.Module):
     """Multi-head attention with Q/K RMSNorm, split RoPE, and V2 head gates."""
 
-    _LAYOUT_TARGETS = {
-        "to_q": "_to_q_weight_t",
-        "to_k": "_to_k_weight_t",
-        "to_v": "_to_v_weight_t",
-        "to_out": "_to_out_weight_t",
-        "to_gate_logits": "_to_gate_logits_weight_t",
-    }
-
     def __init__(
         self,
         query_dim: int,
@@ -342,50 +332,6 @@ class Attention(nn.Module):
             output = output * gate[..., None]
             output = output.reshape(batch, tokens, self.heads * self.dim_head)
         return _projection(self.to_out, output, self._to_out_weight_t)
-
-    def _pretranspose(self, target: str) -> list[mx.array]:
-        if target not in self._LAYOUT_TARGETS:
-            raise ValueError(f"unsupported attention layout target: {target}")
-        layer = getattr(self, target)
-        if layer is None:
-            return []
-        cache_attribute = self._LAYOUT_TARGETS[target]
-        cached = getattr(self, cache_attribute)
-        if cached is None:
-            if "weight" not in layer:
-                raise ValueError(f"{target} weight is unavailable for pretranspose")
-            cached = mx.contiguous(layer.weight.T)
-            setattr(self, cache_attribute, cached)
-        arrays = [cached]
-        bias = layer.get("bias")
-        if bias is not None:
-            arrays.append(bias)
-        return arrays
-
-    def apply_layouts(
-        self,
-        specs: tuple[tuple[str, str], ...],
-    ) -> list[mx.array]:
-        """Materialize supported same-math attention layouts."""
-        arrays: list[mx.array] = []
-        for target, layout in specs:
-            if layout != "pretranspose":
-                raise ValueError(f"unsupported attention layout: {target}:{layout}")
-            arrays.extend(self._pretranspose(target))
-        return arrays
-
-    def drop_layout_sources(self, specs: tuple[tuple[str, str], ...]) -> None:
-        """Release dense source weights replaced by baked layouts."""
-        for target, layout in specs:
-            if layout != "pretranspose" or target not in self._LAYOUT_TARGETS:
-                raise ValueError(f"unsupported attention layout: {target}:{layout}")
-            layer = getattr(self, target)
-            if (
-                layer is not None
-                and getattr(self, self._LAYOUT_TARGETS[target]) is not None
-                and "weight" in layer
-            ):
-                del layer.weight
 
 
 __all__ = ["Attention", "RMSNorm", "rms_norm", "scaled_dot_product_attention"]

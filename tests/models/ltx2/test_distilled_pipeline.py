@@ -1,6 +1,4 @@
-"""Phase C contracts for the public two-stage distilled recipe."""
-
-from __future__ import annotations
+"""Contracts for the public two-stage distilled recipe."""
 
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -12,9 +10,11 @@ import pytest
 import kinomlx.models.ltx2.conditioning.preparation as condition_preparation
 import kinomlx.models.ltx2.decode as decode_module
 import kinomlx.models.ltx2.pipelines.distilled as distilled
+from kinomlx.adapters.lora import LoRAConfig
 from kinomlx.components import ComponentLease
-from kinomlx.lora.loading import LoRAConfig
 from kinomlx.media.frames import VideoFrameStream
+from kinomlx.memory_policy import MLXMemoryPolicy
+from kinomlx.models.ltx2.adapters.inputs import LTX2AdapterConfig
 from kinomlx.models.ltx2.artifacts import (
     STAGE_1_CONDITIONING,
     STAGE_2_CONDITIONING,
@@ -32,9 +32,9 @@ from kinomlx.models.ltx2.types import (
     VideoVAETilingConfig,
 )
 from kinomlx.models.ltx2.video_vae.config import LTX23_VIDEO_VAE_CONFIG
-from kinomlx.reporting import RecordingReporter
 from kinomlx.samplers.noise import NoiseStreamState
 from kinomlx.types import VideoPixelShape
+from tests._reporting import RecordingReporter
 
 
 @dataclass(frozen=True)
@@ -45,6 +45,8 @@ class _MemoryReceipt:
 
 
 class _Resources:
+    memory_policy = MLXMemoryPolicy()
+
     def __init__(
         self,
         *,
@@ -61,6 +63,7 @@ class _Resources:
         self.capabilities = SimpleNamespace(
             model_generation=generation,
             recipe_families=("distilled",),
+            video_vae_kind="native-conv3d",
             condition_families=("text", "image", "keyframe"),
             generates_audio=True,
             sampler_policy=(
@@ -80,12 +83,12 @@ class _Resources:
             source_fingerprint="checkpoint-fingerprint",
         )
         self.components = ()
-        self.execution_policy = SimpleNamespace(mlx_cache_limit_bytes=None)
+        self.execution_policy = SimpleNamespace(check_adapter_weights=True)
         self.gemma_path = Path("gemma")
         self.weights_path = Path("checkpoint.safetensors")
 
     def require(self, kind: ComponentKind) -> SimpleNamespace:
-        return SimpleNamespace(cache_path=Path(f"{kind.value}.safetensors"))
+        return SimpleNamespace()
 
 
 class _IdentityStatistics:
@@ -98,7 +101,7 @@ class _IdentityStatistics:
 
 class _X0:
     velocity_model = SimpleNamespace(close_streamer=lambda: None)
-    lora_receipts = ()
+    adapter_receipts = ()
 
     def __init__(self, owner: _RecordingComponents, load_index: int, *, fail: bool) -> None:
         self._owner = owner
@@ -451,10 +454,10 @@ def test_default_and_injected_providers_follow_the_same_station_graph(monkeypatc
     default_output.close()
 
 
-def test_public_recipe_applies_cache_limit_before_prompt(monkeypatch) -> None:
+def test_public_recipe_applies_weights_limit_before_prompt(monkeypatch) -> None:
     events = []
     resources = _Resources()
-    resources.execution_policy.mlx_cache_limit_bytes = 1234
+    resources.memory_policy = MLXMemoryPolicy(cache_limit_gb=1234 / 1024**3)
     _patch_operations(monkeypatch)
     monkeypatch.setattr(
         distilled.mx,
@@ -580,6 +583,7 @@ def test_recipe_forwards_the_vae_tiling_policy(monkeypatch) -> None:
     [
         (None, "auto", mx.bfloat16),
         (None, "float32", mx.float32),
+        (None, "float16", mx.float16),
         ("ACESCG", "auto", mx.float32),
         ("ACESCG", "bfloat16", mx.bfloat16),
     ],
@@ -598,7 +602,7 @@ def test_terminal_resolves_recipe_aware_vae_decode_dtype(
         components=(),
         capabilities=base.capabilities,
         dtype_policy=policy,
-        cache_policy=SimpleNamespace(),
+        weight_policy=SimpleNamespace(),
         execution_policy=base.execution_policy,
         video_vae_config=LTX23_VIDEO_VAE_CONFIG,
     )
@@ -815,6 +819,38 @@ def test_generation_output_rejects_invalid_audio_and_closes_frames(
     assert frames.closed
 
 
+def test_generation_output_aggregates_adapter_warnings() -> None:
+    request = DistilledRequest(
+        prompt="test",
+        width=64,
+        height=64,
+        frames=9,
+        generate_audio=False,
+    )
+    frames = VideoFrameStream(
+        lambda: iter(()),
+        spec=distilled.ltx23_sdr_signal(width=64, height=64, fps=request.fps),
+        frame_count=request.frames,
+    )
+
+    output = distilled.build_generation_output(
+        request,
+        _Resources(),
+        frames=frames,
+        waveform=None,
+        sample_rate=None,
+        adapter_receipts=(
+            {
+                "path": "style.safetensors",
+                "warnings": ["low target coverage (20.0%)"],
+            },
+        ),
+    )
+
+    assert output.metadata["warnings"] == ("style.safetensors: low target coverage (20.0%)",)
+    output.close()
+
+
 @pytest.mark.parametrize(
     ("name", "stage_1", "stage_2", "expected"),
     [
@@ -842,9 +878,9 @@ def test_complete_profile_truth_table_for_one_adapter(
             width=64,
             height=64,
             frames=9,
-            lora_paths=(adapter,),
-            lora_stage1_strengths=(stage_1,),
-            lora_stage2_strengths=(stage_2,),
+            adapters=(
+                LTX2AdapterConfig(path=adapter, stage1_strength=stage_1, stage2_strength=stage_2),
+            ),
         ),
     )
 
@@ -878,9 +914,10 @@ def test_equal_strengths_with_different_adapter_paths_reload_pristine(
             width=64,
             height=64,
             frames=9,
-            lora_paths=(first, second),
-            lora_stage1_strengths=(0.5, 0.0),
-            lora_stage2_strengths=(0.0, 0.5),
+            adapters=(
+                LTX2AdapterConfig(path=first, stage1_strength=0.5, stage2_strength=0.0),
+                LTX2AdapterConfig(path=second, stage1_strength=0.0, stage2_strength=0.5),
+            ),
         ),
     )
     assert [_profile_signature(profile) for profile in components.transformer_profiles] == [
@@ -897,7 +934,11 @@ def test_equal_path_and_strength_with_different_exclusions_reloads_pristine(
     adapter.touch()
     stage_1 = (LoRAConfig(adapter, strength=0.5, exclude=("audio",)),)
     stage_2 = (LoRAConfig(adapter, strength=0.5, exclude=("video",)),)
-    monkeypatch.setattr(distilled, "resolve_lora_profiles", lambda _request: (stage_1, stage_2))
+    monkeypatch.setattr(
+        distilled,
+        "resolve_adapter_profiles",
+        lambda _request: (stage_1, stage_2),
+    )
     _output, components = _generate(
         monkeypatch,
         DistilledRequest(prompt="test", width=64, height=64, frames=9),
@@ -921,9 +962,7 @@ def test_distinct_profile_memory_receipt_has_no_transformer_at_upscaler_entry(
             width=64,
             height=64,
             frames=9,
-            lora_paths=(adapter,),
-            lora_stage1_strengths=(0.25,),
-            lora_stage2_strengths=(0.75,),
+            adapters=(LTX2AdapterConfig(path=adapter, stage1_strength=0.25, stage2_strength=0.75),),
         ),
     )
     receipt = components.memory_receipts[0]
@@ -952,8 +991,7 @@ def test_identical_profile_intentionally_keeps_transformer_through_upscale(
             width=64,
             height=64,
             frames=9,
-            lora_paths=(adapter,),
-            lora_strengths=(0.5,),
+            adapters=(LTX2AdapterConfig(path=adapter, strength=0.5),),
         ),
     )
     assert "transformer" in components.memory_receipts[0].active_components
@@ -977,9 +1015,9 @@ def test_transformer_failure_closes_each_active_lease_once(
                 width=64,
                 height=64,
                 frames=9,
-                lora_paths=(adapter,),
-                lora_stage1_strengths=(0.25,),
-                lora_stage2_strengths=(0.75,),
+                adapters=(
+                    LTX2AdapterConfig(path=adapter, stage1_strength=0.25, stage2_strength=0.75),
+                ),
             ),
             _Resources(),
             components=components,
@@ -1022,9 +1060,7 @@ def test_product_recipe_station_failure_closes_every_loaded_component_once(
         height=64,
         frames=9,
         generate_audio=True,
-        lora_paths=(adapter,),
-        lora_stage1_strengths=(0.25,),
-        lora_stage2_strengths=(0.75,),
+        adapters=(LTX2AdapterConfig(path=adapter, stage1_strength=0.25, stage2_strength=0.75),),
     )
     if station == "video iteration":
         output = distilled.generate_distilled(
@@ -1062,9 +1098,7 @@ def test_reporter_records_only_real_transformer_loads(tmp_path, monkeypatch) -> 
             width=64,
             height=64,
             frames=9,
-            lora_paths=(adapter,),
-            lora_stage1_strengths=(0.25,),
-            lora_stage2_strengths=(0.75,),
+            adapters=(LTX2AdapterConfig(path=adapter, stage1_strength=0.25, stage2_strength=0.75),),
         ),
         reporter=reporter,
     )
@@ -1113,15 +1147,13 @@ def test_resolved_profiles_use_canonical_file_identity_and_omit_zero(
     alias = tmp_path / "alias.safetensors"
     adapter.touch()
     alias.symlink_to(adapter)
-    stage_1, stage_2 = distilled.resolve_lora_profiles(
+    stage_1, stage_2 = distilled.resolve_adapter_profiles(
         DistilledRequest(
             prompt="test",
             width=64,
             height=64,
             frames=9,
-            lora_paths=(alias,),
-            lora_stage1_strengths=(0.0,),
-            lora_stage2_strengths=(0.5,),
+            adapters=(LTX2AdapterConfig(path=alias, stage1_strength=0.0, stage2_strength=0.5),),
         )
     )
     assert stage_1 == ()
@@ -1374,7 +1406,7 @@ def test_ltx25_impossible_generated_keyframes_reject_before_any_provider() -> No
     )
 
 
-def test_ltx25_nonempty_lora_profile_reaches_transformer_provider(
+def test_ltx25_nonempty_adapter_profile_reaches_transformer_provider(
     tmp_path,
     monkeypatch,
 ) -> None:
@@ -1387,7 +1419,7 @@ def test_ltx25_nonempty_lora_profile_reaches_transformer_provider(
             width=64,
             height=64,
             frames=9,
-            lora_paths=(adapter,),
+            adapters=(LTX2AdapterConfig(path=adapter),),
         ),
         resources=_Resources(generation="2.5"),
     )
@@ -1424,7 +1456,7 @@ def test_ltx25_cancellation_inside_ancestral_noise_closes_the_transformer_once(
             **_kwargs,
         ):
             if transition == 2:
-                raise RuntimeError("cancelled")
+                raise RuntimeError("canceled")
             return mx.zeros(shape, dtype=dtype)
 
     monkeypatch.setattr(
@@ -1433,7 +1465,7 @@ def test_ltx25_cancellation_inside_ancestral_noise_closes_the_transformer_once(
         lambda _seed, **_kwargs: _CancelNoise(),
     )
     _patch_operations(monkeypatch)
-    with pytest.raises(RuntimeError, match="cancelled"):
+    with pytest.raises(RuntimeError, match="canceled"):
         distilled.generate_distilled(
             DistilledRequest(prompt="test", width=64, height=64, frames=9),
             _Resources(generation="2.5"),
@@ -1514,3 +1546,50 @@ def test_ltx23_recipe_never_constructs_the_ancestral_noise_stream(monkeypatch) -
     )
     output.close()
     assert components.active == set()
+
+
+@pytest.mark.parametrize("kind", ["native-conv3d", "diffusion-na"])
+def test_fp16_vae_admission_uses_selected_decoder_kind(kind) -> None:
+    resources = _Resources(generation="2.5")
+    resources.capabilities.video_vae_kind = kind
+    request = DistilledRequest(prompt="test", frames=9, vae_decode_dtype="float16")
+    if kind == "native-conv3d":
+        with pytest.raises(ValueError, match="requires --video-vae diffusion"):
+            distilled.validate_distilled_request(request, resources, ())
+    else:
+        distilled.validate_distilled_request(request, resources, ())
+
+
+def test_seed_list_reuses_text_and_both_source_geometry_encodings(monkeypatch, tmp_path):
+    from kinomlx.models.ltx2.runner import LTX2Runner
+
+    _patch_operations(monkeypatch)
+    path = tmp_path / "condition.png"
+    path.touch()
+    sizes = []
+
+    def encode_image(_path, _encoder, *, width, height, compute_dtype, **_kwargs):
+        sizes.append((width, height))
+        return mx.ones((1, 128, 1, height // 32, width // 32), dtype=compute_dtype)
+
+    monkeypatch.setattr(condition_preparation, "encode_image", encode_image)
+    components = _RecordingComponents()
+    conditioner = _RecordingTextConditioner()
+    host = LTX2Runner(resources=_Resources(), components=components, text_conditioner=conditioner)
+    request = DistilledRequest(
+        prompt="test",
+        width=64,
+        height=64,
+        frames=9,
+        seeds=(9, 2, 9),
+        image=ImageConditioningConfig(path),
+    )
+    observed = []
+    for output in host.generate(request):
+        observed.append(output.metadata["seed"])
+        output.close()
+    assert observed == [9, 2, 9]
+    assert len(conditioner.calls) == 1
+    assert sizes == [(32, 32), (64, 64)]
+    assert len(components.transformers) == 3
+    assert not components.active

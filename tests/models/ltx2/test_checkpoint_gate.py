@@ -1,7 +1,5 @@
 """Generation-neutral transformer metadata and constructor gating."""
 
-from __future__ import annotations
-
 import json
 from pathlib import Path
 
@@ -138,7 +136,8 @@ def test_checkpoint_gate_accepts_25_constructor_without_filename_or_version_gate
 
     assert parsed.model_generation == "2.5"
     assert parsed.declared_model_version == "community-metadata"
-    assert parsed.transformer.cache_identity() != ()
+    assert parsed.transformer.ff_bias is False
+    assert parsed.transformer.use_keyframes_abs_pos_embedding is True
 
 
 def test_checkpoint_gate_records_absent_semantic_version(monkeypatch) -> None:

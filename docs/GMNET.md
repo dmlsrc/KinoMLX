@@ -1,20 +1,23 @@
 # GMNet Model Guide
 
-This document owns the setup, checkpoint conversion, command-line, variant,
-output, sidecar, and library API reference for KinoMLX's `gmnet` model class.
-For the project overview and shared installation, see the
-[root README](../README.md). LTX2 has a separate [model guide](LTX2.md).
+Use GMNet to expand an SDR photograph into an HDR still. This guide covers the
+one-time weight conversion, realworld/synthetic model choice, output formats,
+and Python API. Start with the [shared installation](../README.md#install).
 
 GMNet ("Learning Gain Map for Inverse Tone Mapping", ICLR 2025) predicts a gain
 map plus a Qmax scalar from one display-referred SDR still. KinoMLX reconstructs
 a normalized scene-linear HDR image and can publish a half-float EXR master,
 10-bit BT.2100 PQ HEIC, and self-describing gain-map sidecar as one transaction.
 
+In this guide: [model weights](#model-weights), [generation](#usage),
+[output files](#output-selection-and-publication), [Python API](#library-api),
+and [limitations](#limitations).
+
 ## Status
 
-The published `realworld` and `synthetic` checkpoints are both implemented and
-tested. Native ImageIO owns input and output; the model path does not depend on
-PyTorch, NumPy, Pillow, or the Hugging Face runtime.
+Both `realworld` and `synthetic` checkpoints are supported. Input and output use
+native macOS image handling; you do not need PyTorch, NumPy, Pillow, or Hugging
+Face packages to run the model.
 
 | Model | Input and output | Public recipe | Runner |
 | --- | --- | --- | --- |
@@ -70,19 +73,19 @@ kinomlx weights convert gmnet G_realworld.pth
 kinomlx weights convert gmnet G_synthetic.pth
 ```
 
-The first conversion creates the canonical file; use `--force` only when
-deliberately reconverting that same destination. In an editable Git checkout,
-canonical converted weights stay beside the model-owned conversion notes at
+Conversion creates a reusable safetensors file; use `--force` only when
+deliberately replacing that destination. In an editable Git checkout,
+converted weights are saved under
 `kinomlx/models/gmnet/weights/`. In a non-checkout install, the default is
-`$KINO_CACHE_DIR/weights/gmnet/`, so conversion never assumes the installed
+`~/Library/Caches/KinoMLX/weights/gmnet/`, so conversion never assumes the installed
 package is writable. An explicit converter `--output` or runtime
-`KINO_GMNET_WEIGHTS`/`--weights-path` override wins in either layout.
+`KINO_GMNET_WEIGHTS_PATH`/`--weights-path` override wins in either layout.
 
-The model-specific converter statically scans the embedded pickle, rebuilds
-tensors through a restricted torch-free reader, requires the complete generator
-state dict, stamps variant and source metadata, and verifies the result through
-the GMNet loader. Outputs refuse to clobber existing files unless `--force` is
-explicit, and a candidate is verified before a forced replacement is published.
+Use the GMNet converter for the published GMNet files: it checks the variant,
+requires all generator weights, and verifies that the result can load before
+publishing it. It reads tensor data through a restricted reader without executing
+the checkpoint's Python code or requiring PyTorch. With `--force`, verification
+still happens before the existing destination is replaced.
 
 KinoMLX also has a value- and layout-preserving converter for plain tensor state
 dicts:
@@ -116,7 +119,7 @@ kinomlx --model gmnet --variant synthetic \
 
 The variant follows the usual precedence:
 `KINO_GMNET_VARIANT`, TOML `[model_settings].variant`, `--variant`, then
-`--set model_settings.variant=...`. `KINO_GMNET_WEIGHTS` and `--weights-path`
+`--set model_settings.variant=...`. `KINO_GMNET_WEIGHTS_PATH` and `--weights-path`
 override the converted-weights location.
 
 Those 203-nit and 100-nit figures describe each checkpoint's training and
@@ -130,26 +133,34 @@ image-to-video; see the [LTX2 HDR contract](LTX2.md#hdr-generation).
 
 ### Output selection and publication
 
-Without an exact `--output`, GMNet derives the input stem and writes both EXR
-and HEIC under `outputs/`. An exact `.exr` or `.heic` path selects exactly that
-primary artifact; add `--heic` or `--exr` to request its sibling explicitly.
+Without an exact `--output`, GMNet uses `<input-stem>_YYYYMMDD_HHMMSS` and writes
+both EXR and HEIC, following the
+[shared app output naming policy](../README.md#output-names-and-sidecars).
+`--output-prefix` replaces the input stem but keeps the timestamp. The directory
+defaults to `KINO_GMNET_OUTPUT_DIR`, then `KINO_OUTPUT_DIR`, then `outputs/`.
+`--output-dir` overrides it.
+Same-second collisions add `_2`, `_3`, and so on to the whole bundle's stem.
+An exact `.exr` or `.heic` path selects exactly that primary artifact without
+a timestamp; add `--heic` or `--exr` to request its sibling explicitly.
 `--save-gain-map` adds a safetensors sidecar carrying the normalized gain map
 and its reconstruction law.
 
-All selected targets are reserved before inference with hidden
-`.<name>.kinomlx-reservation` peers rather than zero-byte final artifacts. Every
-artifact is completed in a private peer directory, and the bundle is published
-together. Existing artifacts remain untouched on an encoder or publication
-failure, including forced replacements. If a process is terminated without
-cleanup, the next refusal names the stale marker that the user can inspect and
-remove after confirming no run is active.
+KinoMLX protects existing outputs and prepares all requested files before publishing
+them together. An ordinary encoding or publication failure leaves previous files
+intact, including when using `--force`.
+
+If a run is terminated without cleanup, its reserved output name may remain occupied.
+Generated filenames skip that name automatically. For an exact output path, the error
+identifies a hidden `.<name>.kinomlx-reservation` marker. Confirm that no run is still
+using the output before removing the named stale marker and retrying.
 
 GMNet exposes `--save-effective-config`, `--save-console-log`, and
 `--save-run-log` individually. `--save-all-sidecars` enables all three plus the
 normalized gain map. They share the resolved output stem and join the
-pre-inference target reservation, so an existing selected sidecar is refused
-alongside an existing EXR or HEIC. `--force` explicitly authorizes replacement
-of the complete selected bundle.
+pre-inference target reservation. A collision with any selected artifact or
+sidecar advances the entire generated stem. With an exact `--output`, existing
+targets are refused unless `--force` explicitly authorizes replacement of the
+complete selected bundle.
 
 The model scalar can select GMNet from TOML without a CLI `--model` flag:
 
@@ -176,19 +187,19 @@ plan:
 ```python
 from pathlib import Path
 
-from kinomlx import (
+from kinomlx import Settings
+from kinomlx.models.gmnet import (
     GMNetOutputConfig,
     GMNetOutputSink,
     GMNetRequest,
     GMNetRunner,
     GMNetSettings,
-    Settings,
     expand_gmnet,
     plan_gmnet_output,
-    prepare_gmnet_resources,
+    prepare_resources,
 )
 
-resources = prepare_gmnet_resources(
+resources = prepare_resources(
     GMNetSettings.from_env(),
     infrastructure=Settings.from_env(),
 )
@@ -229,3 +240,20 @@ not redistribute the checkpoints.
 KinoMLX's own code is [MIT-licensed](../LICENSE). See
 [THIRD_PARTY_LICENSES.md](../THIRD_PARTY_LICENSES.md) for included license texts
 and notices.
+
+Installed-package conversion storage and native signpost builds use
+`--app-cache-dir` / `settings.app_cache_dir`. The environment lookup order is
+`KINO_APP_CACHE_DIR`, then `XDG_CACHE_HOME/KinoMLX`, then
+`~/Library/Caches/KinoMLX`.
+Conversion remains an explicit manual command; normal generation never opens
+a pickle checkpoint. Editable checkout weights remain beside the model code.
+
+### Memory policy for API calls
+
+The runner and public recipe functions apply the resource inventory's shared
+memory policy before model work. Set `mlx_cache_limit_gb` and
+`mlx_wired_limit_gb` through infrastructure `Settings`. Reusing resources
+preserves those choices; each invocation reapplies them. For standalone
+component loading, call `kinomlx.apply_memory_policy(resources.memory_policy)`
+before allocating inputs or loading weights. See
+[public API memory policy](PERFORMANCE.md#public-api-memory-policy).

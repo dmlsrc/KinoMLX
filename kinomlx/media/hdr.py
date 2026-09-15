@@ -6,8 +6,6 @@ All operations retain float32 scene-linear values until a terminal chooses a
 delivery representation.
 """
 
-from __future__ import annotations
-
 import mlx.core as mx
 
 from .signals import ColorPrimaries, ColorTransfer, UnsupportedSignalError

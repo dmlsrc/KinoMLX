@@ -1,22 +1,23 @@
 """Hostile checkpoint metadata is refused before it controls MLX work."""
 
-from __future__ import annotations
-
 import io
 import pickle
 import sys
 import zipfile
 from collections import OrderedDict, defaultdict
+from typing import ClassVar
 
 import pytest
 
 import kinomlx.weights.torch_checkpoint as checkpoint_module
-from kinomlx.weights.torch_checkpoint import (
-    CheckpointReadLimits,
+from kinomlx.weights.pickle_scan import (
     RestrictedCheckpointError,
-    load_restricted_checkpoint,
     scan_pickle_globals,
     suspicious_globals,
+)
+from kinomlx.weights.torch_checkpoint import (
+    CheckpointReadLimits,
+    load_restricted_checkpoint,
 )
 from tests.models.gmnet.test_convert import (
     _FakeStorage,
@@ -219,7 +220,7 @@ def test_recursive_unpickler_failure_is_reported_as_a_typed_refusal(
         archive.writestr("archive/data.pkl", pickle.dumps({}))
 
     class RecursiveUnpickler:
-        storage_meta = {}
+        storage_meta: ClassVar[dict[str, object]] = {}
 
         def load(self):
             raise RecursionError("maximum recursion depth exceeded")

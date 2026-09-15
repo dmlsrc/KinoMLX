@@ -1,7 +1,5 @@
 """LTX-2.5 diffusion video decoder graph and binding tests."""
 
-from __future__ import annotations
-
 import math
 
 import mlx.core as mx
@@ -361,3 +359,24 @@ def test_loader_requires_every_target_folds_gates_and_receipts_baggage() -> None
         weights["per_channel_statistics.mean-of-means"],
     ).item()
     assert math.isfinite(float(mx.sum(target.conv_out.weight).item()))
+
+
+def test_fp16_loader_casts_bf16_parameters_and_streaming_decode_stays_finite() -> None:
+    mx.random.seed(42)
+    source = NativeDiffusionVideoDecoder(_mini_config(), compute_dtype=mx.bfloat16)
+    source.set_dtype(mx.bfloat16)
+    weights = {
+        f"decoder.{_checkpoint_key(key)}": value
+        for key, value in tree_flatten(source.parameters())
+        if not key.startswith("per_channel_statistics.")
+    }
+    weights["per_channel_statistics.mean-of-means"] = mx.zeros((8,), dtype=mx.bfloat16)
+    weights["per_channel_statistics.std-of-means"] = mx.ones((8,), dtype=mx.bfloat16)
+    target = NativeDiffusionVideoDecoder(_mini_config(), compute_dtype=mx.float16)
+    load_diffusion_video_decoder_weights(target, weights)
+    assert all(value.dtype == mx.float16 for _, value in tree_flatten(target.parameters()))
+    latent = mx.zeros((1, 8, 2, 1, 1), dtype=mx.bfloat16)
+    chunks = tuple(decode_streaming(latent, target, TilingConfig(), seed=42))
+    assert sum(chunk.shape[2] for chunk in chunks) == 9
+    assert all(chunk.dtype == mx.float16 for chunk in chunks)
+    assert all(mx.all(mx.isfinite(chunk)).item() for chunk in chunks)

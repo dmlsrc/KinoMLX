@@ -29,8 +29,6 @@ The stacked progress-bar primitives are injected by the caller (KinoMLX
 uses a rich-based UI); the VT encoder no longer imports them directly.
 """
 
-from __future__ import annotations
-
 from .audio import AudioTrack
 from .cut_detect import CutDetector
 from .encode import FrameSource, ProgressStack, encode_video_videotoolbox
@@ -45,9 +43,9 @@ __all__ = [
     "CutDetector",
     "FrameSource",
     "ProgressStack",
-    "VsrSession",
-    "VtfrcSession",
     "VideoToolboxError",
     "VideoToolboxUnavailableError",
+    "VsrSession",
+    "VtfrcSession",
     "encode_video_videotoolbox",
 ]

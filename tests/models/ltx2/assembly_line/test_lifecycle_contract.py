@@ -1,7 +1,5 @@
 """Component lifetime, failure cleanup, and lazy-frame ownership contracts."""
 
-from __future__ import annotations
-
 from ._contracts import (
     AdapterSpec,
     ContractResources,

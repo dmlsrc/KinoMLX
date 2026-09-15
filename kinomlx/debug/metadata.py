@@ -1,17 +1,18 @@
 """Paths and structured metadata for reproducible generation sidecars."""
 
-from __future__ import annotations
-
 import json
 import shlex
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 
+from kinomlx.config.persistence import RUN_SCHEMA_VERSION, configuration_payload
+from kinomlx.config.provenance import PreparedConfig
 from kinomlx.errors import KinoMLXError
 from kinomlx.io.atomic import write_text_atomic, write_text_exclusive
 from kinomlx.reporting import TimingReporter
+from kinomlx.restart_selection import PLANNED_IMAGE_COUNT
 
 
 class SidecarError(KinoMLXError, RuntimeError):
@@ -178,27 +179,41 @@ class RunRecord:
         path: Path,
         *,
         model: str,
-        invocation: Mapping[str, object],
+        effective_config: Mapping[str, object],
+        config_intent: PreparedConfig,
         argv: list[str],
         timings: TimingReporter,
-        planned_outputs: Mapping[str, str],
+        planned_outputs: Mapping[str, object],
         sidecar_errors: list[dict[str, str]] | None = None,
         preexisting_sidecars: Mapping[str, str] | None = None,
         restart: Mapping[str, object] | None = None,
+        planned_image_count: int | None = None,
+        planned_generation: Mapping[str, object] | None = None,
     ) -> None:
         self.path = path
         self._timings = timings
         self._sidecar_errors = sidecar_errors if sidecar_errors is not None else []
         self._payload: dict[str, object] = {
-            "schema_version": 1,
+            "schema_version": RUN_SCHEMA_VERSION,
             "status": "started",
             "started_at": datetime.now(UTC).isoformat(),
             "model": model,
             "argv": list(argv),
-            "invocation": dict(invocation),
+            "configuration": configuration_payload(model, config_intent),
+            "effective_config": dict(effective_config),
             "planned_outputs": dict(planned_outputs),
             "preexisting_sidecars": dict(preexisting_sidecars or {}),
         }
+        # A multi-image run keys every per-image digest by this count, so the
+        # record carries it from the start and a canceled run keeps its
+        # restart identity.
+        if planned_image_count is not None:
+            self._payload[PLANNED_IMAGE_COUNT] = planned_image_count
+        # The identity of each planned image is known before sampling. Recording
+        # it now is what lets a canceled run be restarted for the images it did
+        # finish; a completed run replaces this block with its full receipt.
+        if planned_generation is not None:
+            self._payload["generation"] = dict(planned_generation)
         if restart is not None:
             self._payload["restart"] = dict(restart)
         self.write(status="started")
@@ -213,6 +228,7 @@ class RunRecord:
         generation: Mapping[str, object] | None = None,
         diagnostics: Mapping[str, object] | None = None,
         stale_sidecars: Mapping[str, str] | None = None,
+        warnings: Sequence[str] | None = None,
         error: str | None = None,
     ) -> None:
         """Persist the latest status without discarding the start metadata."""
@@ -235,6 +251,8 @@ class RunRecord:
             self._payload["diagnostics"] = dict(diagnostics)
         if stale_sidecars is not None:
             self._payload["stale_sidecars"] = dict(stale_sidecars)
+        if warnings is not None:
+            self._payload["warnings"] = list(warnings)
         if error is not None:
             self._payload["error"] = error
         try:

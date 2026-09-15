@@ -1,7 +1,5 @@
 """Typed CLI/TOML resolution and precedence tests."""
 
-from __future__ import annotations
-
 import json
 import tomllib
 from concurrent.futures import ThreadPoolExecutor
@@ -10,21 +8,16 @@ from pathlib import Path
 
 import pytest
 
-from kinomlx.cli._registry import CONFIG_CONTROL_DESTINATIONS, config_registry
-from kinomlx.cli.args import build_parser
-from kinomlx.cli.config import (
-    assemble,
-    build_timestamped_output_path,
-    resolve_for_execution,
-    validate_for_execution,
-)
+from kinomlx.cli._registry import CONFIG_CONTROL_DESTINATIONS
 from kinomlx.config import (
     ConfigError,
-    ConfigGroup,
     dump_config,
     load_config,
-    normalize_output_selection,
 )
+from kinomlx.io.reservation import PathReservation
+from kinomlx.model_registry import config_registry
+from kinomlx.models.flux2.config_schema import CONFIG_SCHEMA
+from kinomlx.models.ltx2.arguments import build_parser
 from kinomlx.models.ltx2.artifacts import (
     FINAL_LATENTS,
     STAGE_1_CONDITIONING,
@@ -33,8 +26,14 @@ from kinomlx.models.ltx2.artifacts import (
     TEXT_CONDITIONING,
     requested_artifacts,
 )
+from kinomlx.models.ltx2.config import (
+    assemble,
+    resolve_for_execution,
+    validate_for_execution,
+)
+from kinomlx.models.ltx2.config_groups import LTX2ConfigGroup
+from kinomlx.models.ltx2.output_config import sidecar_selection
 from kinomlx.models.ltx2.settings import LTX2Settings
-from kinomlx.models.ltx2.types import DistilledRequest
 from kinomlx.settings import Settings
 
 
@@ -50,7 +49,9 @@ def test_config_path_expansion_failure_is_typed(monkeypatch) -> None:
 
 
 def test_output_normalization_emits_an_explicit_exact_path_tombstone() -> None:
-    normalized = normalize_output_selection({"output": {"directory": "renders", "prefix": "clip"}})
+    normalized = CONFIG_SCHEMA.normalize_layer(
+        {"output": {"directory": "renders", "prefix": "clip"}}
+    )
 
     assert normalized["output"] == {
         "directory": "renders",
@@ -60,7 +61,7 @@ def test_output_normalization_emits_an_explicit_exact_path_tombstone() -> None:
 
 
 def test_same_layer_exact_output_still_wins_over_generated_names() -> None:
-    normalized = normalize_output_selection(
+    normalized = CONFIG_SCHEMA.normalize_layer(
         {
             "output": {
                 "path": "exact.mp4",
@@ -177,24 +178,17 @@ def test_registry_semantic_groups_point_only_at_typed_ltx2_fields() -> None:
     schema = config_registry().model("ltx2")
     model_fields = LTX2Settings.__dataclass_fields__
     for group in (
-        ConfigGroup.MODEL_SOURCE,
-        ConfigGroup.MODEL_MONOLITHIC_SOURCE,
-        ConfigGroup.MODEL_SPLIT_SOURCE,
-        ConfigGroup.MODEL_GEMMA_SOURCE,
-        ConfigGroup.MODEL_TEXT_ENCODER_SOURCE,
-        ConfigGroup.MODEL_GENERATION_SELECTOR,
-        ConfigGroup.MODEL_VIDEO_VAE_SELECTOR,
-        ConfigGroup.MODEL_VIDEO_VAE_SOURCE,
+        LTX2ConfigGroup.MODEL_SOURCE,
+        LTX2ConfigGroup.MODEL_MONOLITHIC_SOURCE,
+        LTX2ConfigGroup.MODEL_SPLIT_SOURCE,
+        LTX2ConfigGroup.MODEL_GEMMA_SOURCE,
+        LTX2ConfigGroup.MODEL_TEXT_ENCODER_SOURCE,
+        LTX2ConfigGroup.MODEL_GENERATION_SELECTOR,
+        LTX2ConfigGroup.MODEL_VIDEO_VAE_SELECTOR,
+        LTX2ConfigGroup.MODEL_VIDEO_VAE_SOURCE,
     ):
         assert schema.cli_destinations_in_group(group)
         assert set(schema.cli_destinations_in_group(group)) <= set(model_fields)
-    request_fields = DistilledRequest.__dataclass_fields__
-    for group in (
-        ConfigGroup.RESTART_DECODE_LOCKED,
-        ConfigGroup.RESTART_STAGE2_LOCKED,
-    ):
-        assert schema.cli_destinations_in_group(group)
-        assert set(schema.cli_destinations_in_group(group)) <= set(request_fields)
 
 
 def test_hdr_reference_cli_builds_one_typed_generation_request(tmp_path: Path) -> None:
@@ -532,13 +526,13 @@ def test_reference_aligned_audio_flag_resolves_on_the_public_request() -> None:
 
 def test_config_settings_override_environment_derived_base(tmp_path: Path) -> None:
     config = tmp_path / "run.toml"
-    config.write_text('[settings]\ncache_dir = "from-config"\n', encoding="utf-8")
+    config.write_text('[settings]\napp_cache_dir = "from-config"\n', encoding="utf-8")
     options = build_parser().parse_args(["--config", str(config), "--print-config"])
     invocation = assemble(
         options,
-        base_settings=Settings(cache_dir=Path("from-env")),
+        base_settings=Settings(),
     )
-    assert invocation.settings.cache_dir == Path("from-config")
+    assert invocation.settings.app_cache_dir == Path("from-config")
 
 
 def test_nested_image_config_can_be_partly_overridden_from_cli(tmp_path: Path) -> None:
@@ -649,7 +643,7 @@ def test_auto_duration_rejects_non_boolean_config_values(tmp_path: Path) -> None
         '[generate]\nprompt = "test"\nauto_duration = "yes"\n',
         encoding="utf-8",
     )
-    with pytest.raises(ConfigError, match="auto_duration must be a boolean"):
+    with pytest.raises(ConfigError, match="auto_duration: expected bool"):
         assemble(
             build_parser().parse_args(["--config", str(config), "--print-config"]),
             base_settings=Settings(),
@@ -840,18 +834,29 @@ def test_nested_image_schema_preserves_specific_validation_error(tmp_path: Path)
         encoding="utf-8",
     )
     options = build_parser().parse_args(["--config", str(config)])
-    with pytest.raises(ConfigError, match="image strength must be between 0 and 1"):
+    with pytest.raises(
+        ConfigError, match=r"\[generate\.image\]\.strength: must be between 0 and 1"
+    ):
         assemble(options, base_settings=Settings())
 
 
-def test_invalid_geometry_and_settings_are_typed_config_errors(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("contents", "message"),
+    [
+        ("[generate]\nwidth = 1000\n", "width"),
+        ("[settings]\nmlx_cache_limit_gb = -1\n", "mlx_cache_limit_gb"),
+    ],
+)
+def test_invalid_geometry_and_settings_are_typed_config_errors(
+    tmp_path: Path, contents, message
+) -> None:
     config = tmp_path / "run.toml"
     config.write_text(
-        "[generate]\nwidth = 1000\n[settings]\nmlx_cache_limit_gb = -1\n",
+        contents,
         encoding="utf-8",
     )
     options = build_parser().parse_args(["--config", str(config)])
-    with pytest.raises(ConfigError, match="mlx_cache_limit_gb"):
+    with pytest.raises(ConfigError, match=message):
         assemble(options, base_settings=Settings())
 
 
@@ -980,7 +985,7 @@ def test_output_flags_resolve_exact_or_timestamped_paths(tmp_path: Path) -> None
                 "--output-dir",
                 str(tmp_path),
                 "--output-prefix",
-                "kitten test!",
+                "sample render!",
             ]
         ),
         base_settings=Settings(),
@@ -989,7 +994,7 @@ def test_output_flags_resolve_exact_or_timestamped_paths(tmp_path: Path) -> None
         generated_invocation,
         now=datetime(2026, 8, 17, 19, 4, 5),
     )
-    expected = tmp_path / "kitten_test_20260817_190405.mp4"
+    expected = tmp_path / "sample_render_20260817_190405.mp4"
     assert resolved.output.path == expected
     assert resolved.generated_output
     assert expected.read_bytes() == b""
@@ -999,7 +1004,7 @@ def test_output_flags_resolve_exact_or_timestamped_paths(tmp_path: Path) -> None
         generated_invocation,
         now=datetime(2026, 8, 17, 19, 4, 5),
     )
-    second = tmp_path / "kitten_test_20260817_190405_2.mp4"
+    second = tmp_path / "sample_render_20260817_190405_2.mp4"
     assert collision.output.path == second
     assert collision.generated_output
     assert second.read_bytes() == b""
@@ -1091,19 +1096,21 @@ def test_hdr_heic_frame_dump_never_reuses_an_existing_path(tmp_path: Path) -> No
     assert resolved.output.path == tmp_path / "result_20260817_190405_2.mp4"
 
 
-def test_timestamped_output_defaults_match_cli_contract(monkeypatch) -> None:
+def test_timestamped_output_defaults_match_cli_contract(monkeypatch, tmp_path) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("KINO_LTX2_OUTPUT_DIR", raising=False)
     monkeypatch.delenv("KINO_OUTPUT_DIR", raising=False)
     invocation = assemble(
         build_parser().parse_args(["--prompt", "test"]),
         base_settings=Settings(),
     )
     assert invocation.output.directory == Path("outputs")
-    assert invocation.output.prefix == "kinomlx"
-    assert build_timestamped_output_path(
-        invocation.output.directory,
-        invocation.output.prefix,
+    assert invocation.output.prefix is None
+    resolved = resolve_for_execution(
+        invocation,
         now=datetime(2026, 8, 17, 1, 2, 3),
-    ) == Path("outputs/kinomlx_20260817_010203.mp4")
+    )
+    assert resolved.output.path == Path("outputs/ltx2-distilled-seed42_20260817_010203.mp4")
 
 
 def test_concurrent_timestamped_output_reservations_are_unique(tmp_path: Path) -> None:
@@ -1141,8 +1148,38 @@ def test_concurrent_timestamped_output_reservations_are_unique(tmp_path: Path) -
     assert all(path.read_bytes() == b"" for path in paths)
 
 
+@pytest.mark.parametrize("suffix", ["_run.json", "_text.safetensors", ".safetensors", ".wav"])
+@pytest.mark.parametrize("reserved", [False, True])
+def test_timestamped_video_skips_a_stem_with_sidecars_but_no_video(
+    tmp_path: Path,
+    suffix: str,
+    reserved: bool,
+) -> None:
+    invocation = assemble(
+        build_parser().parse_args(
+            ["--prompt", "test", "--output-dir", str(tmp_path), "--output-prefix", "result"]
+        ),
+        base_settings=Settings(),
+    )
+    existing = tmp_path / f"result_20260817_190405{suffix}"
+    marker = PathReservation.acquire(existing) if reserved else None
+    if not reserved:
+        existing.write_bytes(b"earlier run")
+    try:
+        resolved = resolve_for_execution(invocation, now=datetime(2026, 8, 17, 19, 4, 5))
+        assert resolved.output.path == tmp_path / "result_20260817_190405_2.mp4"
+        assert not (tmp_path / "result_20260817_190405.mp4").exists()
+        if marker is not None:
+            assert marker.active
+        else:
+            assert existing.read_bytes() == b"earlier run"
+    finally:
+        if marker is not None:
+            marker.release()
+
+
 def test_output_directory_environment_and_cli_precedence(monkeypatch) -> None:
-    monkeypatch.setenv("KINO_OUTPUT_DIR", "/from/kino")
+    monkeypatch.setenv("KINO_LTX2_OUTPUT_DIR", "/from/kino")
     from_environment = assemble(
         build_parser().parse_args(["--print-config"]),
         base_settings=Settings(),
@@ -1211,15 +1248,45 @@ def test_parser_does_not_accept_abbreviated_flags() -> None:
         build_parser().parse_args(["--prom", "test"])
 
 
-def test_lora_cli_arrays_and_prompt_padding_land_in_pipeline_config() -> None:
+def test_adapter_cli_records_and_prompt_padding_land_in_pipeline_config() -> None:
     options = build_parser().parse_args(
         [
             "--prompt",
             "test",
+            "--adapter",
+            "style.safetensors",
+            "--adapter",
+            "motion.safetensors",
+            "--adapter-strength",
+            "0.5",
+            "--adapter-stage1-strength",
+            "0.25",
+            "--adapter-stage2-strength",
+            "1.0",
+            "--adapter-exclude",
+            "audio,cross",
+            "--compact-prompt",
+            "--print-config",
+        ]
+    )
+    invocation = assemble(options, base_settings=Settings())
+    first, second = invocation.request.resolved_adapters()
+    assert (first.path, first.strength, first.exclude) == (Path("style.safetensors"), 1.0, ())
+    assert (second.path, second.strength, second.exclude) == (
+        Path("motion.safetensors"),
+        0.5,
+        ("audio", "cross"),
+    )
+    assert second.stage_1_strength == 0.25
+    assert second.stage_2_strength == 1.0
+    assert invocation.request.pad_prompt_to_max is False
+
+
+def test_lora_cli_spellings_are_adapter_aliases() -> None:
+    options = build_parser().parse_args(
+        [
             "--lora",
             "style.safetensors",
-            "--lora",
-            "motion.safetensors",
             "--lora-strength",
             "0.5",
             "--lora-stage1-strength",
@@ -1228,49 +1295,18 @@ def test_lora_cli_arrays_and_prompt_padding_land_in_pipeline_config() -> None:
             "1.0",
             "--lora-exclude",
             "audio,cross",
-            "--compact-prompt",
             "--print-config",
         ]
     )
-    invocation = assemble(options, base_settings=Settings())
-    assert invocation.request.lora_paths == (
-        Path("style.safetensors"),
-        Path("motion.safetensors"),
-    )
-    assert invocation.request.lora_strengths == (0.5,)
-    assert invocation.request.lora_stage1_strengths == (0.25,)
-    assert invocation.request.lora_stage2_strengths == (1.0,)
-    assert invocation.request.lora_exclusions == ("audio,cross",)
-    assert invocation.request.pad_prompt_to_max is False
-
-
-@pytest.mark.parametrize(
-    "flag",
-    ["--stage2-lora-fuse-mode", "--lora-stage2-fuse-mode"],
-)
-def test_removed_stage_transition_cli_aliases_are_rejected(flag: str) -> None:
-    with pytest.raises(SystemExit):
-        build_parser().parse_args([flag, "delta", "--print-config"])
-
-
-def test_removed_stage_transition_toml_and_set_fields_are_unknown(tmp_path: Path) -> None:
-    config = tmp_path / "stale.toml"
-    config.write_text(
-        '[generate]\nprompt = "test"\nstage2_lora_fuse_mode = "delta"\n',
-        encoding="utf-8",
-    )
-    with pytest.raises(ConfigError, match="unknown field 'stage2_lora_fuse_mode'"):
-        assemble(
-            build_parser().parse_args(["--config", str(config), "--print-config"]),
-            base_settings=Settings(),
-        )
-    with pytest.raises(ConfigError, match="unknown field 'stage2_lora_fuse_mode'"):
-        assemble(
-            build_parser().parse_args(
-                ["--set", 'generate.stage2_lora_fuse_mode="delta"', "--print-config"]
-            ),
-            base_settings=Settings(),
-        )
+    assert options.adapters == [
+        {
+            "path": Path("style.safetensors"),
+            "strength": 0.5,
+            "stage1_strength": 0.25,
+            "stage2_strength": 1.0,
+            "exclude": ("audio", "cross"),
+        }
+    ]
 
 
 def test_toml_cache_arrays_are_strictly_typed(tmp_path: Path) -> None:
@@ -1303,28 +1339,29 @@ audio_ff_layout_specs = []
         )
 
 
-def test_lora_streaming_conflict_is_rejected_during_assembly() -> None:
+def test_adapter_streaming_is_accepted_during_assembly() -> None:
     options = build_parser().parse_args(
         [
-            "--lora",
+            "--adapter",
             "adapter.safetensors",
             "--transformer-resident-blocks",
             "4",
             "--print-config",
         ]
     )
-    with pytest.raises(ConfigError, match="block streaming"):
-        assemble(options, base_settings=Settings())
+    invocation = assemble(options, base_settings=Settings())
+    assert invocation.model_settings.transformer_resident_blocks == 4
+    assert invocation.request.adapters[0].path == Path("adapter.safetensors")
 
 
-def test_stream_transformer_expands_to_r16_g4_and_preserves_overrides() -> None:
+def test_stream_transformer_expands_to_r8_eager_and_preserves_overrides() -> None:
     preset = assemble(
         build_parser().parse_args(["--stream-transformer", "--print-config"]),
         base_settings=Settings(),
     ).model_settings
     assert preset.stream_transformer is True
-    assert preset.transformer_resident_blocks == 16
-    assert preset.transformer_compile_group_size == 4
+    assert preset.transformer_resident_blocks == 8
+    assert preset.transformer_compile_group_size is None
 
     explicit = assemble(
         build_parser().parse_args(
@@ -1368,8 +1405,19 @@ def test_save_all_sidecars_expands_every_output_category() -> None:
     assert output.save_effective_config
     assert output.save_audio_sidecar
     assert output.vsr_save_original
-    assert output.save_vae_frames is False
-    assert output.save_hdr_heic_frames is False
+    # Both frame sequences are excluded from save-all, so the expansion leaves
+    # them unset and the resolver reports them off.
+    assert output.save_vae_frames is None
+    assert output.save_hdr_heic_frames is None
+    selection = sidecar_selection(output)
+    assert selection.vae_frames is False
+    assert selection.hdr_heic_frames is False
+    assert (selection.run_log, selection.console_log, selection.effective_config) == (
+        True,
+        True,
+        True,
+    )
+    assert selection.audio_sidecar is True
 
 
 def test_save_all_sidecars_includes_both_encoded_media_conditioning_stages() -> None:
@@ -1497,3 +1545,33 @@ def test_sidecar_cli_aliases_share_model_artifact_config() -> None:
     assert invocation.model_artifacts.save_text_conditioning
     assert invocation.output.save_run_log
     assert invocation.output.save_all_sidecars
+
+
+def test_quantization_exclusions_round_trip_toml(tmp_path):
+    config = tmp_path / "run.toml"
+    config.write_text(
+        '[model_settings]\ntransformer_quantize = "mxfp8-blocks"\ntransformer_quantize_exclude_layers = [0, 1, 2, 3, 47]\n'
+    )
+    invocation = assemble(
+        build_parser().parse_args(["--config", str(config), "--print-config"]),
+        base_settings=Settings(),
+    )
+    assert invocation.model_settings.transformer_quantize_exclude_layers == (0, 1, 2, 3, 47)
+    assert tomllib.loads(dump_config(invocation.resolved_config))["model_settings"][
+        "transformer_quantize_exclude_layers"
+    ] == [0, 1, 2, 3, 47]
+
+
+@pytest.mark.parametrize("source", ["cli", "toml", "set"])
+def test_experimental_fp16_vae_dtype_resolves_through_request_surfaces(tmp_path, source):
+    args = ["--video-vae", "diffusion", "--print-config"]
+    if source == "cli":
+        args += ["--vae-decode-dtype", "float16"]
+    elif source == "toml":
+        path = tmp_path / "decode.toml"
+        path.write_text('[generate]\nvae_decode_dtype = "float16"\n')
+        args += ["--config", str(path)]
+    else:
+        args += ["--set", "generate.vae_decode_dtype=float16"]
+    invocation = assemble(build_parser().parse_args(args), base_settings=Settings())
+    assert invocation.request.vae_decode_dtype == "float16"

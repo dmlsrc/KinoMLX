@@ -1,7 +1,5 @@
 """Shared native Conv3d primitives for the BFHWC video VAE."""
 
-from __future__ import annotations
-
 from collections.abc import Mapping
 
 import mlx.core as mx
@@ -21,7 +19,7 @@ def to_native_conv3d_layout(
 ) -> mx.array:
     """Convert PyTorch OITHW Conv3d weights to MLX OTHWI layout.
 
-    Family-cache tensors are already channels-last, so this operation is
+    Prepared tensors are already channels-last, so this operation is
     idempotent when ``value`` has the requested shape.
     """
     if tuple(value.shape) == expected_shape:

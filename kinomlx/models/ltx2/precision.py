@@ -1,7 +1,5 @@
 """Explicit dtype boundaries for native LTX-2 pipelines."""
 
-from __future__ import annotations
-
 from dataclasses import dataclass
 
 import mlx.core as mx
@@ -73,6 +71,8 @@ def resolve_video_vae_decode_dtype(
         return mx.float32 if hdr else default
     if value == "bfloat16":
         return mx.bfloat16
+    if value == "float16":
+        return mx.float16
     if value == "float32":
         return mx.float32
     raise ValueError(f"unsupported video VAE decode dtype {value!r}")

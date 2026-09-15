@@ -1,7 +1,5 @@
 """Model-neutral ownership primitive for heavyweight runtime components."""
 
-from __future__ import annotations
-
 from collections.abc import Callable
 
 

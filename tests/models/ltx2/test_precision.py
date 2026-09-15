@@ -38,4 +38,5 @@ def test_video_vae_decode_dtype_is_recipe_aware_and_overridable() -> None:
     assert resolve_video_vae_decode_dtype("auto", hdr=False, default=mx.bfloat16) == mx.bfloat16
     assert resolve_video_vae_decode_dtype("auto", hdr=True, default=mx.bfloat16) == mx.float32
     assert resolve_video_vae_decode_dtype("bfloat16", hdr=True, default=mx.float32) == mx.bfloat16
+    assert resolve_video_vae_decode_dtype("float16", hdr=False, default=mx.bfloat16) == mx.float16
     assert resolve_video_vae_decode_dtype("float32", hdr=False, default=mx.bfloat16) == mx.float32

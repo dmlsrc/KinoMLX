@@ -1,7 +1,5 @@
 """Public assembly-line resource, recipe, signal, and example contracts."""
 
-from __future__ import annotations
-
 import importlib
 import importlib.util
 import inspect
@@ -15,7 +13,8 @@ import kinomlx.models.ltx2.pipelines.distilled as distilled
 from kinomlx.media.frames import VideoFrameStream
 from kinomlx.models.ltx2.artifacts import TEXT_CONDITIONING
 from kinomlx.models.ltx2.types import DistilledRequest
-from kinomlx.reporting import NullReporter, RecordingReporter, Reporter
+from kinomlx.reporting import NullReporter, Reporter
+from tests._reporting import RecordingReporter
 from tests.models.ltx2.test_distilled_pipeline import (
     _patch_operations,
     _RecordingComponents,

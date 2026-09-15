@@ -1,11 +1,8 @@
 """Native MLX spatial latent upscaler for structurally fitting LTX-2 artifacts."""
 
-from __future__ import annotations
-
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING
 
 import mlx.core as mx
 
@@ -14,8 +11,7 @@ from kinomlx.io.safetensors import load_weights, read_metadata
 from kinomlx.kernels import group_norm, silu
 from kinomlx.reporting import NullReporter, Reporter
 
-if TYPE_CHECKING:
-    from kinomlx.models.ltx2.components import SpatialUpscalerPort
+from .ports import SpatialUpscalerPort
 
 
 def _strict_int(value: object, *, field: str) -> int:
@@ -369,7 +365,7 @@ def load_spatial_upscaler_weights(
     *,
     reporter: Reporter | None = None,
 ) -> int:
-    """Load every consumed upscaler target and ignore unrelated source tensors."""
+    """Bind consumed weights lazily; first use evaluates reads and layout conversions."""
     expected = _expected_weight_keys(model)
     sink = reporter if reporter is not None else NullReporter()
     phase = "load spatial upscaler"
@@ -407,7 +403,6 @@ def load_spatial_upscaler_weights(
             setattr(target, attribute, value)
             sink.phase_advance(phase)
         _promote_normalizers(model)
-        mx.eval(model.parameters())
         return len(expected)
     finally:
         weights.clear()

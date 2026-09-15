@@ -1,20 +1,81 @@
 """Rich-backed CLI logging and machine-readable stdout protocols."""
 
-from __future__ import annotations
-
 import logging
 import sys
+import time
 from pathlib import Path
-from typing import TYPE_CHECKING, TextIO
+from typing import TextIO
 
+from rich.console import Console, ConsoleOptions, ConsoleRenderable, RenderResult
 from rich.logging import RichHandler
+from rich.segment import Segment
+from rich.traceback import Traceback
+
+from kinomlx.settings import Settings
 
 from .console import get_console
 
-if TYPE_CHECKING:
-    from kinomlx.settings import Settings
-
 _ROOT_LOGGER = "kinomlx"
+_LEVEL_WIDTH = 8
+_DEFAULT_TIME_FORMAT = "[%H:%M:%S]"
+
+
+class _ConsoleLayout:
+    """Columns taken by the Rich time and level cells before every console message."""
+
+    prefix_width = len(time.strftime(_DEFAULT_TIME_FORMAT)) + _LEVEL_WIDTH + 2
+
+
+def console_message_width() -> int:
+    """Return the columns one console log message can use before Rich folds it."""
+    return max(24, get_console().width - _ConsoleLayout.prefix_width)
+
+
+def _strip_trailing_blanks(line: list[Segment]) -> list[Segment]:
+    """Drop the whitespace-only tail of one rendered row, keeping control segments."""
+    kept = list(line)
+    while kept and not kept[-1].control and not kept[-1].text.strip():
+        kept.pop()
+    if kept and not kept[-1].control:
+        last = kept[-1]
+        kept[-1] = Segment(last.text.rstrip(), last.style, last.control)
+    return kept
+
+
+class _UnpaddedRows:
+    """Render a log row's lines without the spaces Rich adds to fill the console width."""
+
+    def __init__(self, renderable: ConsoleRenderable) -> None:
+        self._renderable = renderable
+
+    def __rich_console__(self, console: Console, options: ConsoleOptions) -> RenderResult:
+        for line in console.render_lines(self._renderable, options, pad=False):
+            yield from _strip_trailing_blanks(line)
+            yield Segment.line()
+
+
+class _ScrollbackFriendlyHandler(RichHandler):
+    """A RichHandler whose rows end at their text.
+
+    Rich pads every log row with spaces out to the full console width. When a
+    terminal re-wraps its scrollback for a narrower window, that padding
+    becomes blank rows between the real ones; rows that end at their text
+    re-wrap without them.
+    """
+
+    def render(
+        self,
+        *,
+        record: logging.LogRecord,
+        traceback: Traceback | None,
+        message_renderable: ConsoleRenderable,
+    ) -> ConsoleRenderable:
+        rendered = super().render(
+            record=record,
+            traceback=traceback,
+            message_renderable=message_renderable,
+        )
+        return _UnpaddedRows(rendered)
 
 
 def configure_machine_output(
@@ -54,8 +115,9 @@ def configure_logging(
 ) -> logging.Logger:
     """Install idempotent Rich and optional file handlers for KinoMLX."""
     console_level = _level_for(verbosity, quiet)
-    time_format = "[%Y-%m-%d %H:%M:%S]" if show_date else "[%H:%M:%S]"
-    console_handler = RichHandler(
+    time_format = "[%Y-%m-%d %H:%M:%S]" if show_date else _DEFAULT_TIME_FORMAT
+    _ConsoleLayout.prefix_width = len(time.strftime(time_format)) + _LEVEL_WIDTH + 2
+    console_handler = _ScrollbackFriendlyHandler(
         console=get_console(),
         show_time=True,
         show_path=False,
@@ -103,4 +165,5 @@ __all__ = [
     "configure_logging",
     "configure_logging_from_settings",
     "configure_machine_output",
+    "console_message_width",
 ]

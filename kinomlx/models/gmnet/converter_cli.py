@@ -1,19 +1,23 @@
 """GMNet-specific extension of the generic weights-conversion command."""
 
-from __future__ import annotations
-
 import argparse
 import logging
 import time
 from contextlib import ExitStack
 from pathlib import Path
 
-from kinomlx.cli.common import format_elapsed, render_error
+from kinomlx.cli.machine_output import emit_json
+from kinomlx.cli.presentation import format_elapsed, render_error
 from kinomlx.errors import KinoMLXError
-from kinomlx.settings import Settings, add_argparse_args
+from kinomlx.memory_policy import apply_memory_policy
+from kinomlx.models.gmnet.catalog import GMNetVariant
+from kinomlx.models.gmnet.convert import convert_checkpoint
+from kinomlx.reporter_stack import command_reporter
+from kinomlx.ui import configure_logging, configure_logging_from_settings
 from kinomlx.weights.host import (
-    apply_mlx_cache_limit,
-    conversion_reporter,
+    add_checkpoint_safety_arguments,
+    add_conversion_arguments,
+    bootstrap_json_output,
     resolve_conversion_settings,
 )
 
@@ -21,7 +25,7 @@ _log = logging.getLogger(__name__)
 
 
 def build_parser() -> argparse.ArgumentParser:
-    """Build the GMNet converter parser without importing MLX."""
+    """Build the GMNet converter parser."""
     parser = argparse.ArgumentParser(
         prog="kinomlx weights convert gmnet",
         description=(
@@ -52,41 +56,17 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Declare the numeric contract of a non-published checkpoint.",
     )
-    parser.add_argument(
-        "--allow-suspicious-globals",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help=(
-            "Proceed past static-scan findings for a trusted file; the restricted "
-            "unpickler still refuses non-allowlisted globals."
-        ),
-    )
-    parser.add_argument(
-        "--force",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help="Replace an existing regular output; otherwise refuse before loading.",
-    )
-    add_argparse_args(parser)
+    add_checkpoint_safety_arguments(parser)
+    add_conversion_arguments(parser)
     return parser
-
-
-def _bootstrap_json(options: object) -> bool:
-    try:
-        base = Settings.from_env_fields("json_output")
-    except TypeError, ValueError:
-        base = Settings()
-    explicit = getattr(options, "json_output", None)
-    return base.json_output if explicit is None else bool(explicit)
 
 
 def run_gmnet_convert_command(argv: list[str]) -> int:
     """Run the GMNet converter and return a process exit code."""
-    from kinomlx.ui import configure_logging, configure_logging_from_settings
 
     configure_logging()
     options = build_parser().parse_args(argv)
-    json_output = _bootstrap_json(options)
+    json_output = bootstrap_json_output(options)
     try:
         settings = resolve_conversion_settings(options)
     except (TypeError, ValueError) as exc:
@@ -95,12 +75,9 @@ def run_gmnet_convert_command(argv: list[str]) -> int:
 
     started = time.perf_counter()
     try:
-        apply_mlx_cache_limit(settings)
-        from kinomlx.models.gmnet.catalog import GMNetVariant
-        from kinomlx.models.gmnet.convert import convert_checkpoint
-
+        apply_memory_policy(settings)
         with ExitStack() as stack:
-            reporter = conversion_reporter(stack, settings)
+            reporter = command_reporter(stack, settings)
             reporter.memory_checkpoint("conversion_start")
             receipt = convert_checkpoint(
                 options.input,
@@ -112,7 +89,7 @@ def run_gmnet_convert_command(argv: list[str]) -> int:
                 ),
                 allow_suspicious=options.allow_suspicious_globals,
                 force=options.force,
-                cache_dir=settings.cache_dir,
+                app_cache_dir=settings.app_cache_dir,
                 reporter=reporter,
             )
             reporter.memory_checkpoint("conversion_complete")
@@ -141,8 +118,6 @@ def run_gmnet_convert_command(argv: list[str]) -> int:
         "diagnostics": {"memory": diagnostics} if diagnostics else {},
     }
     if settings.json_output:
-        from kinomlx.cli.output import emit_json
-
         emit_json(payload)
     else:
         _log.info("Source: %s (sha256 %s...)", receipt.source, receipt.source_sha256[:12])

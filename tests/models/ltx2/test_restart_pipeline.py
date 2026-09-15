@@ -1,12 +1,10 @@
 """Shared public/CLI recipe gates for distilled station restart."""
 
-from __future__ import annotations
-
+import math
 from dataclasses import replace
 from pathlib import Path
 
 import mlx.core as mx
-import numpy as np
 import pytest
 
 import kinomlx.models.ltx2.pipelines.distilled as distilled
@@ -14,16 +12,16 @@ import kinomlx.models.ltx2.pipelines.restart as restart_pipeline
 from kinomlx.io.fingerprints import file_sha256
 from kinomlx.io.safetensors import save_weights
 from kinomlx.media.frames import VideoFrameStream
-from kinomlx.models.ltx2.artifacts import FINAL_LATENTS, STAGE_1_LATENTS
-from kinomlx.models.ltx2.pipelines.restart import DistilledRestart
+from kinomlx.models.ltx2.artifacts import FINAL_LATENTS, STAGE_1_LATENTS, TEXT_CONDITIONING
+from kinomlx.models.ltx2.restart import DistilledRestart
 from kinomlx.models.ltx2.text_conditioning import NativeTextConditioner
 from kinomlx.models.ltx2.types import (
     AudioLatentShape,
     DistilledRequest,
     video_latent_shape_from_pixel,
 )
-from kinomlx.reporting import RecordingReporter
 from kinomlx.types import VideoPixelShape
+from tests._reporting import RecordingReporter
 from tests.models.ltx2.test_distilled_pipeline import (
     _patch_operations,
     _RecordingComponents,
@@ -50,13 +48,13 @@ def _stage_latents(
     metadata: dict[str, str] | None = None,
 ) -> tuple[mx.array, mx.array | None]:
     video_shape = video_latent_shape_from_pixel(geometry).to_tuple()
-    video = mx.arange(int(np.prod(video_shape)), dtype=mx.float32).reshape(video_shape) / 100.0
+    video = mx.arange(math.prod(video_shape), dtype=mx.float32).reshape(video_shape) / 100.0
     audio_latent = None
     arrays = {"video_latent": video}
     if audio:
         audio_shape = AudioLatentShape.from_video(geometry, fps=fps).to_tuple()
         audio_latent = (
-            mx.arange(int(np.prod(audio_shape)), dtype=mx.float32).reshape(audio_shape) / 50.0
+            mx.arange(math.prod(audio_shape), dtype=mx.float32).reshape(audio_shape) / 50.0
         )
         arrays["audio_latent"] = audio_latent
     save_weights(path, arrays, metadata or {})
@@ -81,10 +79,91 @@ def _seeded_decode(
     return VideoFrameStream(frames, spec=spec, frame_count=frame_count)
 
 
-def _consume(output) -> tuple[np.ndarray, np.ndarray | None]:
-    frames = np.stack([np.asarray(frame) for frame in output.frames])
-    waveform = None if output.audio_waveform is None else np.asarray(output.audio_waveform)
-    return frames, waveform
+def _consume(output) -> tuple[mx.array, mx.array | None]:
+    frames = mx.stack(list(output.frames))
+    return frames, output.audio_waveform
+
+
+class _RecordingArtifacts:
+    """Accept every offered artifact so a station's own output can be read back."""
+
+    def __init__(self) -> None:
+        self.tensors: dict[str, dict[str, mx.array]] = {}
+
+    def save(self, artifact) -> None:
+        self.tensors[artifact.name] = dict(artifact.tensors)
+
+
+def test_decode_restart_re_emits_the_latent_product_it_consumed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    final_path = tmp_path / "final.safetensors"
+    stage_1_path = tmp_path / "stage1.safetensors"
+    final_video, _audio = _stage_latents(
+        final_path, VideoPixelShape(batch=1, frames=9, height=64, width=64)
+    )
+    stage_1_video, _stage_1_audio = _stage_latents(
+        stage_1_path, VideoPixelShape(batch=1, frames=9, height=32, width=32)
+    )
+    monkeypatch.setattr(distilled, "decode_ltx23_sdr_frames", _seeded_decode)
+    monkeypatch.setattr(distilled, "release_stage_temporaries", lambda: None)
+    request = DistilledRequest(prompt="", width=64, height=64, frames=9, seed=42)
+
+    final_saved = _RecordingArtifacts()
+    restart_pipeline.restart_distilled(
+        request,
+        _Resources(),
+        restart=DistilledRestart.decode(final_path),
+        components=_RecordingComponents(),
+        artifact_sink=final_saved,
+    ).close()
+
+    stage_1_saved = _RecordingArtifacts()
+    restart_pipeline.restart_distilled(
+        request,
+        _Resources(),
+        restart=DistilledRestart.decode(stage_1_path, latent_stage="stage-1"),
+        components=_RecordingComponents(),
+        artifact_sink=stage_1_saved,
+    ).close()
+
+    assert set(final_saved.tensors) == {FINAL_LATENTS}
+    assert mx.array_equal(final_saved.tensors[FINAL_LATENTS]["video_latent"], final_video).item()
+    assert set(stage_1_saved.tensors) == {STAGE_1_LATENTS}
+    assert mx.array_equal(
+        stage_1_saved.tensors[STAGE_1_LATENTS]["video_latent"], stage_1_video
+    ).item()
+
+
+def test_stage_2_restart_re_emits_the_text_and_stage_1_latent_it_consumed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    latent_path = tmp_path / "stage1.safetensors"
+    text_path = tmp_path / "text.safetensors"
+    text_path.touch()
+    stage_1_video, _audio = _stage_latents(
+        latent_path,
+        VideoPixelShape(batch=1, frames=9, height=32, width=32),
+        metadata={"pipeline": "distilled_two_stage", "stage": "1", "final": "false"},
+    )
+    _patch_operations(monkeypatch)
+    monkeypatch.setattr(restart_pipeline, "release_stage_temporaries", lambda: None)
+    saved = _RecordingArtifacts()
+
+    output = restart_pipeline.restart_distilled(
+        DistilledRequest(prompt="ignored", width=64, height=64, frames=9, seed=42),
+        _Resources(),
+        restart=DistilledRestart.stage_2(latent_path, text_conditioning=text_path),
+        components=_RecordingComponents(),
+        text_conditioner=_RestartTextConditioner(),
+        artifact_sink=saved,
+    )
+    output.close()
+
+    assert {STAGE_1_LATENTS, FINAL_LATENTS, TEXT_CONDITIONING} <= set(saved.tensors)
+    assert mx.array_equal(saved.tensors[STAGE_1_LATENTS]["video_latent"], stage_1_video).item()
 
 
 def test_public_restart_constructors_keep_the_call_site_small(tmp_path: Path) -> None:
@@ -162,7 +241,7 @@ def test_restart_metadata_labels_are_advisory_when_tensor_structure_fits(
         source_model_generation="2.5",
     )
 
-    np.testing.assert_array_equal(np.asarray(loaded.video), np.asarray(expected_video))
+    assert mx.array_equal(loaded.video, expected_video).item()
 
 
 def test_restart_wrong_latent_shape_fails_before_any_component_opens(
@@ -434,7 +513,7 @@ def test_torch_mps_stage_2_restart_resumes_recorded_noise_position_exactly(
     ).item()
 
 
-def test_stage_1_direct_decode_reports_half_resolution(
+def test_stage_1_decode_reports_half_resolution(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -494,8 +573,8 @@ def test_decode_restart_is_bit_exact_before_encoding_and_seed_can_reroll_diffvae
         components=_RecordingComponents(),
     )
     restart_frames, restart_audio = _consume(restarted)
-    np.testing.assert_array_equal(restart_frames, normal_frames)
-    np.testing.assert_array_equal(restart_audio, normal_audio)
+    assert mx.array_equal(restart_frames, normal_frames).item()
+    assert mx.array_equal(restart_audio, normal_audio).item()
 
     rerolled = restart_pipeline.restart_distilled(
         DistilledRequest(
@@ -512,6 +591,6 @@ def test_decode_restart_is_bit_exact_before_encoding_and_seed_can_reroll_diffvae
     )
     rerolled_frames, rerolled_audio = _consume(rerolled)
 
-    assert not np.array_equal(rerolled_frames, normal_frames)
-    np.testing.assert_array_equal(rerolled_audio, normal_audio)
+    assert not mx.array_equal(rerolled_frames, normal_frames).item()
+    assert mx.array_equal(rerolled_audio, normal_audio).item()
     assert file_sha256(latent_path) == source_hash

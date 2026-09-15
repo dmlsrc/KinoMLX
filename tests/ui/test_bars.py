@@ -5,8 +5,6 @@ the configuration (refresh rate, custom pace column) and the
 math-consistent pace formatting that's our value-add.
 """
 
-from __future__ import annotations
-
 import logging
 from dataclasses import dataclass
 from typing import Any
@@ -49,7 +47,7 @@ def test_pace_formats_fast_as_units_per_second() -> None:
     col = WallClockPaceColumn()
     task = _FakeTask(completed=40, elapsed=2.0, fields={"unit": "frame"})
     # 2 s / 40 frames = 0.05 s/frame -> 20 frames/s.
-    assert "20.0 frame/s" in str(col.render(task))
+    assert "20.0 frames/s" in str(col.render(task))
 
 
 def test_pace_unit_defaults_to_it_when_unset() -> None:
@@ -76,9 +74,9 @@ def test_pace_returns_measuring_when_elapsed_is_none() -> None:
         # Round numbers that won't surprise on fp formatting.
         (1, 5.0, "5.0 s/step"),  # 5 s/step
         (1, 1.0, "1.0 s/step"),  # exactly the boundary
-        (2, 1.0, "2.0 step/s"),  # just below the boundary -> switch to step/s
-        (10, 1.0, "10.0 step/s"),  # multiple steps/s
-        (100, 0.5, "200.0 step/s"),  # high rate
+        (2, 1.0, "2.0 steps/s"),  # just below the boundary -> switch to steps/s
+        (10, 1.0, "10.0 steps/s"),  # multiple steps/s
+        (100, 0.5, "200.0 steps/s"),  # high rate
     ],
 )
 def test_pace_boundary_cases(completed: int, elapsed: float, expected_substr: str) -> None:
@@ -200,7 +198,7 @@ def test_track_phase_logs_completion_summary(caplog: pytest.LogCaptureFixture) -
             prog.advance(task)
     text = caplog.text
     assert "denoise" in text
-    assert "4 step" in text  # iterations + unit
+    assert "4 steps" in text  # iterations + unit
     assert "s/step" in text  # time per iteration
 
 

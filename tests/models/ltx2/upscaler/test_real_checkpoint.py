@@ -1,22 +1,20 @@
 """Opt-in canary for the official LTX-2.3 x2 spatial upscaler."""
 
-from __future__ import annotations
-
 import gc
 
 import mlx.core as mx
 import pytest
 
-from kinomlx.models.ltx2.settings import LTX2Settings
 from kinomlx.models.ltx2.upscaler import load_spatial_upscaler
+from tests.models.ltx2._source_weights import NO_LTX23_CHECKPOINT, ltx23_checkpoint
 
 
-@pytest.mark.requires_weights
+@pytest.mark.heavy
 @pytest.mark.parametrize("version", ["1.0", "1.1"])
 def test_real_ltx23_spatial_upscaler(version: str) -> None:
-    checkpoint = LTX2Settings.from_env().weights_path
+    checkpoint = ltx23_checkpoint()
     if checkpoint is None:
-        pytest.skip("KINO_WEIGHTS_PATH is not configured")
+        pytest.skip(NO_LTX23_CHECKPOINT)
     path = checkpoint.parent / f"ltx-2.3-spatial-upscaler-x2-{version}.safetensors"
     if not path.is_file():
         pytest.skip("the official LTX-2.3 x2 spatial upscaler is not cached")

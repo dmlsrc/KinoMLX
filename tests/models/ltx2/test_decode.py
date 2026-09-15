@@ -1,7 +1,5 @@
 """Decoded-media boundary contracts."""
 
-from __future__ import annotations
-
 from types import SimpleNamespace
 
 import mlx.core as mx

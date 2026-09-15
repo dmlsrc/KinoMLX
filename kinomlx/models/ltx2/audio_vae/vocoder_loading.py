@@ -1,7 +1,6 @@
 """Complete consumed-target loading for the LTX-2 BWE vocoder family."""
 
-from __future__ import annotations
-
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, cast
@@ -131,9 +130,18 @@ def _targets(model: VocoderWithBWE) -> dict[str, _Target]:
     return targets
 
 
+WeightSource = Mapping[str, mx.array] | Path | str
+
+
+def _weights_from_source(source: WeightSource) -> dict[str, mx.array]:
+    if isinstance(source, Mapping):
+        return dict(source)
+    return load_weights(Path(source))
+
+
 def load_vocoder_weights(
     model: VocoderWithBWE,
-    path: Path | str,
+    source: WeightSource,
     *,
     reporter: Reporter | None = None,
 ) -> int:
@@ -145,7 +153,7 @@ def load_vocoder_weights(
     weights: dict[str, mx.array] = {}
     prepared: dict[str, mx.array] = {}
     try:
-        weights = load_weights(path)
+        weights = _weights_from_source(source)
         bindings: dict[str, str] = {}
         for logical_key in targets:
             aliases = [logical_key]

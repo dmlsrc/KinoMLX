@@ -19,8 +19,6 @@ and the CLI parser are each checked. Pure MLX (no pyobjc), so this runs
 everywhere.
 """
 
-from __future__ import annotations
-
 import mlx.core as mx
 import pytest
 
@@ -31,7 +29,6 @@ from kinomlx.audio.onset import (
     DEFAULT_SILENCE_RATIO,
     DEFAULT_SILENCE_START_MS,
     DEFAULT_TRIM_MS,
-    detect_onset_latent_spike,
     detect_onset_spike,
     mitigate_onset,
     parse_trim_mode,
@@ -198,34 +195,6 @@ def test_mitigate_does_not_mutate_input():
 def test_mitigate_unknown_mode_raises():
     with pytest.raises(ValueError, match="Unknown onset mitigation mode"):
         mitigate_onset(_click_signature(), SR, mode="bogus")
-
-
-# ---------------------------------------------------------------------------
-# Latent-domain detector
-# ---------------------------------------------------------------------------
-
-
-def _audio_latent(frame0_scale: list[float], frames: int = 64, seed: int = 0) -> mx.array:
-    """(1, 8, frames, 16) N(0,1), with frame 0 scaled per channel."""
-    a = mx.random.normal(shape=(1, 8, frames, 16), key=mx.random.key(seed))
-    scale = mx.array(frame0_scale, dtype=mx.float32).reshape(1, 8, 1, 1)
-    first = a[:, :, :1, :] * scale
-    return mx.concatenate([first, a[:, :, 1:, :]], axis=2)
-
-
-def test_latent_detector_fires_on_concentrated_spike():
-    scale = [1.0] * 8
-    scale[4] = 6.0
-    assert detect_onset_latent_spike(_audio_latent(scale))
-
-
-def test_latent_detector_ignores_broad_elevation():
-    # Every channel elevated at frame 0 -> not concentrated -> decodes quiet.
-    assert not detect_onset_latent_spike(_audio_latent([3.0] * 8))
-
-
-def test_latent_detector_ignores_normal_first_frame():
-    assert not detect_onset_latent_spike(_audio_latent([1.0] * 8))
 
 
 # ---------------------------------------------------------------------------

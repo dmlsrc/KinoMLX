@@ -5,17 +5,14 @@ generation head and KV-cache path are intentionally omitted because LTX uses
 the backbone once as a prompt encoder.
 """
 
-from __future__ import annotations
-
 from dataclasses import dataclass, field
 
 import mlx.core as mx
 
 import kinomlx._mlx_nn as nn
 from kinomlx.kernels import gelu_approx, rms_norm
+from kinomlx.modeling.layers import embedding_shell, linear_shell
 from kinomlx.reporting import NullReporter, Reporter
-
-from ._layers import embedding_shell, linear_shell
 
 GEMMA3_LAYER_TYPES = tuple(
     "full_attention" if index % 6 == 5 else "sliding_attention" for index in range(48)
@@ -62,7 +59,7 @@ class Gemma3Config:
             raise ValueError("Gemma layer_types must match num_hidden_layers")
         invalid = set(self.layer_types) - {"sliding_attention", "full_attention"}
         if invalid:
-            raise ValueError(f"unsupported Gemma attention type: {sorted(invalid)[0]}")
+            raise ValueError(f"unsupported Gemma attention type: {min(invalid)}")
 
 
 class Gemma3RMSNorm(nn.Module):
@@ -281,7 +278,8 @@ class Gemma3Model(nn.Module):
             raise ValueError("Gemma attention_mask must match input_ids")
         sink = reporter if reporter is not None else NullReporter()
         phase = "encode prompt with Gemma 3"
-        sink.phase_start(phase, total=len(self.layers), unit="layer")
+        # Indeterminate phase: one lazy graph per prompt, evaluated once below.
+        sink.phase_start(phase)
         try:
             hidden = self.embed_tokens(input_ids)
             scale = mx.array(self.config.hidden_size**0.5, dtype=mx.bfloat16)
@@ -294,12 +292,10 @@ class Gemma3Model(nn.Module):
                     states.append(hidden)
                 mask = sliding_mask if layer.layer_type == "sliding_attention" else full_mask
                 hidden = layer(hidden, mask, positions)
-                mx.eval(hidden)
-                sink.phase_advance(phase)
             hidden = self.norm(hidden)
-            mx.eval(hidden)
             if states is not None:
                 states.append(hidden)
+            mx.eval(hidden, *(states or ()))
             return hidden, tuple(states) if states is not None else None
         finally:
             sink.phase_end(phase)

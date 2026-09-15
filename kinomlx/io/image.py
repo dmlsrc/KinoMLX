@@ -12,14 +12,13 @@ The ``size`` argument uses ``(width, height)``; internal indexing is
 ``(H, W, C)`` to match the returned array.
 """
 
-from __future__ import annotations
-
 import math
 from pathlib import Path
 
 import mlx.core as mx
 
-from kinomlx.videotoolbox.images import load_image_rgb
+from kinomlx.videotoolbox.exr import read_exr_frame
+from kinomlx.videotoolbox.images import image_size, load_image_rgb
 from kinomlx.videotoolbox.images import save_image as _save_image_native
 
 
@@ -51,7 +50,6 @@ def load_raw_exr(
     size: tuple[int, int] | None = None,
 ) -> mx.array:
     """Load raw floating EXR RGB samples without display-space conversion."""
-    from kinomlx.videotoolbox.exr import read_exr_frame
 
     image = read_exr_frame(path)
     if size is not None:
@@ -111,3 +109,6 @@ def _cover_crop(img: mx.array, size: tuple[int, int]) -> mx.array:
     top = (new_h - target_h) // 2
     left = (new_w - target_w) // 2
     return resized[top : top + target_h, left : left + target_w, :]
+
+
+__all__ = ["image_size", "load_image", "load_raw_exr", "save_image"]

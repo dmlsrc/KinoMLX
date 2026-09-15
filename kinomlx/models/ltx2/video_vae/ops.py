@@ -1,7 +1,5 @@
 """Video VAE patchification and latent normalization operations."""
 
-from __future__ import annotations
-
 from collections.abc import Callable
 from functools import cache
 

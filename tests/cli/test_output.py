@@ -1,14 +1,10 @@
 """Generation-output glue tests without invoking VideoToolbox."""
 
-from __future__ import annotations
-
 from pathlib import Path
 
 import mlx.core as mx
 import pytest
 
-from kinomlx.cli.config import OutputConfig
-from kinomlx.cli.output import write_generation
 from kinomlx.media.frames import VideoFrameStream
 from kinomlx.media.signals import (
     BT709_SDR_422_DELIVERY,
@@ -18,14 +14,16 @@ from kinomlx.media.signals import (
     ExrDeliverySpec,
     UnsupportedSignalError,
 )
-from kinomlx.models.ltx2.runner import GenerationOutput
+from kinomlx.models.ltx2.generation import GenerationOutput
+from kinomlx.models.ltx2.output import write_generation
+from kinomlx.models.ltx2.output_config import OutputConfig
 from kinomlx.models.ltx2.signals import (
     SCENE_LINEAR_HDR_SIGNAL,
     ltx23_sdr_signal,
     ltx_hdr_working_signal,
 )
 from kinomlx.output import ArtifactSet, OutputError
-from kinomlx.reporting import RecordingReporter
+from tests._reporting import RecordingReporter
 
 
 def _generation(
@@ -233,7 +231,7 @@ def test_write_generation_maps_hdr_authoring_to_dual_sink_plan(
     primaries: ColorPrimaries,
     transfer: ColorTransfer,
 ) -> None:
-    import kinomlx.cli.output as output_module
+    import kinomlx.models.ltx2.output as output_module
 
     signal = ltx_hdr_working_signal(
         transfer=ColorTransfer.ACESCCT,

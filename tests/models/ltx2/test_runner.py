@@ -1,18 +1,19 @@
 """Generic LTX2Runner host and public output contracts."""
 
-from __future__ import annotations
-
 from dataclasses import dataclass
+from types import SimpleNamespace
 
 import pytest
 
 import kinomlx.models.ltx2.runner as runner_module
-from kinomlx.models.ltx2.pipelines.restart import DistilledRestart
-from kinomlx.models.ltx2.runner import GenerationOutput, LTX2Error, LTX2Runner
+from kinomlx.memory_policy import MLXMemoryPolicy
+from kinomlx.models.ltx2.generation import GenerationOutput
+from kinomlx.models.ltx2.restart import DistilledRestart
+from kinomlx.models.ltx2.runner import LTX2Error, LTX2Runner
 from kinomlx.models.ltx2.settings import LTX2Settings
 from kinomlx.models.ltx2.types import DistilledRequest
-from kinomlx.reporting import RecordingReporter
 from kinomlx.settings import Settings
+from tests._reporting import RecordingReporter
 
 
 @dataclass
@@ -31,7 +32,7 @@ class _FalseyReporter(RecordingReporter):
 
 
 def test_runner_supplies_one_prepared_plan_and_the_same_stateless_ports() -> None:
-    resources = object()
+    resources = SimpleNamespace(memory_policy=MLXMemoryPolicy())
     components = object()
     text_conditioner = object()
     reporter = _FalseyReporter()
@@ -70,7 +71,9 @@ def test_runner_supplies_one_prepared_plan_and_the_same_stateless_ports() -> Non
 
 
 def test_runner_core_runs_distinct_recipe_request_types_without_branching() -> None:
-    runner = LTX2Runner(resources=object(), components=object())
+    runner = LTX2Runner(
+        resources=SimpleNamespace(memory_policy=MLXMemoryPolicy()), components=object()
+    )
     events = []
 
     @dataclass(frozen=True)
@@ -94,7 +97,7 @@ def test_runner_core_runs_distinct_recipe_request_types_without_branching() -> N
 def test_runner_restart_uses_the_same_public_recipe_ports(monkeypatch, tmp_path) -> None:
     import kinomlx.models.ltx2.pipelines.restart as restart_module
 
-    resources = object()
+    resources = SimpleNamespace(memory_policy=MLXMemoryPolicy())
     components = object()
     text_conditioner = object()
     reporter = RecordingReporter()
@@ -134,7 +137,7 @@ def test_runner_restart_uses_the_same_public_recipe_ports(monkeypatch, tmp_path)
     ]
 
 
-def test_runner_prepares_resources_once_at_construction(monkeypatch) -> None:
+def test_runner_prepares_resources_once_at_construction(monkeypatch, tmp_path) -> None:
     expected = object()
     calls = []
     reporter = RecordingReporter()
@@ -143,9 +146,7 @@ def test_runner_prepares_resources_once_at_construction(monkeypatch) -> None:
     monkeypatch.setattr(
         runner_module,
         "prepare_resources",
-        lambda received, *, infrastructure, reporter: (
-            calls.append((received, infrastructure, reporter)) or expected
-        ),
+        lambda received, *, infrastructure: calls.append((received, infrastructure)) or expected,
     )
 
     runner = LTX2Runner(
@@ -156,12 +157,12 @@ def test_runner_prepares_resources_once_at_construction(monkeypatch) -> None:
     )
 
     assert runner.resources is expected
-    assert calls == [(model_settings, infrastructure, reporter)]
+    assert calls == [(model_settings, infrastructure)]
 
 
 def test_runner_rejects_ambiguous_resource_ownership() -> None:
     with pytest.raises(ValueError, match="settings or prepared resources"):
-        LTX2Runner(LTX2Settings(), resources=object())
+        LTX2Runner(LTX2Settings(), resources=SimpleNamespace(memory_policy=MLXMemoryPolicy()))
 
 
 def test_runner_wraps_resource_and_recipe_operational_failures(monkeypatch) -> None:
@@ -176,13 +177,17 @@ def test_runner_wraps_resource_and_recipe_operational_failures(monkeypatch) -> N
     def failing_recipe(*_args, **_kwargs):
         raise RuntimeError("denoise failed")
 
-    runner = LTX2Runner(resources=object(), components=object())
+    runner = LTX2Runner(
+        resources=SimpleNamespace(memory_policy=MLXMemoryPolicy()), components=object()
+    )
     with pytest.raises(LTX2Error, match="generation failed.*denoise failed"):
         runner.run(failing_recipe, object())
 
 
 def test_recipe_must_return_generation_output() -> None:
-    runner = LTX2Runner(resources=object(), components=object())
+    runner = LTX2Runner(
+        resources=SimpleNamespace(memory_policy=MLXMemoryPolicy()), components=object()
+    )
 
     with pytest.raises(TypeError, match="must return GenerationOutput"):
         runner.run(lambda *_args, **_kwargs: object(), object())

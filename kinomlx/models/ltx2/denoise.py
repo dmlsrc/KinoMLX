@@ -1,25 +1,30 @@
 """Pure joint audio/video distilled denoising and Euler stepping."""
 
-from __future__ import annotations
-
 import math
 from collections.abc import Callable, Sequence
 from dataclasses import replace
 from itertools import pairwise
-from typing import Literal, Protocol
+from typing import Literal, Protocol, cast
 
 import mlx.core as mx
 
+from kinomlx.adapters.validation import AdapterWeightError, check_adapter_weights
+from kinomlx.errors import KinoMLXError
 from kinomlx.reporting import NullReporter, Reporter
 from kinomlx.samplers.steps import euler_ancestral_rf_step, euler_step
-from kinomlx.types import LatentState
 
 from .components import TransformerPort
 from .state import post_process_latent
 from .transformer import Modality
+from .transformer.execution import TransformerExecution
+from .types import LatentState
 
 DenoiseStepKind = Literal["deterministic-euler", "ancestral-rf"]
 NoiseModality = Literal["video", "audio"]
+
+
+class LTX2DenoiseError(KinoMLXError, RuntimeError):
+    """A completed denoise step produced nonfinite active latents."""
 
 
 class TransitionNoiseProvider(Protocol):
@@ -165,6 +170,7 @@ def denoise_step(
     step_kind: DenoiseStepKind = "deterministic-euler",
     video_noise: mx.array | None = None,
     audio_noise: mx.array | None = None,
+    reporter: Reporter | None = None,
 ) -> tuple[LatentState, LatentState | None]:
     """Run one X0 transformer call and the selected Euler update."""
     video_modality = modality_from_state(
@@ -218,6 +224,32 @@ def denoise_step(
     if audio_state is not None:
         arrays.append(audio_state.latent)
     mx.eval(*arrays)
+    check_adapter_weights(
+        transformer,
+        context="LTX-2 denoise step",
+        reporter=reporter or NullReporter(),
+        active=TransformerExecution.resolve(
+            video_present=video_modality.latent.size > 0,
+            audio_present=audio_modality is not None and audio_modality.latent.size > 0,
+            video_enabled=video_enabled,
+            audio_enabled=audio_enabled,
+            video_keyframes=video_keyframes_mask is not None,
+        ).uses_weight,
+    )
+    active = []
+    if video_enabled:
+        active.append(("video", video_state.latent))
+    if audio_enabled and audio_state is not None:
+        active.append(("audio", audio_state.latent))
+    if active:
+        finite = cast(
+            list[bool], mx.stack([mx.all(mx.isfinite(value)) for _, value in active]).tolist()
+        )
+        for (modality, value), valid in zip(active, finite, strict=True):
+            if not valid:
+                raise LTX2DenoiseError(
+                    f"LTX-2 denoising produced a nonfinite {modality} latent in {value.dtype}."
+                )
     return video_state, audio_state
 
 
@@ -281,21 +313,26 @@ def denoise_loop(
                         transition=transition,
                         modality="audio",
                     )
-            video_state, audio_state = denoise_step(
-                video_state,
-                audio_state,
-                sigma=sigma,
-                sigma_next=sigma_next,
-                transformer=transformer,
-                video_context=video_context,
-                audio_context=audio_context,
-                video_context_mask=video_context_mask,
-                audio_context_mask=audio_context_mask,
-                video_keyframes_mask=video_keyframes_mask,
-                step_kind=step_kind,
-                video_noise=video_noise,
-                audio_noise=audio_noise,
-            )
+            try:
+                video_state, audio_state = denoise_step(
+                    video_state,
+                    audio_state,
+                    sigma=sigma,
+                    sigma_next=sigma_next,
+                    transformer=transformer,
+                    video_context=video_context,
+                    audio_context=audio_context,
+                    video_context_mask=video_context_mask,
+                    audio_context_mask=audio_context_mask,
+                    video_keyframes_mask=video_keyframes_mask,
+                    step_kind=step_kind,
+                    video_noise=video_noise,
+                    audio_noise=audio_noise,
+                    reporter=sink,
+                )
+            except (LTX2DenoiseError, AdapterWeightError) as error:
+                location = f"stage {stage}" if stage is not None else phase
+                raise type(error)(f"{location}, step {index}: {error}") from error
             sink.phase_advance(phase)
             if callback is not None:
                 callback(index, total)
@@ -306,6 +343,7 @@ def denoise_loop(
 
 __all__ = [
     "DenoiseStepKind",
+    "LTX2DenoiseError",
     "TransitionNoiseProvider",
     "denoise_loop",
     "denoise_step",

@@ -1,7 +1,5 @@
 """Behavioral tests for ``kinomlx.ui.console`` - the rich-backed logging setup."""
 
-from __future__ import annotations
-
 import logging
 import pathlib
 
@@ -79,7 +77,7 @@ def test_subsystems_are_independently_filterable() -> None:
     """Logger name = subsystem: one can be quieted without touching another."""
     configure_logging()  # kinomlx -> INFO
     vt = logging.getLogger("kinomlx.videotoolbox")
-    lora = logging.getLogger("kinomlx.lora")
+    lora = logging.getLogger("kinomlx.adapters")
     vt.setLevel(logging.WARNING)
     try:
         assert not vt.isEnabledFor(logging.INFO)

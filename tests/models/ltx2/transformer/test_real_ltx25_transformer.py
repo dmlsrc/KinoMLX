@@ -1,7 +1,5 @@
 """Opt-in one-token parity gate for the real LTX-2.5 transformer."""
 
-from __future__ import annotations
-
 import gc
 import hashlib
 import os
@@ -11,10 +9,10 @@ from pathlib import Path
 import mlx.core as mx
 import pytest
 
-from kinomlx.models.ltx2.cache import load_transformer_weights_cached_streaming
 from kinomlx.models.ltx2.metadata import checkpoint_config
 from kinomlx.models.ltx2.transformer import LTXAVModel, Modality
-from kinomlx.settings import Settings
+from kinomlx.models.ltx2.weights.loading import bind_transformer
+from tests.models.ltx2._source_weights import transformer_weights
 
 _INPUTS_SHA256 = "4ed4fc5a791f87ffd66560bddcd98d5e371c9624f11170cafcb4f46538038755"
 _OUTPUTS_SHA256 = "d173a19e10e2518614572f901b1d0bfd40ca179eb2f3855effb3f342b48fbc6d"
@@ -78,7 +76,7 @@ def _assert_boundary(name: str, candidate: mx.array, reference: mx.array) -> Non
     )
 
 
-@pytest.mark.requires_weights
+@pytest.mark.heavy
 def test_real_ltx25_one_token_joint_transformer_matches_frozen_reference() -> None:
     checkpoint = _required_path("KINO_LTX25_TRANSFORMER_PATH")
     fixture_dir = _required_path("KINO_LTX25_TRANSFORMER_FIXTURE_DIR", directory=True)
@@ -105,15 +103,12 @@ def test_real_ltx25_one_token_joint_transformer_matches_frozen_reference() -> No
             compile_attention=False,
             fast_mode=False,
         )
-        load_transformer_weights_cached_streaming(
+        bind_transformer(
             model,
-            checkpoint,
+            weight_loader=lambda _index: transformer_weights(checkpoint, config=config),
             transformer_dtype=mx.bfloat16,
-            cache_mode="auto",
-            cache_root=Settings.from_env().cache_dir,
             include_audio=True,
             resident_blocks=1,
-            constructor_config=config,
         )
         video = Modality(
             latent=inputs["video_latent"],

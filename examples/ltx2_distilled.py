@@ -6,12 +6,14 @@ inside the lexical region where it is live, and every station consumes a
 materialized product from the station above it.
 """
 
-from __future__ import annotations
+# This custom recipe owns an invocation boundary through @memory_managed.
+# Its resources capture both memory controls from infrastructure Settings.
 
 import argparse
 from collections.abc import Sequence
 from pathlib import Path
 
+from kinomlx import memory_managed
 from kinomlx.artifacts import ArtifactSink, NullArtifactSink
 from kinomlx.components import ComponentLease
 from kinomlx.media.signals import BT709_SDR_420_DELIVERY, OutputColorPlan
@@ -26,6 +28,8 @@ from kinomlx.models.ltx2.decode import (
     decode_ltx23_sdr_frames,
     vocode_audio,
 )
+from kinomlx.models.ltx2.generation import GenerationOutput
+from kinomlx.models.ltx2.noising import GaussianNoiser
 from kinomlx.models.ltx2.pipelines.distilled import (
     StageLatents,
     build_generation_output,
@@ -34,14 +38,12 @@ from kinomlx.models.ltx2.pipelines.distilled import (
     prepare_stage_conditions,
     prepare_text_conditioning,
     release_stage_temporaries,
-    reported_phase,
+    resolve_adapter_profiles,
     resolve_auto_frame_count,
-    resolve_lora_profiles,
     run_stage,
     upscale_between_stages,
 )
 from kinomlx.models.ltx2.resources import LTX2Resources, prepare_resources
-from kinomlx.models.ltx2.runner import GenerationOutput
 from kinomlx.models.ltx2.settings import LTX2Settings
 from kinomlx.models.ltx2.sigmas import (
     DISTILLED_STAGE_1_SIGMAS,
@@ -49,14 +51,15 @@ from kinomlx.models.ltx2.sigmas import (
 )
 from kinomlx.models.ltx2.signals import ltx23_sdr_signal
 from kinomlx.models.ltx2.text_conditioning import TextConditioner
+from kinomlx.models.ltx2.transition_noise import SeededGaussianNoise
 from kinomlx.models.ltx2.types import DistilledRequest
 from kinomlx.output import VideoToolboxGenerationSink
-from kinomlx.reporting import NullReporter, Reporter
-from kinomlx.samplers.noisers import GaussianNoiser, SeededGaussianNoise
+from kinomlx.reporting import NullReporter, Reporter, reported_phase
 from kinomlx.settings import Settings
 from kinomlx.types import VideoPixelShape
 
 
+@memory_managed
 def compose_distilled(
     request: DistilledRequest,
     resources: LTX2Resources,
@@ -90,7 +93,7 @@ def compose_distilled(
                 text,
                 duration_predictor,
             )
-    stage_1_profile, stage_2_profile = resolve_lora_profiles(request)
+    stage_1_profile, stage_2_profile = resolve_adapter_profiles(request)
     noiser = GaussianNoiser(request.seed, backend=request.noise_backend)
     transition_noise = (
         None
@@ -129,7 +132,7 @@ def compose_distilled(
     del stage_1_conditions
 
     transformer: ComponentLease[TransformerPort] | None = None
-    lora_receipts: list[dict[str, object]] = []
+    adapter_receipts: list[dict[str, object]] = []
     final_latents: StageLatents
     try:
         with reported_phase(progress, "load stage 1 transformer"):
@@ -138,10 +141,10 @@ def compose_distilled(
                 stage_1_profile,
             )
             stages = (1, 2) if stage_1_profile == stage_2_profile else (1,)
-            for receipt in transformer.value.lora_receipts:
+            for receipt in transformer.value.adapter_receipts:
                 metadata = receipt.to_metadata()
                 metadata["stages"] = stages
-                lora_receipts.append(metadata)
+                adapter_receipts.append(metadata)
         stage_1_latents = run_stage(
             stage_1,
             transformer.value,
@@ -208,10 +211,10 @@ def compose_distilled(
                     resources,
                     stage_2_profile,
                 )
-                for receipt in transformer.value.lora_receipts:
+                for receipt in transformer.value.adapter_receipts:
                     metadata = receipt.to_metadata()
                     metadata["stages"] = (2,)
-                    lora_receipts.append(metadata)
+                    adapter_receipts.append(metadata)
         final_latents = run_stage(
             stage_2,
             transformer.value,
@@ -281,7 +284,7 @@ def compose_distilled(
         sample_rate=sample_rate,
         frame_count=frame_count,
         generated_keyframe_indices=generated_indices,
-        lora_receipts=lora_receipts,
+        adapter_receipts=adapter_receipts,
         initial_noise_state=initial_noise_state,
         ancestral_noise_state=(None if transition_noise is None else transition_noise.state),
     )

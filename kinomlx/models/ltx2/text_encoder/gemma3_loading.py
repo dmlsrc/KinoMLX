@@ -1,12 +1,10 @@
 """Complete consumed-target loading for the allocation-light Gemma 3 backbone."""
 
-from __future__ import annotations
-
 from pathlib import Path
 
+from kinomlx.modeling.loading import WeightTarget, bind_weight_targets
 from kinomlx.reporting import Reporter
 
-from ._loading import WeightTarget, bind_weight_targets
 from .gemma3 import Gemma3Model
 
 

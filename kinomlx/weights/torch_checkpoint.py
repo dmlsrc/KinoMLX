@@ -1,7 +1,5 @@
 """Restricted, torch-free reader for zip-format PyTorch tensor checkpoints."""
 
-from __future__ import annotations
-
 import collections
 import io
 import pickle
@@ -74,7 +72,7 @@ class _StorageRef:
 
 
 class _LazyTensor:
-    __slots__ = ("storage", "offset", "shape", "strides")
+    __slots__ = ("offset", "shape", "storage", "strides")
 
     def __init__(
         self,
@@ -496,8 +494,5 @@ def load_restricted_checkpoint(
 __all__ = [
     "CheckpointReadLimits",
     "RestrictedCheckpoint",
-    "RestrictedCheckpointError",
     "load_restricted_checkpoint",
-    "scan_pickle_globals",
-    "suspicious_globals",
 ]

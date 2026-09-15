@@ -13,8 +13,6 @@ and transposes conv weights at load time (remappings live as data in
 :func:`checkpoint_key_map`).
 """
 
-from __future__ import annotations
-
 import math
 from pathlib import Path
 
@@ -278,8 +276,8 @@ def load_gmnet_weights(path: Path | str) -> tuple[GMNet, dict[str, str]]:
 __all__ = [
     "EXPECTED_CHECKPOINT_KEYS",
     "FEATURES",
-    "GMNet",
     "THUMBNAIL_SIZE",
+    "GMNet",
     "adaptive_average_pool",
     "checkpoint_key_map",
     "load_gmnet_weights",

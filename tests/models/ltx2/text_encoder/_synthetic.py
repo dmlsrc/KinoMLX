@@ -1,13 +1,11 @@
 """Test-owned synthetic parameter materialization for small text graphs."""
 
-from __future__ import annotations
-
 from collections.abc import Mapping
 
 import mlx.core as mx
 
 import kinomlx._mlx_nn as nn
-from kinomlx.models.ltx2.text_encoder._loading import WeightTarget
+from kinomlx.modeling.loading import WeightTarget
 from kinomlx.models.ltx2.text_encoder.encoder import AudioVideoGemmaTextEncoderModel
 from kinomlx.models.ltx2.text_encoder.gemma3 import Gemma3Model
 from kinomlx.models.ltx2.text_encoder.gemma3_loading import _targets as _gemma3_targets

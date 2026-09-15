@@ -1,7 +1,5 @@
 """The model stack stays self-contained: mlx-lm is reference-only."""
 
-from __future__ import annotations
-
 import subprocess
 import sys
 

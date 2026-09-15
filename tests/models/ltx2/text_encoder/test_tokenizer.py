@@ -1,12 +1,10 @@
-from __future__ import annotations
-
 import logging
 
 import mlx.core as mx
 import pytest
 
 from kinomlx.models.ltx2.text_encoder import GemmaTokenizer
-from kinomlx.models.ltx2.text_encoder.encoder import _trim_left_padding
+from kinomlx.models.ltx2.text_encoder.prompt import _trim_left_padding
 
 
 class _Processor:
@@ -17,6 +15,8 @@ class _Processor:
 
 def _tokenizer() -> GemmaTokenizer:
     tokenizer = object.__new__(GemmaTokenizer)
+    tokenizer._splitter = None
+    tokenizer._literal_tokens = {}
     tokenizer._processor = _Processor()  # type: ignore[attr-defined]
     tokenizer.bos_id = 2
     tokenizer.eos_id = 1
@@ -74,7 +74,7 @@ def test_invisible_prompt_characters_warn_once_without_mutation(
     offset: str,
 ) -> None:
     processor = _RecordingProcessor()
-    tokenizer = object.__new__(GemmaTokenizer)
+    tokenizer = _tokenizer()
     tokenizer._processor = processor  # type: ignore[attr-defined]
     tokenizer.bos_id = 2
     tokenizer.eos_id = 1
@@ -103,7 +103,7 @@ def test_visible_prompt_text_does_not_warn(
     prompt: str,
 ) -> None:
     processor = _RecordingProcessor()
-    tokenizer = object.__new__(GemmaTokenizer)
+    tokenizer = _tokenizer()
     tokenizer._processor = processor  # type: ignore[attr-defined]
     tokenizer.bos_id = 2
     tokenizer.eos_id = 1

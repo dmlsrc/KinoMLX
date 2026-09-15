@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import json
 
 import mlx.core as mx
@@ -14,7 +12,7 @@ from kinomlx.models.ltx2.text_encoder import (
     load_av_text_encoder_v2_weights,
     norm_and_concat_per_token_rms,
 )
-from kinomlx.reporting import RecordingReporter
+from tests._reporting import RecordingReporter
 
 from ._synthetic import initialize_test_parameters
 
@@ -106,16 +104,10 @@ def test_connector_extends_real_tokens_to_full_context() -> None:
     assert tuple(output.attention_mask.shape) == (1, 1024)
     assert mx.all(output.attention_mask == 1).item()
     assert mx.all(mx.isfinite(output.video_encoding)).item()
-    assert reporter.events[0] == (
-        "start",
-        "project audio/video text context",
-        {"total": 3, "unit": "stage"},
-    )
-    assert reporter.events[-1] == (
-        "end",
-        "project audio/video text context",
-        {},
-    )
+    assert reporter.events == [
+        ("start", "project audio/video text context", {"total": None, "unit": "it"}),
+        ("end", "project audio/video text context", {}),
+    ]
 
 
 def test_public_connector_rejects_padded_attention_masks_explicitly() -> None:

@@ -1,7 +1,5 @@
 """Atomic publication helpers for single-file product artifacts."""
 
-from __future__ import annotations
-
 import os
 import secrets
 import stat
@@ -44,17 +42,25 @@ def _open_atomic_temporary(destination: Path, temp_suffix: str) -> tuple[int, Pa
 
 
 @contextmanager
-def atomic_output_path(path: Path | str, *, temp_suffix: str) -> Iterator[Path]:
+def atomic_output_path(
+    path: Path | str,
+    *,
+    temp_suffix: str,
+    mode: int | None = None,
+) -> Iterator[Path]:
     """Yield a same-directory temporary and atomically publish it on success.
 
-    New outputs receive ordinary ``0666 & ~umask`` permissions. Replacing an
-    existing regular file preserves its permission bits across the inode swap.
+    New outputs receive ordinary ``0666 & ~umask`` permissions unless an
+    explicit publication mode is supplied. Replacing an existing regular file
+    preserves its permission bits unless that explicit mode overrides them.
     """
     destination = Path(path)
     destination.parent.mkdir(parents=True, exist_ok=True)
     existing_mode = _existing_regular_mode(destination)
     descriptor, temporary, creation_mode = _open_atomic_temporary(destination, temp_suffix)
-    publication_mode = creation_mode if existing_mode is None else existing_mode
+    publication_mode = (
+        mode if mode is not None else creation_mode if existing_mode is None else existing_mode
+    )
     try:
         descriptor_to_close = descriptor
         descriptor = -1
@@ -68,9 +74,15 @@ def atomic_output_path(path: Path | str, *, temp_suffix: str) -> Iterator[Path]:
         temporary.unlink(missing_ok=True)
 
 
-def write_text_atomic(path: Path | str, text: str, *, encoding: str = "utf-8") -> None:
+def write_text_atomic(
+    path: Path | str,
+    text: str,
+    *,
+    encoding: str = "utf-8",
+    mode: int | None = None,
+) -> None:
     """Atomically replace one text artifact after its complete write succeeds."""
-    with atomic_output_path(path, temp_suffix=".tmp") as temporary:
+    with atomic_output_path(path, temp_suffix=".tmp", mode=mode) as temporary:
         temporary.write_text(text, encoding=encoding)
 
 

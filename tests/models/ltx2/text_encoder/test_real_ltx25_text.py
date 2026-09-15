@@ -1,7 +1,5 @@
 """Opt-in layerwise and whole-backbone parity for the LTX-tuned Gemma 4."""
 
-from __future__ import annotations
-
 import gc
 import hashlib
 import os
@@ -74,7 +72,7 @@ def _assert_boundary(name: str, candidate: mx.array, reference: mx.array) -> Non
     )
 
 
-@pytest.mark.requires_weights
+@pytest.mark.heavy
 def test_real_ltx25_gemma4_matches_all_frozen_boundaries() -> None:
     checkpoint = _required_path("KINO_LTX25_TEXT_ENCODER_PATH")
     fixture_dir = _required_path("KINO_LTX25_TEXT_FIXTURE_DIR", directory=True)

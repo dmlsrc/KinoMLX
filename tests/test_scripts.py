@@ -7,8 +7,6 @@ API drift fails in the suite instead of on someone's terminal. ``main()`` stays
 guarded by ``__name__``, so loading the module runs no scenarios.
 """
 
-from __future__ import annotations
-
 import importlib.util
 from pathlib import Path
 

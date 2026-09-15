@@ -1,30 +1,35 @@
 """Stateless recipe host over immutable GMNet resources and public ports."""
 
-from __future__ import annotations
-
+import logging
+from functools import partial
 from typing import Protocol
 
+from kinomlx.api_boundaries import APIBoundary, configuration, runtime
 from kinomlx.errors import KinoMLXError
+from kinomlx.recipe_host import execute_recipe
 from kinomlx.reporting import NullReporter, Reporter
 from kinomlx.settings import Settings
 
 from .components import GMNetComponents, NativeGMNetComponents
 from .expand import ExpansionResult
+from .pipeline import expand_gmnet
 from .resources import GMNetResources, prepare_resources
 from .settings import GMNetSettings
-from .types import GMNetRequest
+from .types import GMNetExpandConfig, GMNetRequest
+
+_log = logging.getLogger(__name__)
 
 
 class GMNetError(KinoMLXError, RuntimeError):
     """Typed operational failure at the GMNet host boundary."""
 
 
-class Recipe(Protocol):
+class Recipe[RequestT](Protocol):
     """A public GMNet recipe callable hosted through standard ports."""
 
     def __call__(
         self,
-        request: GMNetRequest,
+        request: RequestT,
         resources: GMNetResources,
         *,
         components: GMNetComponents | None = None,
@@ -51,7 +56,6 @@ class GMNetRunner:
                 resources = prepare_resources(
                     selected,
                     infrastructure=infrastructure,
-                    reporter=self.reporter,
                 )
             except KinoMLXError:
                 raise
@@ -66,30 +70,50 @@ class GMNetRunner:
             components if components is not None else NativeGMNetComponents(self.reporter)
         )
 
-    def run(self, recipe: Recipe, request: GMNetRequest) -> ExpansionResult:
+    def run[RequestT](self, recipe: Recipe[RequestT], request: RequestT) -> ExpansionResult:
         """Run any GMNet recipe that accepts the standard stateless host ports."""
-        try:
-            output = recipe(
-                request,
-                self.resources,
-                components=self.components,
-                reporter=self.reporter,
-            )
-        except KinoMLXError:
-            raise
-        except FileNotFoundError:
-            raise
-        except (KeyError, OSError, TypeError, ValueError, RuntimeError) as exc:
-            raise GMNetError(f"GMNet expansion failed: {exc}") from exc
-        if not isinstance(output, ExpansionResult):
-            raise TypeError("a GMNet recipe must return ExpansionResult")
-        return output
+        return execute_recipe(
+            partial(
+                recipe, request, self.resources, components=self.components, reporter=self.reporter
+            ),
+            memory_policy=self.resources.memory_policy,
+            result_type=ExpansionResult,
+            error_type=GMNetError,
+            label="GMNet expansion",
+            logger=_log,
+        )
 
     def expand(self, request: GMNetRequest) -> ExpansionResult:
         """Run the standard SDR-to-HDR expansion recipe."""
-        from .pipeline import expand_gmnet
-
         return self.run(expand_gmnet, request)
 
 
-__all__ = ["GMNetError", "GMNetRunner", "Recipe"]
+API_BOUNDARIES = (
+    APIBoundary(
+        "gmnet",
+        GMNetRunner.__init__,
+        (
+            configuration("model_settings", GMNetSettings, "model_settings"),
+            configuration("infrastructure", Settings, "settings"),
+            runtime("resources", "prepared resource inventory"),
+            runtime("components", "component provider"),
+            runtime("reporter", "progress reporter"),
+        ),
+    ),
+    APIBoundary(
+        "gmnet",
+        GMNetRunner.run,
+        (
+            runtime("recipe", "recipe callable"),
+            runtime("request", "recipe-selected request port"),
+        ),
+    ),
+    APIBoundary(
+        "gmnet",
+        GMNetRunner.expand,
+        (configuration("request", GMNetExpandConfig, "expand", projection=True),),
+    ),
+)
+
+
+__all__ = ["API_BOUNDARIES", "GMNetError", "GMNetRunner", "Recipe"]
