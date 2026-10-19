@@ -7,24 +7,28 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import cast
 
-from kinomlx.config import ConfigError
+from kinomlx.config import ConfigError, ModelConfigSpec
 from kinomlx.config.persistence import rebase_configuration
 from kinomlx.config.provenance import PreparedConfig
-from kinomlx.config.stations import station_output_defaults
+from kinomlx.config.stages import stage_output_defaults
 from kinomlx.config_constraints import ChoiceConstraint
 from kinomlx.config_records import config_record
 from kinomlx.config_rules import validate_record
 from kinomlx.restart_receipts import input_receipt, read_restart_run
 
-from .artifacts import OUTPUT_POLICIES
+from .output_policies import OUTPUT_POLICIES
 from .restart_rules import (
-    LATENT_STAGE_CHOICES,
-    RESTART_ARTIFACTS,
-    RESTART_PHASE_CHOICES,
+    CONSUMES,
+    FINAL_LATENTS,
+    LATENT_STAGES,
+    LATENTS,
+    RESTART_INPUTS,
     RESTART_SELECTION,
-    LatentStage,
-    RestartPhase,
-    resolved_latent_stage,
+    RESTARTS,
+    STAGE_1_LATENTS,
+    TEXT_CONDITIONING,
+    LTX2Stage,
+    default_latent_stage,
 )
 
 _LOG = logging.getLogger(__name__)
@@ -33,57 +37,60 @@ _LOG = logging.getLogger(__name__)
 @config_record
 @dataclass(frozen=True)
 class RestartConfig:
-    """User-facing selection of a prior run and its first repeated station."""
+    """User-facing selection of a prior run and its first repeated stage."""
 
     run: Path
-    phase: RestartPhase = field(
-        default="decode",
+    stage: LTX2Stage = field(
+        default=LTX2Stage.DECODE,
         metadata={
-            "config_constraints": (ChoiceConstraint(RESTART_PHASE_CHOICES),),
+            "config_constraints": (ChoiceConstraint(RESTARTS),),
             "config_rules": (RESTART_SELECTION,),
         },
     )
-    latent_stage: LatentStage | None = field(
-        default=None, metadata={"config_constraints": (ChoiceConstraint(LATENT_STAGE_CHOICES),)}
+    latent_stage: LTX2Stage | None = field(
+        default=None, metadata={"config_constraints": (ChoiceConstraint(LATENT_STAGES),)}
     )
     latents: Path | None = None
 
 
 @config_record
 @dataclass(frozen=True)
-class DistilledRestart:
-    """One public, typed entry point into the distilled station graph."""
+class LTX2Restart:
+    """One public, typed entry point into the distilled stage graph."""
 
     latents: Path
-    phase: RestartPhase = field(
-        default="decode",
+    stage: LTX2Stage = field(
+        default=LTX2Stage.DECODE,
         metadata={
-            "config_constraints": (ChoiceConstraint(RESTART_PHASE_CHOICES),),
-            "config_rules": (RESTART_ARTIFACTS,),
+            "config_constraints": (ChoiceConstraint(RESTARTS),),
+            "config_rules": (RESTART_INPUTS,),
         },
     )
-    latent_stage: LatentStage | None = field(
-        default=None, metadata={"config_constraints": (ChoiceConstraint(LATENT_STAGE_CHOICES),)}
+    latent_stage: LTX2Stage | None = field(
+        default=None, metadata={"config_constraints": (ChoiceConstraint(LATENT_STAGES),)}
     )
     text_conditioning: Path | None = None
     source_model_generation: str | None = None
 
     @property
-    def selected_latent_stage(self) -> LatentStage:
-        return resolved_latent_stage(self.phase, self.latent_stage)
+    def selected_latent_stage(self) -> LTX2Stage:
+        """The stage whose latent this restart reads: the named one, or the latest before it."""
+        return (
+            self.latent_stage if self.latent_stage is not None else default_latent_stage(self.stage)
+        )
 
     @classmethod
     def decode(
         cls,
         latents: Path | str,
         *,
-        latent_stage: LatentStage = "final",
+        latent_stage: LTX2Stage = LTX2Stage.STAGE_2,
         source_model_generation: str | None = None,
-    ) -> DistilledRestart:
-        """Select direct decoding of a final or stage-1 latent product."""
+    ) -> LTX2Restart:
+        """Decode a saved latent product directly: stage 2's by default, or stage 1's."""
         return cls(
             latents=Path(latents),
-            phase="decode",
+            stage=LTX2Stage.DECODE,
             latent_stage=latent_stage,
             source_model_generation=source_model_generation,
         )
@@ -95,12 +102,11 @@ class DistilledRestart:
         *,
         text_conditioning: Path | str,
         source_model_generation: str | None = None,
-    ) -> DistilledRestart:
+    ) -> LTX2Restart:
         """Select stage 2 from a saved stage-1 latent and text product."""
         return cls(
             latents=Path(latents),
-            phase="stage-2",
-            latent_stage="stage-1",
+            stage=LTX2Stage.STAGE_2,
             text_conditioning=Path(text_conditioning),
             source_model_generation=source_model_generation,
         )
@@ -127,37 +133,37 @@ class RestartManifest:
     @property
     def selected_latents(self) -> Path:
         """Return the latent artifact consumed by this restart selection."""
-        selected = self.config.latents
+        if self.config.latents is not None:
+            return self.config.latents
+        artifact = LATENTS[self.selected_latent_stage]
+        selected = {STAGE_1_LATENTS: self.stage_1_latents, FINAL_LATENTS: self.final_latents}[
+            artifact
+        ]
         if selected is None:
-            selected = (
-                self.stage_1_latents
-                if self.config.phase == "stage-2" or self.config.latent_stage == "stage-1"
-                else self.final_latents
-            )
-        if selected is None:
-            artifact = (
-                "stage_1_latents"
-                if self.config.phase == "stage-2" or self.config.latent_stage == "stage-1"
-                else "final_latents"
-            )
             raise ConfigError(f"restart run {self.source_run} has no completed {artifact} output")
         return selected
 
     @property
-    def selected_latent_stage(self) -> LatentStage:
-        """Return the source stage represented by ``selected_latents``."""
-        return resolved_latent_stage(self.config.phase, self.config.latent_stage)
+    def selected_latent_stage(self) -> LTX2Stage:
+        """The stage whose latent ``selected_latents`` holds: the named one, or the latest before it."""
+        config = self.config
+        return (
+            config.latent_stage
+            if config.latent_stage is not None
+            else default_latent_stage(config.stage)
+        )
 
     def base_config(self) -> PreparedConfig:
         """Return the prior invocation as a safe lower-precedence config layer."""
         base = copy.deepcopy(self.configuration.values)
         base.pop("restart", None)
+        base["operation"] = {"dry_run": False}
 
         raw_generate = base.get("generate")
         generate: dict[str, object] = (
             {} if not isinstance(raw_generate, dict) else dict(raw_generate)
         )
-        if self.config.phase == "stage-2" and self.text_conditioning is not None:
+        if TEXT_CONDITIONING in CONSUMES[self.config.stage] and self.text_conditioning is not None:
             generate["text_conditioning"] = self.text_conditioning
         if self.source_video_shape is not None:
             batch, channels, frames, height, width = self.source_video_shape
@@ -178,8 +184,8 @@ class RestartManifest:
 
         raw_artifacts = base.get("model_artifacts", {})
         model_artifacts = cast(dict[str, object], raw_artifacts)
-        base["model_artifacts"] = station_output_defaults(
-            model_artifacts, OUTPUT_POLICIES, station=self.config.phase
+        base["model_artifacts"] = stage_output_defaults(
+            model_artifacts, OUTPUT_POLICIES, stage=self.config.stage
         )
 
         raw_output = base.get("output")
@@ -190,7 +196,7 @@ class RestartManifest:
             if source_video is not None
             else self.source_run.stem.removesuffix("_run")
         )
-        if self.config.phase == "stage-2":
+        if self.config.stage == LTX2Stage.STAGE_2:
             suffix = "stage2"
         else:
             suffix = f"{self.selected_latent_stage.replace('-', '')}_decode"
@@ -213,9 +219,7 @@ class RestartManifest:
         decoder_seed: int,
     ) -> dict[str, object]:
         """Return parent-run provenance and observational input identities."""
-        latent_name = (
-            "stage_1_latents" if self.selected_latent_stage == "stage-1" else "final_latents"
-        )
+        latent_name = LATENTS[self.selected_latent_stage]
         inputs: dict[str, dict[str, object]] = {
             latent_name: input_receipt(
                 self.selected_latents,
@@ -224,9 +228,11 @@ class RestartManifest:
                 expected_metadata=_expected_metadata(latent_name),
             )
         }
-        if self.config.phase == "stage-2":
+        if TEXT_CONDITIONING in CONSUMES[self.config.stage]:
             if text_conditioning is None:
-                raise ConfigError("stage-2 restart requires a text-conditioning sidecar")
+                raise ConfigError(
+                    f"{self.config.stage} restart requires a text-conditioning sidecar"
+                )
             inputs["text_conditioning"] = input_receipt(
                 text_conditioning,
                 name="text_conditioning",
@@ -239,7 +245,7 @@ class RestartManifest:
             "source_schema_version": self.source_schema_version,
             "source_model": self.source_model,
             "source_model_generation": self.source_model_generation,
-            "phase": self.config.phase,
+            "stage": self.config.stage,
             "latent_stage": self.selected_latent_stage,
             "decoder_seed": decoder_seed,
             "inputs": inputs,
@@ -347,10 +353,10 @@ def _source_output_fingerprints(
     return fingerprints
 
 
-def load_restart_manifest(config: RestartConfig) -> RestartManifest:
+def load_restart_manifest(config: RestartConfig, *, schema: ModelConfigSpec) -> RestartManifest:
     """Load one KinoMLX run JSON and resolve only confirmed output artifacts."""
     validate_record(config, location="[restart]")
-    run_log = read_restart_run(config.run, model="ltx2")
+    run_log = read_restart_run(config.run, schema=schema)
     source = run_log.source
     payload = run_log.payload
     configuration = run_log.configuration
@@ -367,7 +373,7 @@ def load_restart_manifest(config: RestartConfig) -> RestartManifest:
     manifest = RestartManifest(
         config=RestartConfig(
             run=source,
-            phase=config.phase,
+            stage=config.stage,
             latent_stage=config.latent_stage,
             latents=(None if config.latents is None else config.latents.expanduser().absolute()),
         ),
@@ -403,12 +409,8 @@ def load_restart_manifest(config: RestartConfig) -> RestartManifest:
 
 
 __all__ = [
-    "LATENT_STAGE_CHOICES",
-    "RESTART_PHASE_CHOICES",
-    "DistilledRestart",
-    "LatentStage",
+    "LTX2Restart",
     "RestartConfig",
     "RestartManifest",
-    "RestartPhase",
     "load_restart_manifest",
 ]

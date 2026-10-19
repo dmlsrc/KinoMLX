@@ -60,7 +60,7 @@ class GaussianNoiser:
     def advance(self, shape: tuple[int, ...]) -> None:
         """Advance one known tensor draw without materializing its values.
 
-        Restarting a later station must preserve both MLX key splits and the
+        Restarting a later stage must preserve both MLX key splits and the
         Torch-MPS Philox offset established by earlier modality draws.
         """
         self._noise.advance(shape)

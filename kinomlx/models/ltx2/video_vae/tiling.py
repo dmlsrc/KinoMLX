@@ -14,10 +14,22 @@ from kinomlx.reporting import NullReporter, Reporter
 from kinomlx.samplers.noise import NoiseStreamState
 from kinomlx.types import DEFAULT_NOISE_BACKEND, NoiseBackend
 
+from . import diffusion_fused
+from .diffusion_fused import SWIGLU_TILE_TOKENS
+from .kinds import VideoVAEKind
+from .sharpening import ContextSharpening
+
 _log = logging.getLogger(__name__)
 
 DEFAULT_TEMPORAL_SCALE = 8
 DEFAULT_SPATIAL_SCALE = 32
+
+# Spatial tile sizes the diffusion tiler considers, largest first; temporal tiles are chosen
+# by count (`_equalized_temporal_tiles`). The overlap each tile recomputes is 24 frames and 64
+# pixels.
+_DIFFUSION_SPATIAL_TILES = (None, 1024, 768, 512, 256, 128, 64)
+_TEMPORAL_OVERLAP_FRAMES = 24
+_SHORTEST_TEMPORAL_TILE = 16
 
 
 class DecoderCallable(Protocol):
@@ -41,12 +53,61 @@ def _strict_int(value: object, *, field: str, minimum: int) -> int:
     return value
 
 
-def _estimate_native_conv3d_peak_gb(
+def tile_intervals(
+    length: int,
+    tile_size: int,
+    stride: int,
+    min_size: int,
+) -> list[tuple[int, int]]:
+    """Overlapping ``[start, end)`` tiles of ``length``: starts every ``stride``, each
+    ``tile_size`` long, and a last tile shorter than ``min_size`` merged into the one before."""
+    if length <= tile_size:
+        return [(0, length)]
+    starts = list(range(0, length, stride))
+    while len(starts) > 1 and length - starts[-1] < min_size:
+        starts.pop()
+    return [(start, min(start + tile_size, length)) for start in starts[:-1]] + [
+        (starts[-1], length)
+    ]
+
+
+def _equalized_temporal_tiles(length: int) -> list[int]:
+    """Temporal tile lengths (decoded frames, multiples of 8) that cut ``length`` stage-4 frames
+    into 2, 3, 4, ... tiles of as nearly equal length as the stride allows, fewest tiles first.
+
+    A plan's work is set by its tile count (every tile past the first recomputes the overlap),
+    so for a given count the shortest tile that still gives that count has the smallest peak:
+    for 721 decoded frames, 384, 264, 208 and 168 frames give 2, 3, 4 and 5 tiles, where a
+    fixed ladder's 224-frame tiles also gave 4 with a short last one.
+    """
+    sizes: list[int] = []
+    for count in range(2, length + 1):
+        # The shortest multiple of 8 whose intervals number `count`: the count only falls as
+        # the tile grows, so step up from the overlap-free length.
+        size = max(_SHORTEST_TEMPORAL_TILE, -(-2 * length // (8 * count)) * 8)
+        while True:
+            tile = size // _STAGE4_TIME_SCALE
+            if tile >= length:
+                return sizes
+            overlap = min(_TEMPORAL_OVERLAP_FRAMES, size - 8) // _STAGE4_TIME_SCALE
+            tiles = len(tile_intervals(length, tile, tile - overlap, _STAGE4_MIN_TILE))
+            if tiles <= count:
+                break
+            size += 8
+        if tiles == count and (not sizes or size < sizes[-1]):
+            sizes.append(size)
+        if size <= _SHORTEST_TEMPORAL_TILE:
+            return sizes
+    return sizes
+
+
+def _estimate_conv3d_peak_gb(
     height: int,
     width: int,
     tile_frames: int,
     *,
     compute_dtype: mx.Dtype = mx.bfloat16,
+    optimized_fp16: bool = False,
 ) -> float:
     """Estimate incremental Conv3d peak above the VAE-entry live set.
 
@@ -54,19 +115,23 @@ def _estimate_native_conv3d_peak_gb(
     at 33 and 65 decoded frames. The 121-frame 768x448 MLX 0.32.2 check
     reached 30.02 GB above the entry live set; a coefficient of 0.38 also
     covers that longer decode. FP32 doubles the activation/workspace
-    estimate; tiled output assembly is accounted separately in FP32.
+    estimate. The eager FP16 Winograd decoder has a separate measured
+    envelope; tiled output assembly is accounted separately in FP32.
     """
     if height <= 0 or width <= 0 or tile_frames <= 0:
         raise ValueError("decode dimensions must be positive")
-    # FP16 activations with the checkpoint's BF16 Conv3d weights promote to
-    # FP32 in MLX, so FP16 is not a truthful low-precision planner input.
-    if compute_dtype == mx.bfloat16:
+    area_scale = (height * width) / (1024 * 576)
+    if compute_dtype == mx.float16 and optimized_fp16:
+        # The selected LTX-2.3/2.5 decoder uses eager FP16 Winograd bands.
+        # This envelope covers measured 64/128/160/256-frame 768x448 tiles;
+        # auto_conv3d adds the separate full-frame assembly allowance.
+        return 4.0 + (5.0 + 0.10 * tile_frames) * area_scale
+    if compute_dtype in (mx.bfloat16, mx.float16):
         dtype_scale = 1.0
     elif compute_dtype == mx.float32:
         dtype_scale = 2.0
     else:
         raise ValueError(f"unsupported native Conv3d compute dtype {compute_dtype}")
-    area_scale = (height * width) / (1024 * 576)
     return (4.2 + 0.38 * tile_frames * area_scale) * dtype_scale
 
 
@@ -87,6 +152,153 @@ def _estimate_tiled_assembly_gb(
     return height * width * tile_frames * channels * 4 * 4 / 1_000_000_000
 
 
+# The diffusion decoder's stage-5 width and SwiGLU hidden width, and on its FP16 kernel route
+# the feature-sized buffers each half of a block holds at once. The attention half holds its
+# residual, its normalized rows, Q, K and V; the attention and proj outputs take buffers those
+# free. The SwiGLU half holds its residual, its normalized rows and its result beside the
+# gate/up products and SiLU outputs of the few tiles MLX, evaluating the tiles' assignments
+# into the result in order, has encoded ahead of the GPU (1.9 GB, about four tiles, measured
+# on a 768x448x65 decode).
+_STAGE5_CHANNELS = 256
+_STAGE5_HIDDEN = 1024
+_KERNEL_ROUTE_ATTENTION_FEATURES = 5
+_KERNEL_ROUTE_SWIGLU_FEATURES = 3
+_SWIGLU_TILES_IN_FLIGHT = 5
+# The final stage's attention: four 64-wide heads over an 11x11x11 window. Its whole-volume
+# kernels bound a tile (`diffusion_fused.addressable`); the earlier stages hold at most an
+# eighth of its tokens.
+_STAGE5_HEADS = 4
+_STAGE5_WINDOW = (11, 11, 11)
+
+
+def _diffusion_grid(height: int, width: int) -> tuple[int, int]:
+    """The decoder's working grid for a requested size: whole 32-pixel latents, and at least
+    the 3x7x7 latent the official decoder pads tiny images to."""
+    return max(224, math.ceil(height / 32) * 32), max(224, math.ceil(width / 32) * 32)
+
+
+def _stage5_grid(height: int, width: int, frames: int) -> tuple[int, int, int]:
+    """The final stage's ``(T, H, W)`` token grid of a tile: full frame rate, a quarter of the
+    pixels per axis."""
+    return frames, math.ceil(height / 4), math.ceil(width / 4)
+
+
+def _stage5_tokens(height: int, width: int, frames: int) -> int:
+    return math.prod(_stage5_grid(height, width, frames))
+
+
+def _latent_context_bytes(height: int, width: int, num_frames: int, compute_dtype: mx.Dtype) -> int:
+    """The whole-clip context the tiles read, as the peak bound counts it: 8 bytes per output
+    pixel and frame (16 in FP32), with 16 frames of latent alignment and trailing context."""
+    itemsize = 4 if compute_dtype == mx.float32 else 2
+    return height * width * (num_frames + 16) * 4 * itemsize
+
+
+def device_buffer_limit() -> int:
+    """The largest buffer this device allocates, in bytes: MLX refuses a larger one."""
+    return int(mx.device_info()["max_buffer_length"])
+
+
+def _estimate_kernel_route_peak_gb(height: int, width: int, frames: int) -> float:
+    """Bound the FP16 kernel route's stage-5 live set above the resident weights and the
+    stage-3 context: the tile's latent context, the larger of a block's two halves, and 1 GiB
+    for the noise, the modulation and the kernels' workspaces.
+
+    On an M1 Max, 768x448 decodes of 65 and 121 frames in one pass at a 16 GiB cache peaked
+    5.00 and 8.44 GB above the resident weights (the SwiGLU half, then the attention half);
+    this bound gives 6.12 and 9.07. The first 128-frame tile of a 1024x576x721 decode peaked
+    at 19.2 GB in all, 22.8 bounded with the context and the tile assembly.
+    """
+    tokens = _stage5_tokens(height, width, frames)
+    feature_bytes = tokens * _STAGE5_CHANNELS * 2
+    tiles = -(-tokens // SWIGLU_TILE_TOKENS)
+    tile_bytes = SWIGLU_TILE_TOKENS * (3 * _STAGE5_HIDDEN + _STAGE5_CHANNELS) * 2
+    attention_bytes = _KERNEL_ROUTE_ATTENTION_FEATURES * feature_bytes
+    swiglu_bytes = (
+        _KERNEL_ROUTE_SWIGLU_FEATURES * feature_bytes
+        + min(tiles, _SWIGLU_TILES_IN_FLIGHT) * tile_bytes
+    )
+    return (feature_bytes + max(attention_bytes, swiglu_bytes) + 1024**3) / 1_000_000_000
+
+
+# What an FP16 decode's tiles cost under a plan, fitted on an M1 Max to the first tile of
+# 1024x576x721 decodes (a tile's time is proportional to its frames, and the first tile
+# reproduces the full decodes' tiles: 128-frame tiles at a 16 GiB cache took 20.7 s each and
+# the decode 152.1 s, 192-frame tiles 31.2 s and 145.4 s). On the kernel route: 4.35 us per
+# stage-5 token of every tile, overlaps included, about 0.3 s a tile for its noise, blend and
+# cache clear, and, measured as system time, 0.25 s per tile for each gigabyte by which 4.5 of
+# the tile's stage-5 features (the five an attention half holds, less what the cache keeps of
+# them) exceed the allocator cache: 192-frame tiles took 32.4 s at 8 GiB and 34.5 s at 4 GiB,
+# 128-frame tiles 21.3 s at 8 GiB, 224-frame tiles 37.0 s at 16 GiB, all within 0.6 s of the
+# fit. The constants rank plans; they do not predict another machine's seconds.
+_SECONDS_PER_STAGE5_TOKEN = 4.35e-6
+_CHURN_FEATURES = 4.5
+_CHURN_SECONDS_PER_GB = 0.25
+_SECONDS_PER_TILE = 0.3
+# The decoder tiles stage 4, which runs at half the output's frame rate and an eighth of its
+# pixels per axis, and merges a last tile shorter than its windows need.
+_STAGE4_TIME_SCALE = 2
+_STAGE4_SPACE_SCALE = 8
+_STAGE4_MIN_TILE = 6
+
+
+def estimated_diffusion_seconds(
+    config: TilingConfig | None,
+    height: int,
+    width: int,
+    frames: int,
+    *,
+    cache_gb: float,
+) -> float:
+    """Rank an FP16 diffusion decode plan: the tiles' stage-4 and stage-5 work, overlaps
+    included, plus the time to fault in the buffers a ``cache_gb`` allocator cache cannot
+    hold. Stages 1 to 3 cost the same under every plan and are left out."""
+    temporal = None if config is None else config.temporal_config
+    spatial = None if config is None else config.spatial_config
+    length_t = (frames - 1) // _STAGE4_TIME_SCALE + 1
+    length_h = height // _STAGE4_SPACE_SCALE
+    length_w = width // _STAGE4_SPACE_SCALE
+
+    def lengths(length: int, size: int | None, overlap: int, scale: int) -> list[int]:
+        if size is None:
+            return [length]
+        tile = size // scale
+        stride = (size - overlap) // scale
+        return [
+            end - start for start, end in tile_intervals(length, tile, stride, _STAGE4_MIN_TILE)
+        ]
+
+    times = lengths(
+        length_t,
+        None if temporal is None else temporal.chunk_size_in_frames,
+        0 if temporal is None else temporal.chunk_overlap_in_frames,
+        _STAGE4_TIME_SCALE,
+    )
+    rows = lengths(
+        length_h,
+        None if spatial is None else spatial.tile_size_in_pixels,
+        0 if spatial is None else spatial.tile_overlap_in_pixels,
+        _STAGE4_SPACE_SCALE,
+    )
+    columns = lengths(
+        length_w,
+        None if spatial is None else spatial.tile_size_in_pixels,
+        0 if spatial is None else spatial.tile_overlap_in_pixels,
+        _STAGE4_SPACE_SCALE,
+    )
+    cache_bytes = cache_gb * 1024**3
+    seconds = 0.0
+    for t in times:
+        for h in rows:
+            for w in columns:
+                tokens = 8 * t * h * w
+                feature_bytes = tokens * _STAGE5_CHANNELS * 2
+                churn = max(0.0, _CHURN_FEATURES * feature_bytes - cache_bytes)
+                seconds += tokens * _SECONDS_PER_STAGE5_TOKEN + _SECONDS_PER_TILE
+                seconds += churn / 1_000_000_000 * _CHURN_SECONDS_PER_GB
+    return seconds
+
+
 def _estimate_diffusion_peak_gb(
     height: int,
     width: int,
@@ -100,12 +312,18 @@ def _estimate_diffusion_peak_gb(
     feature-sized buffers cover context, residuals, normalization, and the
     temporal QKV partition; 1 GiB covers the bounded attention/FF workspaces.
     Include the decoder's latent alignment and two trailing context frames.
+    FP16 decodes take the kernel route, whose whole-grid half-blocks are
+    bounded separately.
     """
     if compute_dtype not in (mx.bfloat16, mx.float16, mx.float32):
         raise ValueError(f"unsupported diffusion VAE compute dtype {compute_dtype}")
+    if compute_dtype == mx.float16:
+        return _estimate_kernel_route_peak_gb(height, width, frames)
     itemsize = 4 if compute_dtype == mx.float32 else 2
     padded_frames = math.ceil(frames / 8) * 8 + 16
-    feature_bytes = padded_frames * math.ceil(height / 4) * math.ceil(width / 4) * 256 * itemsize
+    feature_bytes = (
+        padded_frames * math.ceil(height / 4) * math.ceil(width / 4) * _STAGE5_CHANNELS * itemsize
+    )
     return (8 * feature_bytes + 1024**3 * (itemsize // 2)) / 1_000_000_000
 
 
@@ -220,6 +438,99 @@ class TilingConfig:
     spatial_config: SpatialTilingConfig | None = None
     temporal_config: TemporalChunkConfig | None = None
 
+    def estimated_peak_gb(
+        self,
+        height: int,
+        width: int,
+        num_frames: int,
+        *,
+        decoder_kind: VideoVAEKind,
+        compute_dtype: mx.Dtype,
+        optimized_fp16: bool = False,
+    ) -> float:
+        """Estimate a user-selected tile using the same bounds as auto tiling."""
+        spatial = self.spatial_config
+        temporal = self.temporal_config
+        spatial_tiled = spatial is not None
+        if decoder_kind == VideoVAEKind.DIFFUSION:
+            height, width = _diffusion_grid(height, width)
+        tile_height, tile_width, tile_frames = self._tile(height, width, num_frames)
+        tiled = spatial_tiled or temporal is not None
+        assembly_gb = (
+            _estimate_tiled_assembly_gb(height, width, tile_frames, spatial_tiled=spatial_tiled)
+            if tiled
+            else 0.0
+        )
+        if decoder_kind == VideoVAEKind.DIFFUSION:
+            context_gb = (
+                _latent_context_bytes(height, width, num_frames, compute_dtype) / 1_000_000_000
+            )
+            return (
+                _estimate_diffusion_peak_gb(
+                    tile_height, tile_width, tile_frames, compute_dtype=compute_dtype
+                )
+                + context_gb
+                + assembly_gb
+            )
+        return (
+            _estimate_conv3d_peak_gb(
+                tile_height,
+                tile_width,
+                tile_frames,
+                compute_dtype=compute_dtype,
+                optimized_fp16=optimized_fp16,
+            )
+            + assembly_gb
+        )
+
+    def _tile(self, height: int, width: int, num_frames: int) -> tuple[int, int, int]:
+        """This plan's tile: the whole grid where an axis is untiled, else the tile size,
+        and one frame more than a temporal tile for its trailing context."""
+        spatial = self.spatial_config
+        temporal = self.temporal_config
+        tile_height = height if spatial is None else min(height, spatial.tile_size_in_pixels)
+        tile_width = width if spatial is None else min(width, spatial.tile_size_in_pixels)
+        tile_frames = (
+            num_frames if temporal is None else min(num_frames, temporal.chunk_size_in_frames + 1)
+        )
+        return tile_height, tile_width, tile_frames
+
+    def kernel_route_feature_gb(self, height: int, width: int, num_frames: int) -> float:
+        """One stage-5 feature buffer of this plan's tile on the FP16 kernel route, in GB:
+        the unit the attention half holds five of and the allocator cache fills with."""
+        height, width = _diffusion_grid(height, width)
+        tile_height, tile_width, tile_frames = self._tile(height, width, num_frames)
+        tokens = _stage5_tokens(tile_height, tile_width, tile_frames)
+        return tokens * _STAGE5_CHANNELS * 2 / 1_000_000_000
+
+    def addressable(
+        self,
+        height: int,
+        width: int,
+        num_frames: int,
+        *,
+        compute_dtype: mx.Dtype,
+        max_buffer_bytes: int | None = None,
+    ) -> bool:
+        """Whether this plan's decode can be addressed: the clip's latent context and each
+        tile's stage-5 feature buffer within ``max_buffer_bytes`` (this device's buffer limit
+        when ``None``; MLX refuses a larger buffer), and on the FP16 kernel route the tile's
+        final-stage volume within its kernels' 32-bit launch counts
+        (``diffusion_fused.addressable``: 134,217,696 tokens, a 68.7 GB feature). A temporal
+        tile holds one frame more than its length."""
+        limit = device_buffer_limit() if max_buffer_bytes is None else max_buffer_bytes
+        height, width = _diffusion_grid(height, width)
+        tile_height, tile_width, tile_frames = self._tile(height, width, num_frames)
+        grid = _stage5_grid(tile_height, tile_width, tile_frames)
+        itemsize = 4 if compute_dtype == mx.float32 else 2
+        feature_bytes = math.prod(grid) * _STAGE5_CHANNELS * itemsize
+        context_bytes = _latent_context_bytes(height, width, num_frames, compute_dtype)
+        if max(feature_bytes, context_bytes) > limit:
+            return False
+        if compute_dtype != mx.float16:
+            return True
+        return diffusion_fused.addressable(grid, heads=_STAGE5_HEADS, window=_STAGE5_WINDOW)
+
     @classmethod
     def default(cls) -> TilingConfig:
         """Return the balanced 512/64 spatial and 64/24 temporal plan."""
@@ -238,15 +549,33 @@ class TilingConfig:
         memory_budget_gb: float | None = None,
         compute_dtype: mx.Dtype = mx.bfloat16,
     ) -> TilingConfig | None:
-        """Choose full or stage-tiled diffusion decode from current headroom."""
-        height = _strict_int(height, field="height", minimum=1)
-        width = _strict_int(width, field="width", minimum=1)
-        num_frames = _strict_int(num_frames, field="num_frames", minimum=1)
-        # The official decoder pads to a 3x7x7 latent before its first stage.
-        # Planning tiny requested images must account for that working grid.
-        height = max(224, math.ceil(height / 32) * 32)
-        width = max(224, math.ceil(width / 32) * 32)
-        num_frames = max(17, num_frames)
+        """Choose full or stage-tiled diffusion decode from current headroom: the largest plan
+        that fits, a single pass when it does."""
+        options = cls.diffusion_options(
+            height,
+            width,
+            num_frames,
+            memory_budget_gb=memory_budget_gb,
+            compute_dtype=compute_dtype,
+        )
+        if not options:
+            raise MemoryError("No diffusion VAE tile fits the available decode memory budget")
+        return options[0]
+
+    @classmethod
+    def diffusion_options(
+        cls,
+        height: int,
+        width: int,
+        num_frames: int,
+        *,
+        memory_budget_gb: float | None = None,
+        compute_dtype: mx.Dtype = mx.bfloat16,
+        max_buffer_bytes: int | None = None,
+    ) -> list[TilingConfig | None]:
+        """Every diffusion decode plan whose estimated peak fits the headroom, in the order of
+        ``diffusion_candidates`` (which leaves out what the device cannot address): ``None``
+        (a single pass) when it fits, then temporal tiles by count, then spatial tiles."""
         budget_gb = (
             capture_decode_memory_budget().available_gb
             if memory_budget_gb is None
@@ -254,46 +583,84 @@ class TilingConfig:
         )
         if not math.isfinite(budget_gb) or budget_gb <= 0:
             raise ValueError("memory_budget_gb must be positive")
-        full_peak = _estimate_diffusion_peak_gb(
-            height, width, num_frames, compute_dtype=compute_dtype
-        )
-        if full_peak <= budget_gb:
-            return None
-        # Stage 1-3 context remains resident even when later stages are tiled.
-        context_gb = height * width * (num_frames + 16) * 8 / 1_000_000_000
-        if compute_dtype == mx.float32:
-            context_gb *= 2
-        temporal_candidates = (None, 512, 256, 128, 80, 64, 40, 32, 16)
-        spatial_candidates = (None, 1024, 768, 512, 256, 128, 64)
-        for spatial_size in spatial_candidates:
+        # The decoder pads a clip to its shortest working grid, 17 frames.
+        num_frames = max(17, _strict_int(num_frames, field="num_frames", minimum=1))
+        return [
+            candidate
+            for candidate in cls.diffusion_candidates(
+                height,
+                width,
+                num_frames,
+                compute_dtype=compute_dtype,
+                max_buffer_bytes=max_buffer_bytes,
+            )
+            if (cls() if candidate is None else candidate).estimated_peak_gb(
+                height,
+                width,
+                num_frames,
+                decoder_kind=VideoVAEKind.DIFFUSION,
+                compute_dtype=compute_dtype,
+            )
+            <= budget_gb
+        ]
+
+    @classmethod
+    def diffusion_candidates(
+        cls,
+        height: int,
+        width: int,
+        num_frames: int,
+        *,
+        compute_dtype: mx.Dtype = mx.float16,
+        max_buffer_bytes: int | None = None,
+    ) -> list[TilingConfig | None]:
+        """Every diffusion decode plan the device addresses, memory aside: ``None`` (a single
+        pass), temporal tiles by count (fewest first, ``_equalized_temporal_tiles``), then each
+        spatial tile size alone and with those temporal tiles. A plan whose tiles the kernels or
+        the device cannot address (``addressable``) is left out, so no plan proposed can overflow
+        a kernel's index range; ``max_buffer_bytes`` defaults to this device's buffer limit.
+        Raises ``ValueError`` when the clip's latent context alone exceeds that limit."""
+        height = _strict_int(height, field="height", minimum=1)
+        width = _strict_int(width, field="width", minimum=1)
+        num_frames = _strict_int(num_frames, field="num_frames", minimum=1)
+        height, width = _diffusion_grid(height, width)
+        num_frames = max(17, num_frames)
+        candidates: list[TilingConfig | None] = [None]
+        stage4_frames = (num_frames - 1) // _STAGE4_TIME_SCALE + 1
+        temporal_sizes = _equalized_temporal_tiles(stage4_frames)
+        for spatial_size in _DIFFUSION_SPATIAL_TILES:
             if spatial_size is not None and spatial_size >= max(height, width):
                 continue
-            tile_height = height if spatial_size is None else min(height, spatial_size)
-            tile_width = width if spatial_size is None else min(width, spatial_size)
-            for temporal_size in temporal_candidates:
-                if temporal_size is not None and temporal_size >= num_frames:
-                    continue
-                tile_frames = num_frames if temporal_size is None else temporal_size
-                peak = _estimate_diffusion_peak_gb(
-                    tile_height, tile_width, tile_frames, compute_dtype=compute_dtype
-                )
-                peak += context_gb + _estimate_tiled_assembly_gb(
-                    height, width, tile_frames, spatial_tiled=spatial_size is not None
-                )
-                if peak > budget_gb:
-                    continue
+            # Spatial tiles with no temporal tiling first; one pass stands at the list's head.
+            for temporal_size in ([None] if spatial_size is not None else []) + temporal_sizes:
                 temporal = (
                     None
                     if temporal_size is None
-                    else TemporalChunkConfig(temporal_size, min(24, temporal_size - 8))
+                    else TemporalChunkConfig(
+                        temporal_size, min(_TEMPORAL_OVERLAP_FRAMES, temporal_size - 8)
+                    )
                 )
                 spatial = (
                     None
                     if spatial_size is None
                     else SpatialTilingConfig(spatial_size, min(64, spatial_size - 32))
                 )
-                return cls(spatial_config=spatial, temporal_config=temporal)
-        raise MemoryError("No diffusion VAE tile fits the available decode memory budget")
+                candidates.append(cls(spatial_config=spatial, temporal_config=temporal))
+        limit = device_buffer_limit() if max_buffer_bytes is None else max_buffer_bytes
+        addressable = [
+            candidate
+            for candidate in candidates
+            if (cls() if candidate is None else candidate).addressable(
+                height, width, num_frames, compute_dtype=compute_dtype, max_buffer_bytes=limit
+            )
+        ]
+        if not addressable:
+            context = _latent_context_bytes(height, width, num_frames, compute_dtype)
+            raise ValueError(
+                f"a {width}x{height}x{num_frames} diffusion decode's {context:,}-byte latent "
+                f"context exceeds this device's {limit:,}-byte buffer limit"
+            )
+        return addressable
 
     @classmethod
     def auto(
@@ -303,18 +670,21 @@ class TilingConfig:
         num_frames: int,
         memory_budget_gb: float | None = None,
         compute_dtype: mx.Dtype = mx.bfloat16,
+        *,
+        optimized_fp16: bool = False,
     ) -> TilingConfig | None:
         """Select the native Conv3d plan for an output geometry."""
-        return cls.auto_native_conv3d(
+        return cls.auto_conv3d(
             height,
             width,
             num_frames,
             memory_budget_gb=memory_budget_gb,
             compute_dtype=compute_dtype,
+            optimized_fp16=optimized_fp16,
         )
 
     @classmethod
-    def auto_native_conv3d(
+    def auto_conv3d(
         cls,
         height: int,
         width: int,
@@ -322,6 +692,7 @@ class TilingConfig:
         *,
         memory_budget_gb: float | None = None,
         compute_dtype: mx.Dtype = mx.bfloat16,
+        optimized_fp16: bool = False,
     ) -> TilingConfig | None:
         """Bound native Conv3d decode jobs by estimated peak memory."""
         height = _strict_int(height, field="height", minimum=1)
@@ -334,13 +705,16 @@ class TilingConfig:
         )
         if not math.isfinite(budget_gb) or budget_gb <= 0:
             raise ValueError("memory_budget_gb must be positive")
-        full_peak_gb = _estimate_native_conv3d_peak_gb(
+        full_peak_gb = _estimate_conv3d_peak_gb(
             height,
             width,
             num_frames,
             compute_dtype=compute_dtype,
+            optimized_fp16=optimized_fp16,
         )
-        if full_peak_gb <= budget_gb:
+        # Longer FP16 Winograd tiles were slower even when they fit in memory.
+        max_fast_tile = 128 if compute_dtype == mx.float16 and optimized_fp16 else None
+        if full_peak_gb <= budget_gb and (max_fast_tile is None or num_frames <= max_fast_tile):
             return None
 
         for spatial_tile in (None, 512, 256, 128, 64):
@@ -348,11 +722,16 @@ class TilingConfig:
                 continue
             effective_h = height if spatial_tile is None else min(height, spatial_tile)
             effective_w = width if spatial_tile is None else min(width, spatial_tile)
-            temporal_candidates = (
-                (256, 128, 64, 40, 32, 16)
-                if spatial_tile is None
-                else (None, 256, 128, 64, 40, 32, 16)
-            )
+            if max_fast_tile is not None:
+                temporal_candidates = (
+                    (None,) if spatial_tile is not None and num_frames <= max_fast_tile else ()
+                ) + (128, 64, 40, 32, 16)
+            else:
+                temporal_candidates = (
+                    (256, 128, 64, 40, 32, 16)
+                    if spatial_tile is None
+                    else (None, 256, 128, 64, 40, 32, 16)
+                )
             for tile_frames in temporal_candidates:
                 if tile_frames is not None and tile_frames >= num_frames:
                     continue
@@ -360,11 +739,12 @@ class TilingConfig:
                 work_frames = (
                     num_frames if tile_frames is None else min(num_frames, tile_frames + 1)
                 )
-                peak_gb = _estimate_native_conv3d_peak_gb(
+                peak_gb = _estimate_conv3d_peak_gb(
                     effective_h,
                     effective_w,
                     work_frames,
                     compute_dtype=compute_dtype,
+                    optimized_fp16=optimized_fp16,
                 ) + _estimate_tiled_assembly_gb(
                     height,
                     width,
@@ -430,7 +810,7 @@ class TilingPlanReceipt:
     spatial_width_tiles: int
     total_tiles: int
     resolved_config: TilingConfig
-    decoder_kind: str = "native-conv3d"
+    decoder_kind: VideoVAEKind = VideoVAEKind.CONV
     attention_tiling: dict[str, int | str] | None = None
 
     def to_dict(self) -> dict[str, object]:
@@ -444,7 +824,7 @@ class TilingPlanReceipt:
             "total_tiles": self.total_tiles,
             "resolved_config": self.resolved_config.to_dict(),
         }
-        if self.decoder_kind != "native-conv3d" or self.attention_tiling is not None:
+        if self.decoder_kind != VideoVAEKind.CONV or self.attention_tiling is not None:
             result["decoder_kind"] = self.decoder_kind
         if self.attention_tiling is not None:
             result["attention_tiling"] = self.attention_tiling
@@ -681,8 +1061,12 @@ def decode_streaming(
     noise_state_callback: Callable[[NoiseStreamState], None] | None = None,
     seed: int = 0,
     noise_backend: NoiseBackend = DEFAULT_NOISE_BACKEND,
+    context_sharpening: ContextSharpening | None = None,
 ) -> Iterator[mx.array]:
-    """Decode and yield blended BCFHW chunks without retaining the full video."""
+    """Decode and yield blended BCFHW chunks without retaining the full video.
+
+    ``context_sharpening`` applies only to the diffusion decoder, which owns its streaming.
+    """
     latent = _as_bcfhw_latent(latent)
     specialized = getattr(decoder_fn, "decode_streaming", None)
     if callable(specialized):
@@ -694,18 +1078,25 @@ def decode_streaming(
             reporter=reporter,
             plan_callback=plan_callback,
             noise_state_callback=noise_state_callback,
+            context_sharpening=context_sharpening,
         )
         return
+    if context_sharpening is not None:
+        raise ValueError("context sharpening applies only to the diffusion video VAE")
     batch, _channels, latent_time, latent_height, latent_width = latent.shape
     scale_time, scale_height, scale_width = _decoder_scale(decoder_fn)
 
     if tiling_config is None:
         output_frames = 1 + (int(latent_time) - 1) * scale_time
-        tiling_config = TilingConfig.auto_native_conv3d(
+        tiling_config = TilingConfig.auto_conv3d(
             int(latent_height) * scale_height,
             int(latent_width) * scale_width,
             output_frames,
             compute_dtype=getattr(decoder_fn, "compute_dtype", mx.bfloat16),
+            optimized_fp16=(
+                getattr(decoder_fn, "compute_dtype", mx.bfloat16) == mx.float16
+                and getattr(decoder_fn, "causal", True) is False
+            ),
         )
 
     if tiling_config is None:
@@ -942,7 +1333,6 @@ def decode_streaming(
                     mx.eval(chunk, chunk_weights)
                     sink.phase_advance(phase)
                     del decoded, mask, tile_latent
-                    mx.clear_cache()
 
             if chunk is None or chunk_weights is None:
                 raise RuntimeError("VAE tile plan produced no decoded chunk")
@@ -974,7 +1364,6 @@ def decode_streaming(
             )
             del chunk, chunk_weights
             gc.collect()
-            mx.clear_cache()
 
         if pending is not None and pending_weights is not None and pending.shape[2]:
             pending = pending / mx.maximum(pending_weights, 1e-8)

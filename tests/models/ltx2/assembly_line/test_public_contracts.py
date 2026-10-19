@@ -12,7 +12,7 @@ import pytest
 import kinomlx.models.ltx2.pipelines.distilled as distilled
 from kinomlx.media.frames import VideoFrameStream
 from kinomlx.models.ltx2.artifacts import TEXT_CONDITIONING
-from kinomlx.models.ltx2.types import DistilledRequest
+from kinomlx.models.ltx2.types import LTX2Request
 from kinomlx.reporting import NullReporter, Reporter
 from tests._reporting import RecordingReporter
 from tests.models.ltx2.test_distilled_pipeline import (
@@ -51,15 +51,15 @@ def test_public_resource_plan_is_frozen_and_has_no_live_component_fields() -> No
 def test_public_component_module_exposes_the_structural_provider_surface() -> None:
     components = importlib.import_module("kinomlx.models.ltx2.components")
     required = {
-        "TransformerPort",
-        "TransformerProvider",
-        "VideoEncoderProvider",
-        "SpatialUpscalerProvider",
-        "AudioDecoderProvider",
-        "VocoderProvider",
-        "VideoDecoderProvider",
-        "DistilledComponents",
-        "NativeLTX2Components",
+        "LTX2TransformerPort",
+        "LTX2TransformerProvider",
+        "LTX2VideoEncoderProvider",
+        "LTX2SpatialUpscalerProvider",
+        "LTX2AudioDecoderProvider",
+        "LTX2VocoderProvider",
+        "LTX2VideoDecoderProvider",
+        "LTX2ComponentsProvider",
+        "LTX2Components",
         "load_transformer",
         "load_video_encoder",
         "load_spatial_upscaler",
@@ -72,10 +72,10 @@ def test_public_component_module_exposes_the_structural_provider_surface() -> No
 
 def test_public_distilled_recipe_has_human_first_injection_signature() -> None:
     recipe = importlib.import_module("kinomlx.models.ltx2.pipelines.distilled")
-    signature = inspect.signature(recipe.generate_distilled)
+    signature = inspect.signature(recipe.generate_ltx2)
     parameters = signature.parameters
 
-    assert callable(recipe.DistilledRequest)
+    assert callable(recipe.LTX2Request)
     assert list(parameters)[:2] == ["request", "resources"]
     assert parameters["components"].kind is inspect.Parameter.KEYWORD_ONLY
     assert parameters["components"].default is None
@@ -135,7 +135,7 @@ def test_external_distilled_example_executes_with_synthetic_components(monkeypat
     monkeypatch.setattr(module, "release_stage_temporaries", lambda: None)
 
     output = module.compose_distilled(
-        DistilledRequest(prompt="test", width=64, height=64, frames=9),
+        LTX2Request(prompt="test", width=64, height=64, frames=9),
         _Resources(),
         components=components,
         text_conditioner=_RecordingTextConditioner(),
@@ -187,12 +187,12 @@ def test_external_example_and_product_recipe_have_the_same_synthetic_call_trace(
                 )
             )
 
-    request = DistilledRequest(prompt="trace", width=64, height=64, frames=9)
+    request = LTX2Request(prompt="trace", width=64, height=64, frames=9)
     product_components = _RecordingComponents()
     product_text = _RecordingTextConditioner()
     product_reporter = RecordingReporter()
     product_artifacts = _Artifacts()
-    product = distilled.generate_distilled(
+    product = distilled.generate_ltx2(
         request,
         _Resources(generation=generation),
         components=product_components,

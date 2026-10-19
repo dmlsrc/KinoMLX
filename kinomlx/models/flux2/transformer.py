@@ -6,11 +6,12 @@ from functools import partial
 import mlx.core as mx
 
 import kinomlx._mlx_nn as nn
+from kinomlx.adapters.receipt import AdapterReceipt
 from kinomlx.kernels import rms_norm, silu
 from kinomlx.modeling.layers import linear_shell
 
-from .conditioning import PreparedVelocity
 from .kv import ReferenceKV, attend, blend_modulation, reference_attention
+from .velocity import PreparedVelocity
 
 
 def rotary_positions(ids: mx.array) -> tuple[mx.array, mx.array]:
@@ -262,6 +263,7 @@ class Flux2Transformer(nn.Module):
 
     def __init__(self) -> None:
         super().__init__()
+        self.adapter_receipts: tuple[AdapterReceipt, ...] = ()
         self.x_embedder = linear_shell(bias=False)
         self.context_embedder = linear_shell(bias=False)
         self.time_guidance_embed = TimeEmbedding()

@@ -1,4 +1,4 @@
-"""Selecting one image of a multi-image source run for a saved-station restart."""
+"""Selecting one image of a multi-image source run for a saved-stage restart."""
 
 import pytest
 

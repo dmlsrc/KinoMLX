@@ -1,9 +1,9 @@
-"""Seed modes preserve station ownership, ordering, and failure cleanup."""
+"""Seed modes preserve stage ownership, ordering, and failure cleanup."""
 
 import pytest
 
 from kinomlx.components import ComponentLease
-from kinomlx.seed_execution import SeedModels, execute_seed_stations
+from kinomlx.seed_execution import SeedModels, execute_seed_stages
 from kinomlx.seeds import resolve_seeds
 
 
@@ -27,11 +27,11 @@ from kinomlx.seeds import resolve_seeds
                 "close-v",
             ],
         ),
-        ("station", ["load-t", "t-9", "t-2", "close-t", "load-v", "v-9", "v-2", "close-v"]),
+        ("stage", ["load-t", "t-9", "t-2", "close-t", "load-v", "v-9", "v-2", "close-v"]),
         ("resident", ["load-t", "t-9", "load-v", "v-9", "t-2", "v-2", "close-v", "close-t"]),
     ],
 )
-def test_station_order(mode, expected):
+def test_stage_order(mode, expected):
     models = SeedModels()
     events = []
 
@@ -51,11 +51,11 @@ def test_station_order(mode, expected):
     jobs = [job(seed) for seed in (9, 2)]
     for item in jobs:
         next(item)
-    assert list(execute_seed_stations(jobs, models, mode)) == [9, 2]
+    assert list(execute_seed_stages(jobs, models, mode)) == [9, 2]
     assert events == expected
 
 
-@pytest.mark.parametrize("mode", ["sequential", "station", "resident"])
+@pytest.mark.parametrize("mode", ["sequential", "stage", "resident"])
 @pytest.mark.parametrize("phase", ["denoise", "decode"])
 def test_failure_releases_every_loaded_model(mode, phase):
     models = SeedModels()
@@ -77,7 +77,7 @@ def test_failure_releases_every_loaded_model(mode, phase):
     item = job()
     next(item)
     with pytest.raises(KeyboardInterrupt):
-        list(execute_seed_stations([item], models, mode))
+        list(execute_seed_stages([item], models, mode))
     assert sorted(loaded) == sorted(closed)
 
 

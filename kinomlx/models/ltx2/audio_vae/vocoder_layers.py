@@ -5,6 +5,7 @@ import math
 import mlx.core as mx
 
 import kinomlx._mlx_nn as nn
+from kinomlx.models.ltx2.kernels import alias_free_snake
 
 
 def _conv1d_values(*, bias: bool) -> tuple[mx.array, mx.array | None]:
@@ -240,7 +241,12 @@ class DownSample1d(nn.Module):
 
 
 class Activation1d(nn.Module):
-    """Alias-free activation: upsample, SnakeBeta, downsample."""
+    """Alias-free activation: upsample, SnakeBeta, downsample.
+
+    With its loaded checkpoint filters in the layout below, it runs as one Metal pass
+    (``kinomlx.models.ltx2.kernels.alias_free_snake``), which differs from these operations by
+    FP32 rounding.
+    """
 
     def __init__(self, channels: int) -> None:
         super().__init__()
@@ -248,7 +254,29 @@ class Activation1d(nn.Module):
         self.upsample = UpSample1d(2, kernel_size=12)
         self.downsample = DownSample1d(2, kernel_size=12)
 
+    def _fused(self, x: mx.array) -> bool:
+        up = self.upsample
+        low = self.downsample.lowpass
+        kernel = alias_free_snake
+        return (
+            up.checkpoint_filter_loaded
+            and low.checkpoint_filter_loaded
+            and (up.ratio, up.kernel_size, up.pad, up.pad_left, up.pad_right)
+            == (kernel.RATIO, kernel.TAPS, kernel.UP_PAD, kernel.UP_CROP, kernel.UP_CROP)
+            and (low.kernel_size, low.stride, low.pad_left, low.pad_right)
+            == (kernel.TAPS, kernel.RATIO, *kernel.DOWN_PADS)
+            and kernel.applies(x, up.filter, low.filter)
+        )
+
     def __call__(self, x: mx.array) -> mx.array:
+        if self._fused(x):
+            return alias_free_snake.activate(
+                x,
+                self.upsample.filter,
+                self.downsample.lowpass.filter,
+                self.act.alpha,
+                self.act.beta,
+            )
         return self.downsample(self.act(self.upsample(x)))
 
 

@@ -13,7 +13,7 @@ from kinomlx.config import CliBinding, ConfigError, ConfigFieldSpec, ConfigRegis
 from kinomlx.config.assembly import collect_invocation_sources
 from kinomlx.config.inspection import configuration_inventory
 from kinomlx.config.provenance import PreparedConfig
-from kinomlx.config.stations import StationPolicy
+from kinomlx.config.stages import StagePolicy
 from kinomlx.config.transforms import LayerTransform
 from kinomlx.config_constraints import NumberConstraint
 from kinomlx.config_records import config_record, record_intent
@@ -47,7 +47,7 @@ def _member(name, example, *, action="store"):
         persistence="intent",
         surfaces=CONFIG_SURFACES,
         cli=CliBinding("Presentation", action=action),
-        station_policies=(StationPolicy("render", "mutable", reason="Rendering runs again."),),
+        stage_policies=(StagePolicy("render", "mutable", reason="Rendering runs again."),),
     )
 
 
@@ -61,15 +61,16 @@ def _schema(*, extended=False, model="fixture"):
         ExposurePresentation if extended else Presentation,
         fields,
         cli_generated=True,
-        stations=("render",),
-        station_record=ExposurePresentation if extended else Presentation,
+        stages=("render",),
+        stage_record=ExposurePresentation if extended else Presentation,
     )
     return replace(
         base,
         model=model,
         root_fields=(replace(base.root_fields[0], default=model, example=model, choices=(model,)),),
         tables=(table,),
-        restart_stations=("render",),
+        stages=("compose", "render"),
+        restart_stages=("render",),
         no_restart_reason=None,
     )
 
@@ -109,10 +110,10 @@ def test_scalar_extension_reaches_every_surface_reference_and_restart(monkeypatc
         dumped = schema.dump_config({"output": record_intent(admitted)})
         assert tomllib.loads(dumped) == {"output": {"exposure": 0.75}}
         assert (
-            schema.station_changes(
+            schema.stage_changes(
                 {"output": admitted},
                 {"output": ExposurePresentation()},
-                station="render",
+                stage="render",
                 active_explicit=frozenset({("output", "exposure")}),
             )
             == ()
@@ -125,7 +126,7 @@ def test_scalar_extension_reaches_every_surface_reference_and_restart(monkeypatc
     assert entry["type"] == "<class 'float'>"
     assert entry["local_constraints"][0]["minimum"] == 0
     assert entry["local_constraints"][0]["maximum"] == 1
-    assert entry["station_policies"][0]["reason"] == "Rendering runs again."
+    assert entry["stage_policies"][0]["reason"] == "Rendering runs again."
 
 
 @pytest.mark.parametrize("saved", [False, True])
@@ -144,7 +145,7 @@ def test_new_model_uses_shared_source_precedence_and_presence(tmp_path, monkeypa
     )
     for args, expected in cases:
         layers = collect_invocation_sources(schema, parser.parse_args(args)).prepare(
-            base, station="render" if saved else "generate"
+            base, stage="render" if saved else None
         )
         typed = _admit(schema, layers.merge())
         assert typed.exposure == expected
@@ -180,7 +181,7 @@ def test_removing_capability_removes_its_binding_rule_and_remedy():
 
     extended = _schema(extended=True)
     capability_table = replace(
-        extended.tables[0], record=ExposureCapability, station_record=ExposureCapability
+        extended.tables[0], record=ExposureCapability, stage_record=ExposureCapability
     )
     capable = replace(extended, tables=(capability_table,))
     removed = _schema()
@@ -207,7 +208,7 @@ def test_removing_capability_removes_its_binding_rule_and_remedy():
     assert "known: enabled" in str(error.value)
 
 
-def test_shared_typed_identity_rejects_reinterpretation_and_accepts_explicit_station_policy():
+def test_shared_typed_identity_rejects_reinterpretation_and_accepts_explicit_stage_policy():
     registry = ConfigRegistry()
     first = _schema()
     registry.register(first)
@@ -219,16 +220,14 @@ def test_shared_typed_identity_rejects_reinterpretation_and_accepts_explicit_sta
     assert registry.models() == ("fixture",)
     locked = replace(
         original.fields[0],
-        station_policies=(
-            StationPolicy("render", "locked", reason="This model caches presentation."),
-        ),
+        stage_policies=(StagePolicy("render", "locked", reason="This model caches presentation."),),
     )
     specialized = replace(second, tables=(replace(original, fields=(locked,)),))
     registry.register(specialized)
-    assert specialized.station_changes(
+    assert specialized.stage_changes(
         {"output": Presentation(False)},
         {"output": Presentation()},
-        station="render",
+        stage="render",
         active_explicit=frozenset({("output", "enabled")}),
     ) == (("output", "enabled"),)
 

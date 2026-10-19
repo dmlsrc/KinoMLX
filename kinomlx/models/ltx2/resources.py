@@ -7,6 +7,7 @@ from pathlib import Path
 
 import mlx.core as mx
 
+from kinomlx._json import JsonObject
 from kinomlx.huggingface import cached_snapshots
 from kinomlx.io.identity import (
     artifact_fingerprint,
@@ -14,7 +15,9 @@ from kinomlx.io.identity import (
     source_fingerprint,
 )
 from kinomlx.memory_policy import MLXMemoryPolicy
+from kinomlx.modeling.dtypes import FloatDType
 from kinomlx.models.ltx2.weights.dtypes import resolve_transformer_dtype
+from kinomlx.models.ltx2.weights.schema import TransformerQuantize
 from kinomlx.settings import Settings
 from kinomlx.types import SpatioTemporalScaleFactors
 
@@ -33,6 +36,15 @@ from .settings import (
 )
 from .transformer_config import TransformerConstructorConfig
 from .video_vae.config import VideoVAEConfig
+from .video_vae.kinds import VideoVAEKind
+from .vocabularies import LTX2ModelGeneration, LTX2StageSampler
+
+# The sampler each generation publishes for its two distilled stages. LTX-2.5 stage 2
+# became ancestral in ltx-pipelines 1.4.0, matching Lightricks' ComfyUI workflows.
+_PUBLISHED_STAGE_SAMPLERS = {
+    LTX2ModelGeneration.LTX23: (LTX2StageSampler.DETERMINISTIC, LTX2StageSampler.DETERMINISTIC),
+    LTX2ModelGeneration.LTX25: (LTX2StageSampler.ANCESTRAL, LTX2StageSampler.ANCESTRAL),
+}
 
 _LTX23_REPO_ID = "Lightricks/LTX-2.3"
 _LTX25_REPO_ID = "Lightricks/LTX-2.5"
@@ -135,7 +147,7 @@ class CheckpointIdentity:
 
     source_path: Path
     source_fingerprint: str
-    model_generation: str
+    model_generation: LTX2ModelGeneration
     model_version: str | None
     layout: CheckpointLayout
 
@@ -144,15 +156,18 @@ class CheckpointIdentity:
 class LTX2Capabilities:
     """Checkpoint-derived behavior used for fail-fast recipe validation."""
 
-    model_generation: str
+    model_generation: LTX2ModelGeneration
     recipe_families: tuple[str, ...]
     condition_families: tuple[str, ...]
     video_compression: SpatioTemporalScaleFactors
-    video_vae_kind: str
+    video_vae_kind: VideoVAEKind
     text_encoder_family: str
     native_hdr: bool
     generates_audio: bool
-    sampler_policy: str = "deterministic-euler-two-stage"
+    stage_samplers: tuple[LTX2StageSampler, LTX2StageSampler] = (
+        LTX2StageSampler.DETERMINISTIC,
+        LTX2StageSampler.DETERMINISTIC,
+    )
     generated_keyframes: bool = False
     duration_available: bool = False
     temporal_latent_upscaler_available: bool = False
@@ -172,14 +187,14 @@ class TransformerWeightPolicy:
     audio_attn_layout_specs: tuple[tuple[str, str], ...] | None
     audio_attn_layout_layers: tuple[int, ...] | None
     adaln_pretranspose: bool
-    transformer_quantize: str
+    transformer_quantize: TransformerQuantize
     video_ff_quantize_specs: tuple[tuple[str, str], ...]
     video_ff_quantize_layers: tuple[int, ...]
     video_ff_quantize_group_size: int | None
     video_ff_quantize_bits: int | None
     resident_blocks: int | None
     transformer_quantize_exclude_layers: tuple[int, ...] = ()
-    adapter_accumulation: str = "float32"
+    adapter_accumulation: FloatDType = FloatDType.FLOAT32
     transformer_retain: tuple[str, ...] = ()
 
 
@@ -187,14 +202,12 @@ class TransformerWeightPolicy:
 class TransformerExecutionPolicy:
     """Immutable transformer constructor settings for component leases."""
 
-    use_steel_attention: bool
     compile_attention: bool
-    steel_attention_d64: bool
-    steel_attention_probe: bool
     fast_mode: bool
-    compile_block_groups: int | None
+    compile_block_group_size: int | None
     transformer_compile_group_size: int | None
     check_adapter_weights: bool = True
+    dense_attention_kernel: bool = True
 
 
 @dataclass(frozen=True)
@@ -210,6 +223,25 @@ class LTX2Resources:
     video_vae_config: VideoVAEConfig
     transformer_config: TransformerConstructorConfig | None = None
     memory_policy: MLXMemoryPolicy = MLXMemoryPolicy()
+
+    def describe(self) -> JsonObject:
+        """Report every resolved source a generation would consume.
+
+        The transformer weight, execution and capability policies stay out of
+        this report: they are resolved decisions rather than sources, and
+        naming them here is a separate design call.
+        """
+        return {
+            "model": "ltx2",
+            "model_generation": self.checkpoint.model_generation,
+            "model_version": self.checkpoint.model_version,
+            "layout": self.checkpoint.layout.value,
+            "source": str(self.checkpoint.source_path),
+            "source_identity": self.checkpoint.source_fingerprint,
+            "dtypes": self.dtype_policy.to_metadata(),
+            "check_adapter_weights": self.execution_policy.check_adapter_weights,
+            "components": [_describe_component(component) for component in self.components],
+        }
 
     def optional(self, kind: ComponentKind) -> ComponentResource | None:
         """Return an inventory item when the checkpoint/discovery provides it."""
@@ -238,7 +270,7 @@ class LTX2Resources:
         return self.require(ComponentKind.TRANSFORMER).source_path
 
     @property
-    def gemma_path(self) -> Path | None:
+    def text_encoder_path(self) -> Path | None:
         component = self.optional(ComponentKind.TEXT_ENCODER)
         return None if component is None else component.source_path
 
@@ -253,6 +285,24 @@ class LTX2Resources:
     @property
     def duration_head_path(self) -> Path:
         return self.require(ComponentKind.DURATION_HEAD).source_path
+
+
+def _describe_component(component: ComponentResource) -> JsonObject:
+    """Name one inventory entry with the identity spellings the families share.
+
+    An LTX component carries annotations rather than tensor bindings, and the
+    transformer carries one more than the rest, so the annotation map is
+    reported as it stands instead of being padded to a fixed shape.
+    """
+    return {
+        "kind": component.kind.value,
+        "source": str(component.source_path),
+        "source_identity": component.source_fingerprint,
+        **{
+            ("graph_identity" if name == "config_digest" else name): value
+            for name, value in component.metadata.entries
+        },
+    }
 
 
 def _ltx25_component_relative_path(name: str, *, video_vae: str) -> str:
@@ -280,16 +330,17 @@ def _discover_ltx25_pack_directory(
     root: Path,
 ) -> LTX2Settings:
     """Expand one local LTX-2.5 pack root into its component paths."""
-    if settings.model_generation not in (None, "2.5"):
+    if settings.model_generation not in (None, LTX2ModelGeneration.LTX25):
         raise ValueError("an LTX-2.5 pack directory cannot be used with model_generation=2.3")
     pack = root.expanduser().absolute()
     transformer_path = settings.transformer_path or _local_ltx25_component(
         pack,
         "transformer_path",
     )
-    text_encoder_path = settings.text_encoder_path
-    if text_encoder_path is None and settings.gemma_path is None:
-        text_encoder_path = _local_ltx25_component(pack, "text_encoder_path")
+    text_encoder_path = settings.text_encoder_path or _local_ltx25_component(
+        pack,
+        "text_encoder_path",
+    )
     video_vae_path = settings.video_vae_path or _local_ltx25_component(
         pack,
         "video_vae_path",
@@ -299,7 +350,7 @@ def _discover_ltx25_pack_directory(
     missing: list[str] = []
     if transformer_path is None:
         missing.append(_ltx25_component_relative_path("transformer_path", video_vae="conv"))
-    if text_encoder_path is None and settings.gemma_path is None:
+    if text_encoder_path is None:
         missing.append(_ltx25_component_relative_path("text_encoder_path", video_vae="conv"))
     if video_vae_path is None:
         missing.append(
@@ -321,7 +372,7 @@ def _discover_ltx25_pack_directory(
 
     return replace(
         settings,
-        model_generation="2.5",
+        model_generation=LTX2ModelGeneration.LTX25,
         weights_path=None,
         transformer_path=transformer_path,
         text_encoder_path=text_encoder_path,
@@ -344,13 +395,13 @@ def _discover_selected_diffusion_video_vae(
     hf_home: Path,
 ) -> LTX2Settings:
     """Resolve the named shared diffusion decoder independently of the transformer."""
-    if settings.video_vae != "diffusion" or settings.video_vae_path is not None:
+    if settings.video_vae != VideoVAEKind.DIFFUSION or settings.video_vae_path is not None:
         return settings
     for snapshot in cached_snapshots(hf_home, _LTX25_REPO_ID):
         candidate = _local_ltx25_component(
             snapshot,
             "video_vae_path",
-            video_vae="diffusion",
+            video_vae=VideoVAEKind.DIFFUSION,
         )
         if candidate is not None:
             return replace(settings, video_vae_path=candidate)
@@ -367,11 +418,7 @@ def _discover_generation_selection(
     """Resolve missing components from local packs and Hugging Face snapshots."""
     if settings.weights_path is not None and settings.weights_path.expanduser().is_dir():
         return _discover_ltx25_pack_directory(settings, settings.weights_path)
-    if all(
-        getattr(settings, name) is not None
-        or (name == "text_encoder_path" and settings.gemma_path is not None)
-        for name in _LTX25_COMPONENT_PATHS
-    ):
+    if all(getattr(settings, name) is not None for name in _LTX25_COMPONENT_PATHS):
         return settings
     generation = settings.model_generation or (
         checkpoint_config(settings.transformer_path).model_generation
@@ -383,12 +430,12 @@ def _discover_generation_selection(
         return _discover_selected_diffusion_video_vae(settings, hf_home)
     if (
         settings.transformer_path is not None
-        and (settings.text_encoder_path is not None or settings.gemma_path is not None)
+        and settings.text_encoder_path is not None
         and settings.video_vae_path is not None
-        and generation == "2.3"
+        and generation == LTX2ModelGeneration.LTX23
     ):
         return _discover_selected_diffusion_video_vae(settings, hf_home)
-    if generation == "2.3":
+    if generation == LTX2ModelGeneration.LTX23:
         for snapshot in cached_snapshots(hf_home, _LTX23_REPO_ID):
             for filename in _LTX23_CHECKPOINT_FILENAMES:
                 candidate = snapshot / filename
@@ -412,7 +459,7 @@ def _discover_generation_selection(
         required_names = set()
         if settings.transformer_path is None:
             required_names.add("transformer_path")
-        if settings.text_encoder_path is None and settings.gemma_path is None:
+        if settings.text_encoder_path is None:
             required_names.add("text_encoder_path")
         if settings.video_vae_path is None:
             required_names.add("video_vae_path")
@@ -427,11 +474,8 @@ def _discover_generation_selection(
             settings,
             transformer_path=settings.transformer_path
             or _local_ltx25_component(snapshot, "transformer_path"),
-            text_encoder_path=(
-                settings.text_encoder_path
-                if settings.text_encoder_path is not None or settings.gemma_path is not None
-                else _local_ltx25_component(snapshot, "text_encoder_path")
-            ),
+            text_encoder_path=settings.text_encoder_path
+            or _local_ltx25_component(snapshot, "text_encoder_path"),
             video_vae_path=(
                 settings.video_vae_path
                 if settings.video_vae_path is not None
@@ -474,14 +518,10 @@ def _discover_gemma_path(
     settings: LTX2Settings,
     infrastructure: Settings,
 ) -> Path | None:
-    if settings.gemma_path is not None:
-        path = settings.gemma_path.expanduser().resolve()
-        if not (path / "config.json").is_file():
-            raise ValueError(f"Gemma directory has no config.json: {path}")
-        return path
-    # No cross-variant fallback: a missing snapshot stays unresolved rather
-    # than silently swapping encoders, and downstream compatibility reports
-    # the text encoder as unavailable.
+    # Only discovery reaches here: an explicit text path goes straight to the
+    # compatibility check. No cross-variant fallback: a missing snapshot stays
+    # unresolved rather than silently swapping encoders, and downstream
+    # compatibility reports the text encoder as unavailable.
     repo_id = _GEMMA_REPO_IDS[settings.gemma_variant]
     for snapshot in cached_snapshots(infrastructure.hf_home.expanduser(), repo_id):
         if (snapshot / "config.json").is_file():
@@ -574,12 +614,10 @@ def _execution_policy(
 ) -> TransformerExecutionPolicy:
     return TransformerExecutionPolicy(
         check_adapter_weights=infrastructure.check_adapter_weights,
-        use_steel_attention=settings.steel_attention,
         compile_attention=settings.compile_attention,
-        steel_attention_d64=settings.steel_attention_d64,
-        steel_attention_probe=settings.steel_attention_probe,
+        dense_attention_kernel=settings.dense_attention_kernel,
         fast_mode=settings.fast_mode,
-        compile_block_groups=settings.compile_block_groups,
+        compile_block_group_size=settings.compile_block_group_size,
         transformer_compile_group_size=settings.transformer_compile_group_size,
     )
 
@@ -810,11 +848,6 @@ def _prepare_inspected_resources(
     if dtype is None:
         dtype = mx.bfloat16
     checkpoint_fingerprint = fingerprint(sources.transformer)
-    sampler_policy = (
-        "deterministic-euler-two-stage"
-        if generation == "2.3"
-        else "ancestral-stage1-deterministic-stage2"
-    )
     return LTX2Resources(
         memory_policy=MLXMemoryPolicy.from_settings(infrastructure),
         checkpoint=CheckpointIdentity(
@@ -832,11 +865,12 @@ def _prepare_inspected_resources(
             video_compression=video_config.encoder_scale,
             video_vae_kind=video_config.decoder_kind,
             text_encoder_family=("unavailable" if text_config is None else text_config.family),
-            native_hdr=generation == "2.5",
+            native_hdr=generation == LTX2ModelGeneration.LTX25,
             generates_audio=report.audio_vae is not None,
-            sampler_policy=sampler_policy,
+            stage_samplers=_PUBLISHED_STAGE_SAMPLERS[generation],
             generated_keyframes=(
-                generation == "2.5" and transformer_config.use_keyframes_abs_pos_embedding
+                generation == LTX2ModelGeneration.LTX25
+                and transformer_config.use_keyframes_abs_pos_embedding
             ),
             duration_available=report.duration_head is not None,
             temporal_latent_upscaler_available=report.temporal_upscaler is not None,
@@ -854,14 +888,9 @@ def _split_composition(
 ) -> tuple[LTX2ComponentSources, LTX2CompatibilityReport]:
     """Inspect a componentized pack of either generation."""
     transformer_path = _required_component_path(settings.transformer_path, "transformer_path")
-    raw_text_path = (
-        settings.text_encoder_path
-        if settings.text_encoder_path is not None
-        else settings.gemma_path
-    )
     text_path = _required_component_path(
-        raw_text_path,
-        "text_encoder_path/gemma_path",
+        settings.text_encoder_path,
+        "text_encoder_path",
         allow_directory=True,
     )
     parsed = checkpoint_config(transformer_path)
@@ -919,19 +948,14 @@ def _monolithic_composition(
         else _required_component_path(resolved.transformer_path, "transformer_path")
     )
     parsed = baseline if resolved.transformer_path is None else checkpoint_config(transformer_path)
-    explicit_text = (
-        resolved.text_encoder_path
-        if resolved.text_encoder_path is not None
-        else resolved.gemma_path
-    )
     text_path: Path | None
-    if explicit_text is not None:
+    if resolved.text_encoder_path is not None:
         text_path = _required_component_path(
-            explicit_text,
-            "text_encoder_path/gemma_path",
+            resolved.text_encoder_path,
+            "text_encoder_path",
             allow_directory=True,
         )
-    elif parsed.model_generation == "2.3":
+    elif parsed.model_generation == LTX2ModelGeneration.LTX23:
         text_path = _discover_gemma_path(resolved, host)
     else:
         text_path = weights_path

@@ -12,7 +12,7 @@ from kinomlx.recipe_host import execute_recipe
 from kinomlx.reporting import NullReporter, Reporter
 from kinomlx.settings import Settings
 
-from .components import Krea2Components, NativeKrea2Components
+from .components import Krea2Components, Krea2ComponentsProvider
 from .pipelines.image_edit import generate_krea2_edit
 from .pipelines.text_to_image import Krea2GenerationOutput, generate_krea2
 from .resource_types import Krea2Resources
@@ -20,7 +20,7 @@ from .resources import prepare_resources
 from .restart import Krea2Restart
 from .sampling import Krea2Checkpoint
 from .settings import Krea2Settings
-from .text_conditioning import Krea2TextConditioner
+from .text_conditioning import Krea2TextConditionerPort
 from .types import Krea2GenerateConfig, Krea2Request
 
 _log = logging.getLogger(__name__)
@@ -38,8 +38,8 @@ class Recipe[RequestT](Protocol):
         request: RequestT,
         resources: Krea2Resources,
         *,
-        components: Krea2Components | None = None,
-        text_conditioner: Krea2TextConditioner | None = None,
+        components: Krea2ComponentsProvider | None = None,
+        text_conditioner: Krea2TextConditionerPort | None = None,
         reporter: Reporter | None = None,
         checkpoint: Krea2Checkpoint | None = None,
     ) -> Krea2GenerationOutput: ...
@@ -54,8 +54,8 @@ class Krea2Runner:
         *,
         infrastructure: Settings | None = None,
         resources: Krea2Resources | None = None,
-        components: Krea2Components | None = None,
-        text_conditioner: Krea2TextConditioner | None = None,
+        components: Krea2ComponentsProvider | None = None,
+        text_conditioner: Krea2TextConditionerPort | None = None,
         reporter: Reporter | None = None,
         checkpoint: Krea2Checkpoint | None = None,
     ) -> None:
@@ -80,7 +80,7 @@ class Krea2Runner:
             raise ValueError("pass settings or prepared resources, not both")
         self.resources = resources
         self.components = (
-            components if components is not None else NativeKrea2Components(reporter=self.reporter)
+            components if components is not None else Krea2Components(reporter=self.reporter)
         )
         self.text_conditioner = text_conditioner
         self.checkpoint = checkpoint
@@ -165,7 +165,7 @@ API_BOUNDARIES = (
         Krea2Runner.restart,
         (
             configuration("request", Krea2GenerateConfig, "generate", projection=True),
-            runtime("restart", "prepared station handoff"),
+            runtime("restart", "prepared stage handoff"),
             runtime("on_image", "image callback"),
         ),
     ),

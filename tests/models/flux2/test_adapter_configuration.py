@@ -136,7 +136,7 @@ def test_final_step_count_is_checked_before_any_adapter_weight_load():
         )
 
 
-def test_saved_adapter_index_edits_obey_denoise_and_decode_station_policies(tmp_path, monkeypatch):
+def test_saved_adapter_index_edits_obey_denoise_and_decode_stage_policies(tmp_path, monkeypatch):
     _fake_generation(monkeypatch)
     assert (
         command.run_flux2_command(
@@ -169,5 +169,5 @@ def test_saved_adapter_index_edits_obey_denoise_and_decode_station_policies(tmp_
         "path": Path("same.safetensors"),
         "strength": 0.5,
     }
-    with pytest.raises(ConfigError, match="adapters.*earlier station"):
+    with pytest.raises(ConfigError, match="adapters.*earlier stage"):
         assemble(build_parser().parse_args([*arguments, "--restart-from", "decode"]))

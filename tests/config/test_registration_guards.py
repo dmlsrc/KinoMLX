@@ -14,7 +14,7 @@ from typing import ClassVar
 import pytest
 
 from kinomlx.config import ConfigFieldSpec, ConfigTableSpec, ModelConfigSpec
-from kinomlx.config.stations import OutputPolicy, StationPolicy
+from kinomlx.config.stages import OutputPolicy, StagePolicy
 from kinomlx.config_surfaces import MODEL_SURFACES, STRUCTURED_SURFACES, SurfacePolicy
 from kinomlx.invocation_controls import MODEL_CONTROL
 from kinomlx.settings import EnvironmentSettings
@@ -60,11 +60,11 @@ def _field(
         persistence="intent",
         surfaces=STRUCTURED_SURFACES,
         output_policy=output_policy,
-        station_policies=(
-            StationPolicy(
+        stage_policies=(
+            StagePolicy(
                 "process",
                 mode,
-                reason="The station runs again.",
+                reason="The stage runs again.",
                 irrelevant_action="ignore" if mode == "irrelevant" else None,
             ),
         ),
@@ -89,7 +89,7 @@ def _model_field() -> ConfigFieldSpec:
 
 def _capture_table(
     *,
-    trace_produced_at: frozenset[str] = frozenset({"generate", "process"}),
+    trace_produced_at: frozenset[str] = frozenset({"acquire", "process"}),
     trace_mode: str = "mutable",
 ) -> ConfigTableSpec:
     return ConfigTableSpec(
@@ -104,8 +104,8 @@ def _capture_table(
                 output_policy=OutputPolicy(trace_produced_at),
             ),
         ),
-        stations=("process",),
-        station_record=Capture,
+        stages=("process",),
+        stage_record=Capture,
     )
 
 
@@ -118,8 +118,8 @@ def _settings_table(
         path=("model_settings",),
         record=ProbeSettings,
         fields=(_field("alpha", destination=destination, environment_key=environment_key),),
-        stations=("process",),
-        station_record=ProbeSettings,
+        stages=("process",),
+        stage_record=ProbeSettings,
     )
 
 
@@ -130,7 +130,8 @@ def _spec(**overrides: object) -> ModelConfigSpec:
         "introduction": ("Probe the registration guards.",),
         "root_fields": (_model_field(),),
         "tables": (_capture_table(), _settings_table()),
-        "restart_stations": ("process",),
+        "stages": ("acquire", "process"),
+        "restart_stages": ("process",),
     }
     declared.update(overrides)
     return ModelConfigSpec(**declared)  # type: ignore[arg-type]
@@ -153,10 +154,10 @@ def test_duplicate_table_paths_are_refused() -> None:
         _spec(tables=(_capture_table(), _capture_table(), _settings_table()))
 
 
-@pytest.mark.parametrize("stations", [("process", "process"), ("process", "")])
-def test_repeated_or_unnamed_restart_stations_are_refused(stations: tuple[str, ...]) -> None:
-    with pytest.raises(ValueError, match="probe: restart stations must be unique nonempty names"):
-        _spec(restart_stations=stations)
+@pytest.mark.parametrize("stages", [("process", "process"), ("process", "")])
+def test_repeated_or_unnamed_restart_stages_are_refused(stages: tuple[str, ...]) -> None:
+    with pytest.raises(ValueError, match="probe: restart stages must be unique nonempty names"):
+        _spec(restart_stages=stages)
 
 
 def test_a_restart_enabled_model_may_not_also_claim_no_restart() -> None:
@@ -194,11 +195,11 @@ def test_a_settings_record_may_not_read_a_different_variable_than_the_registry()
 
 def test_an_artifact_may_not_be_mutable_where_it_is_not_produced() -> None:
     """Availability is the authority; a hand-written mode cannot outvote it."""
-    table = _capture_table(trace_produced_at=frozenset({"generate"}))
+    table = _capture_table(trace_produced_at=frozenset({"acquire"}))
     with pytest.raises(
         ValueError,
         match=(
-            r"capture\.save_trace: station process declares 'mutable' "
+            r"capture\.save_trace: stage process declares 'mutable' "
             r"but this artifact is not produced there"
         ),
     ):
@@ -210,7 +211,7 @@ def test_an_artifact_may_not_be_irrelevant_where_it_is_produced() -> None:
     with pytest.raises(
         ValueError,
         match=(
-            r"capture\.save_trace: station process declares 'irrelevant' "
+            r"capture\.save_trace: stage process declares 'irrelevant' "
             r"but this artifact is produced there"
         ),
     ):

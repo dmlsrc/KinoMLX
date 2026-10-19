@@ -1,50 +1,34 @@
 """Data-only Krea 2 source, component, and weight dtype settings."""
 
-from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import ClassVar
 
 from kinomlx.config_constraints import ChoiceConstraint
 from kinomlx.config_records import config_record
-from kinomlx.config_rules import RecordRule, RuleInputs
+from kinomlx.config_rules import RuleInputs
+from kinomlx.modeling.dtypes import FLOAT_DTYPE_CHOICES, FloatDType
 from kinomlx.settings import EnvironmentSettings
 
 from .catalog import KREA2_VAE_DECODER_CHOICES, KREA2_VARIANT_CHOICES
+from .settings_rules import (
+    REFERENCE_FP16_ERROR,
+    REFERENCE_PRECISION,
+    VAE_SOURCE,
+    VARIANT_SOURCE,
+)
 
-TRANSFORMER_DTYPE_CHOICES = ("bfloat16", "float16", "float32")
-VAE_DTYPE_CHOICES = TRANSFORMER_DTYPE_CHOICES
 OPTIMIZED_DENOISE_MODE = "compact_unmasked_pretransposed"
-REFERENCE_FP16_ERROR = (
-    "Krea 2 reference denoising does not support float16: padding can cause FP16 "
-    "overflow and nonfinite outputs. Remove --reference-denoise or select "
-    "--transformer-dtype bfloat16 (or float32)."
-)
 
 
-def _reference_precision(values: Mapping[str, object]) -> None:
-    if values["reference_denoise"] and values["transformer_dtype"] == "float16":
-        raise ValueError(REFERENCE_FP16_ERROR)
+def denoise_mode(reference_denoise: bool) -> str:
+    """Name the denoiser one boolean selects, for every surface that reports it.
 
-
-_REFERENCE_PRECISION = RecordRule(
-    "reference_precision",
-    frozenset({"reference_denoise", "transformer_dtype"}),
-    _reference_precision,
-)
-
-
-def _variant_source(values: RuleInputs) -> None:
-    declared = values.context["declared_variant"]
-    if values.context["variant_requires_explicit"] and values["variant"] is None:
-        raise ValueError(
-            "component-only or index-free Krea 2 sources require an explicit Krea 2 variant"
-        )
-    if declared is not None and values["variant"] is not None and values["variant"] != declared:
-        raise ValueError(
-            f"Krea 2 source declares variant {declared!r}, contradicting "
-            f"variant {values['variant']!r}"
-        )
+    The console header, the resource section and the machine report all state
+    this fact, and before they shared an owner two of them disagreed on its
+    spelling within one command's output.
+    """
+    return "reference" if reference_denoise else OPTIMIZED_DENOISE_MODE
 
 
 def validate_variant_source(
@@ -54,7 +38,7 @@ def validate_variant_source(
     variant_requires_explicit: bool,
 ) -> None:
     """Reuse the field-owned variant rule before opening other components."""
-    _variant_source(
+    VARIANT_SOURCE.run(
         RuleInputs(
             {"variant": settings.variant},
             {},
@@ -64,33 +48,6 @@ def validate_variant_source(
             },
         )
     )
-
-
-VARIANT_SOURCE = RecordRule(
-    "variant_source",
-    frozenset({"variant"}),
-    _variant_source,
-    phase="capability",
-    context_reads=frozenset({"declared_variant", "variant_requires_explicit"}),
-)
-
-
-def _vae_source(values: RuleInputs) -> None:
-    detected = values.context["detected_vae_decoder"]
-    if values["vae_decoder"] is not None and values["vae_decoder"] != detected:
-        raise ValueError(
-            f"Krea 2 vae_decoder={values['vae_decoder']!r} contradicts "
-            f"the {detected!r} decoder detected in the selected VAE source"
-        )
-
-
-VAE_SOURCE = RecordRule(
-    "vae_source",
-    frozenset({"vae_decoder"}),
-    _vae_source,
-    phase="capability",
-    context_reads=frozenset({"detected_vae_decoder"}),
-)
 
 
 @config_record
@@ -127,20 +84,21 @@ class Krea2Settings(EnvironmentSettings):
             "config_rules": (VAE_SOURCE,),
         },
     )
-    transformer_dtype: str = field(
-        default="bfloat16",
-        metadata={"config_constraints": (ChoiceConstraint(TRANSFORMER_DTYPE_CHOICES),)},
+    transformer_dtype: FloatDType = field(
+        default=FloatDType.BFLOAT16,
+        metadata={"config_constraints": (ChoiceConstraint(FLOAT_DTYPE_CHOICES),)},
     )
     reference_denoise: bool = field(
-        default=False, metadata={"config_rules": (_REFERENCE_PRECISION,)}
+        default=False, metadata={"config_rules": (REFERENCE_PRECISION,)}
     )
-    vae_dtype: str = field(
-        default="bfloat16", metadata={"config_constraints": (ChoiceConstraint(VAE_DTYPE_CHOICES),)}
+    vae_dtype: FloatDType = field(
+        default=FloatDType.BFLOAT16,
+        metadata={"config_constraints": (ChoiceConstraint(FLOAT_DTYPE_CHOICES),)},
     )
 
     @property
     def denoise_mode(self) -> str:
-        return "reference" if self.reference_denoise else OPTIMIZED_DENOISE_MODE
+        return denoise_mode(self.reference_denoise)
 
     @property
     def component_overrides(self) -> dict[str, Path]:
@@ -157,7 +115,6 @@ class Krea2Settings(EnvironmentSettings):
 __all__ = [
     "OPTIMIZED_DENOISE_MODE",
     "REFERENCE_FP16_ERROR",
-    "TRANSFORMER_DTYPE_CHOICES",
-    "VAE_DTYPE_CHOICES",
     "Krea2Settings",
+    "denoise_mode",
 ]

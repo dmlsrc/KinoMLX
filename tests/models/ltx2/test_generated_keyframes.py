@@ -57,3 +57,48 @@ def test_generated_slots_reject_impossible_or_duplicate_interior_requests() -> N
         generated_keyframe_indices(1, 1)
     with pytest.raises(ValueError, match="interior"):
         generated_keyframe_indices(9, 8)
+
+
+def _slot_case() -> tuple[dict, VideoLatentShape]:
+    fixture = json.loads(_FIXTURE.read_text(encoding="utf-8"))["slot_case"]
+    return fixture, VideoLatentShape(*fixture["latent_shape"])
+
+
+def test_initial_slots_seed_the_generative_latent_and_leave_clean_zero() -> None:
+    fixture, shape = _slot_case()
+    tools = create_video_latent_tools(shape, fps=fixture["fps"])
+    state = init_video_latent_state(tools, dtype=mx.float32)
+    count = fixture["count"]
+    slot_shape = (shape.batch, shape.channels, count, shape.height, shape.width)
+    initial = mx.arange(mx.prod(mx.array(slot_shape)).item(), dtype=mx.float32).reshape(slot_shape)
+
+    prepared, layout, _mask = append_generated_keyframe_slots(
+        state,
+        tools,
+        pixel_frames=fixture["pixel_frames"],
+        count=count,
+        initial=initial,
+    )
+
+    slots = slice(layout.first_token, layout.first_token + layout.token_count)
+    assert mx.array_equal(prepared.latent[:, slots], tools.patchifier.patchify(initial)).item()
+    assert mx.array_equal(
+        extract_generated_keyframes(prepared.latent, tools, layout), initial
+    ).item()
+    assert not mx.any(prepared.clean_latent[:, slots]).item()
+    assert mx.all(prepared.denoise_mask[:, slots] == 1).item()
+
+
+def test_initial_slots_must_match_the_stage_latent_size() -> None:
+    fixture, shape = _slot_case()
+    tools = create_video_latent_tools(shape, fps=fixture["fps"])
+    state = init_video_latent_state(tools, dtype=mx.float32)
+    wrong = mx.zeros((shape.batch, shape.channels, fixture["count"], shape.height * 2, shape.width))
+    with pytest.raises(ValueError, match="initial generated keyframes have shape"):
+        append_generated_keyframe_slots(
+            state,
+            tools,
+            pixel_frames=fixture["pixel_frames"],
+            count=fixture["count"],
+            initial=wrong,
+        )

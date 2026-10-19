@@ -11,7 +11,7 @@ from kinomlx.io.safetensors import load_weights, read_metadata
 from kinomlx.kernels import group_norm, silu
 from kinomlx.reporting import NullReporter, Reporter
 
-from .ports import TemporalUpscalerPort
+from .ports import LTX2TemporalUpscalerPort
 from .spatial import ResBlock3d
 
 
@@ -186,7 +186,7 @@ class TemporalUpscaler(nn.Module):
 
 def temporal_upsample_video(
     latent: mx.array,
-    upscaler: TemporalUpscalerPort,
+    upscaler: LTX2TemporalUpscalerPort,
     *,
     reporter: Reporter | None = None,
 ) -> mx.array:

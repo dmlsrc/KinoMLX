@@ -4,11 +4,9 @@ from collections.abc import Mapping
 from typing import cast
 
 from kinomlx.config_rules import RecordRule
+from kinomlx.modeling.dtypes import FloatDType
 
-
-def _text_sources(values: Mapping[str, object]) -> None:
-    if values["gemma_path"] is not None and values["text_encoder_path"] is not None:
-        raise ValueError("gemma_path and text_encoder_path cannot be combined")
+from .vocabularies import LTX2AdapterAccumulation
 
 
 def _retention(values: Mapping[str, object]) -> None:
@@ -21,13 +19,11 @@ def _retention(values: Mapping[str, object]) -> None:
 
 
 def _adapter_precision(values: Mapping[str, object]) -> None:
-    if values["adapter_accumulation"] == "float16" and values["transformer_dtype"] != "float16":
+    if (
+        values["adapter_accumulation"] == LTX2AdapterAccumulation.FLOAT16
+        and values["transformer_dtype"] != FloatDType.FLOAT16
+    ):
         raise ValueError("adapter_accumulation=float16 requires transformer_dtype=float16")
-
-
-def _attention_probe(values: Mapping[str, object]) -> None:
-    if values["steel_attention_probe"] and not values["steel_attention"]:
-        raise ValueError("steel_attention_probe requires steel_attention=true")
 
 
 def _audio_layout(values: Mapping[str, object]) -> None:
@@ -58,9 +54,6 @@ def _compile_groups(values: Mapping[str, object]) -> None:
         raise ValueError("transformer_compile_group_size cannot exceed transformer_resident_blocks")
 
 
-TEXT_SOURCES = RecordRule(
-    "text_sources", frozenset({"gemma_path", "text_encoder_path"}), _text_sources
-)
 RETENTION = RecordRule(
     "retention",
     frozenset({"transformer_retain", "stream_transformer", "transformer_resident_blocks"}),
@@ -70,9 +63,6 @@ ADAPTER_PRECISION = RecordRule(
     "adapter_precision",
     frozenset({"adapter_accumulation", "transformer_dtype"}),
     _adapter_precision,
-)
-ATTENTION_PROBE = RecordRule(
-    "attention_probe", frozenset({"steel_attention_probe", "steel_attention"}), _attention_probe
 )
 AUDIO_LAYOUT = RecordRule(
     "audio_layout",

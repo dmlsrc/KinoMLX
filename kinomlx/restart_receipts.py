@@ -1,4 +1,4 @@
-"""Observational receipts for the artifacts a saved-station restart consumes.
+"""Observational receipts for the artifacts a saved-stage restart consumes.
 
 Identity here is evidence, not a gate: a missing fingerprint, a changed file, or
 advisory metadata that disagrees with the recorded run is reported and carried
@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
 
-from kinomlx.config import ConfigError
+from kinomlx.config import ConfigError, ModelConfigSpec
 from kinomlx.config.persistence import read_configuration
 from kinomlx.config.provenance import PreparedConfig
 from kinomlx.io.fingerprints import file_sha256
@@ -40,7 +40,7 @@ class RestartRunLog:
     outputs: dict[str, object]
 
 
-def read_restart_run(run: Path, *, model: str) -> RestartRunLog:
+def read_restart_run(run: Path, *, schema: ModelConfigSpec) -> RestartRunLog:
     """Decode a saved run log and admit the objects a restart resolves against."""
     source = run.expanduser().absolute()
     try:
@@ -54,7 +54,7 @@ def read_restart_run(run: Path, *, model: str) -> RestartRunLog:
     return RestartRunLog(
         source=source,
         payload=payload,
-        configuration=read_configuration(payload, model=model, source=str(source)),
+        configuration=read_configuration(payload, schema=schema, source=str(source)),
         effective=restart_object(
             payload.get("effective_config"), label="effective_config", source=source
         ),

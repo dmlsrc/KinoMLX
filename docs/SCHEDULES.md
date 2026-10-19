@@ -1,47 +1,40 @@
 # Denoise schedules and adapter strength over a run
 
-Two things vary as a model denoises: the **noise level** at each step, and the
-**adapter strength** applied at each step. They are documented together because
-they are coupled - an adapter can select its steps by noise level, which only
-means something once the schedule is known.
+Two things can vary as a model denoises: the **noise level** of each step, and the **adapter
+strength** applied at each step. They are documented together because an adapter can select its
+steps by noise level, which only means something once the schedule is known.
 
-Everything here is optional. A run that sets none of it behaves exactly as it did
-before these controls existed.
+Everything here is optional. Without it, each model uses its own schedule and every adapter keeps
+one strength for the whole run.
 
 - [The schedule](#the-schedule)
   - [What every run reports](#what-every-run-reports)
   - [Setting the schedule](#setting-the-schedule)
-  - [LTX-2 has two of them](#ltx-2-has-two-of-them)
+  - [LTX2 has two of them](#ltx2-has-two-of-them)
 - [Adapter strength over a run](#adapter-strength-over-a-run)
   - [One strength per step](#one-strength-per-step)
   - [Strength by noise level](#strength-by-noise-level)
   - [Which spelling to use](#which-spelling-to-use)
 - [How a varying adapter is applied](#how-a-varying-adapter-is-applied)
-  - [Which formats can vary](#which-formats-can-vary)
-  - [What this changes numerically](#what-this-changes-numerically)
-  - [Composition with fused adapters](#composition-with-fused-adapters)
-- [First-class profiles](#first-class-profiles)
+- [Krea 2 profiles](#krea-2-profiles)
 - [A worked example](#a-worked-example)
 - [Things that will bite](#things-that-will-bite)
 
 ## The schedule
 
-A schedule is a list of noise levels from high to low. It holds **one more value
-than the steps it drives**: step `i` is evaluated at `sigmas[i]`, and the last
-value is the level the final step arrives at, never a step of its own. Eight
-steps therefore need nine values.
-
-Each model produces its own by default:
+A schedule is a list of noise levels from high to low. It holds **one more value than the steps
+it drives**: step `i` runs at `sigmas[i]`, and the last value is where the final step arrives, not
+a step of its own. Eight steps need nine values.
 
 | Model | Default schedule |
 | --- | --- |
-| Krea 2 | A uniform 1-to-0 ramp, shifted by `mu`. Turbo pins `mu=1.15`; Raw derives it from the token grid. |
-| Klein | An empirical shift over the target token grid, so the same step count gives different levels at different resolutions. |
-| LTX-2 | Two literal pinned schedules, one per denoise stage. |
+| Krea 2 | A uniform 1-to-0 ramp, shifted by `mu`. Turbo uses `mu` 1.15; Raw derives it from the image size. |
+| Klein | A shift that depends on the output size, so one step count gives different levels at different sizes. |
+| LTX2 | Two fixed schedules, one per denoising stage. |
 
 ### What every run reports
 
-The resolved schedule appears in the sampling section of the console:
+The console's sampling section shows the resolved schedule:
 
 ```text
 Sampling:
@@ -49,49 +42,44 @@ Sampling:
   Sigmas: 1, 0.956724, 0.904531, 0.840349, 0.759511, 0.654567, 0.512844, 0.310901, 0
 ```
 
-A long schedule keeps its head in full and reports its length, because the early
-high-noise steps are the ones worth reading. The run metadata always records the
-complete array: Krea 2 under `denoise.sigmas`, Klein per image under `schedule`,
-LTX-2 as `stage_1_sigmas` and `stage_2_sigmas`.
+A long schedule shows its first values and its length, since the early high-noise steps matter
+most. The run record always keeps the whole list: Krea 2 under `denoise.sigmas`, Klein per image
+under `schedule`, and LTX2 as `stage_1_sigmas` and `stage_2_sigmas`.
 
 ### Setting the schedule
 
-Supply the levels to replace the model's derivation:
+`--sigmas` replaces the model's own levels:
 
 ```bash
 kinomlx --model krea2 --prompt "A quiet coastal sunrise" \
   --sigmas "1,0.9567,0.9045,0.8403,0.7595,0.6547,0.5128,0.3109,0"
 ```
 
-The array **fixes the step count**, because the count is just its length minus
-one. Nine values run eight steps whatever `--steps` resolved to, and the sampling
-section reports the step count actually used so the override stays visible. For
-Krea 2, `mu` only shapes a generated schedule, so it is reported as `unused
-(explicit sigmas)`.
+The list **fixes the step count**, its length minus one. Nine values run eight steps whatever
+`--steps` says, and the sampling section shows the count actually used. Krea 2's `mu` shapes only a
+generated schedule, so it is reported as `unused (explicit sigmas)`.
 
-Levels must be finite, lie between 0 and 1, and decrease strictly. A final value
-above zero is allowed and simply stops the denoise early, leaving residual noise
-in the latent - a deliberate choice, not an error.
+Levels must be finite, between 0 and 1, and strictly decreasing. A last value above zero is
+allowed: it stops early and leaves some noise in the latent, deliberately.
 
-TOML uses `sigmas`:
+In TOML, use `sigmas`:
 
 ```toml
 [generate]
 sigmas = [1.0, 0.85, 0.6, 0.3, 0.0]
 ```
 
-### LTX-2 has two of them
+### LTX2 has two of them
 
-The distilled pipeline denoises in two stages with independent schedules. Both are
-pinned literals, and both are reported and recorded:
+The distilled pipeline denoises in two stages, each with a fixed schedule:
 
-| Stage | Steps | Pinned levels |
+| Stage | Steps | Levels |
 | --- | --- | --- |
 | 1 | 8 | `1, 0.99375, 0.9875, 0.98125, 0.975, 0.909375, 0.725, 0.421875, 0` |
 | 2 | 3 | `0.909375, 0.725, 0.421875, 0` |
 
-Stage 2 runs after the spatial upscaler, and its first three levels mirror the
-tail of stage 1. Each stage has its own flag:
+Stage 2 runs after the spatial upscaler, and its levels repeat the tail of stage 1. Each stage has
+its own option, and either can be used alone; the other keeps its fixed levels:
 
 ```bash
 kinomlx --model ltx2 --prompt "A quiet coastal sunrise" \
@@ -99,26 +87,18 @@ kinomlx --model ltx2 --prompt "A quiet coastal sunrise" \
   --sigmas-stage-2 "0.9,0.72,0.42,0"
 ```
 
-Each array sets its own stage's step count, so the nine values above keep stage 1
-at eight steps while respacing them. Overriding one stage leaves the other on its
-pinned values, so either flag can be used alone:
+Each list sets its own stage's step count, so the nine values above keep stage 1 at eight steps
+while respacing them.
 
-```bash
-kinomlx --model ltx2 --prompt "A quiet coastal sunrise" \
-  --sigmas-stage-2 "0.9,0.72,0.42,0"
-```
-
-Stage 2 legitimately starts **below** 1.0, with a pinned first level of
-`0.909375`, because it continues from stage 1's tail rather than from pure noise.
-Writing a replacement that starts at 1.0 would treat an already-denoised latent as
-pure noise.
+Stage 2 rightly starts **below** 1.0, at `0.909375`, because it continues from stage 1 rather
+than from pure noise. A replacement starting at 1.0 would treat an almost finished latent as pure
+noise.
 
 ## Adapter strength over a run
 
-An adapter normally applies one constant strength for the whole run. Some
-adapters should not: a turbo diversity adapter decides composition in the first
-high-noise steps, and the remaining steps are detail refinement it only disturbs.
-There are two ways to say when it applies.
+An adapter normally keeps one strength for the whole run. Some should not: a Turbo diversity
+adapter decides composition in the first high-noise steps and only disturbs the detail steps that
+follow. Krea 2 and Klein offer two ways to say when an adapter applies.
 
 ### One strength per step
 
@@ -130,92 +110,79 @@ kinomlx --model krea2 --prompt "A still life with fruit" --steps 8 \
   --adapter-step-strengths "1,1,0,0,0,0,0,0"
 ```
 
-Full strength for the first two steps, off for the rest. The array must hold
-exactly one value per resolved step, which is checked before any weights load.
-An array that repeats one value for every step is a constant, so it fuses at
-that value rather than taking the unfused path, and the run is identical to
-giving that strength on its own.
-Each modifier applies to the latest preceding CLI adapter. Structured `step_strengths` belongs
-inside that adapter's record; an omitted member leaves that item unscheduled. Empty arrays are
-invalid and arrays do not broadcast:
+This is full strength for two steps and off for the rest. The list must have exactly one value
+per step, which is checked before any weights load, and an empty list is invalid. A list
+repeating one value is a constant: the adapter is merged at that value, exactly as with a plain
+strength.
+
+The option applies to the latest `--adapter` only and never carries over to the others; an adapter
+without one keeps its constant strength. In TOML, `step_strengths` goes in that adapter's record.
+To remove an inherited list, replace the record without it:
 
 ```toml
 [generate]
 adapters = [
-  {path="sda.safetensors", step_strengths=[1, 1, 0, 0, 0, 0, 0, 0]},
-  {path="style.safetensors"},
+  {path = "sda.safetensors", step_strengths = [1, 1, 0, 0, 0, 0, 0, 0]},
+  {path = "style.safetensors"},
 ]
 ```
 
-These record rules apply to both [Krea](KREA2.md#adapters) and
-[Klein](FLUX2.md#adapter-records). Removing an inherited schedule requires replacing the item
-without its `step_strengths` member.
-
-An array replaces that adapter's own `--adapter-strength`, so supplying both for
-one adapter in the same config layer is an error.
+A step list replaces that adapter's `--adapter-strength`, so giving both in one config file or
+command line is an error.
 
 ### Strength by noise level
 
-Select noise levels instead of step indices:
+Select noise levels instead of step numbers:
 
 ```bash
 kinomlx --model krea2 --prompt "A still life with fruit" \
   --adapter sda.safetensors --adapter-sigma-window "0.93"
 ```
 
-`0.93` means "at every level from 0.93 up to 1". A band is written
-`low[:high][@strength]`, and several comma-separated bands express a taper:
+`0.93` means every level from 0.93 up to 1. A band is written `low[:high][@strength]`, and several
+comma-separated bands make a taper:
 
 ```bash
 --adapter-sigma-window "0.93@1,0.6:0.93@0.4,0:0.6@0.1"
 ```
 
-Bands are ordered and **the first band holding a level wins**, which makes
-overlap deterministic and lets a coarse band sit last as a fallback. A level no
-band holds contributes nothing. A band that omits `@strength` uses the adapter's
-own `--adapter-strength`, so a window pairs with a constant strength naturally -
-the window says *when*, the strength says *how much*:
+**The first band holding a level wins**, so overlaps are predictable and a broad band can go last
+as a fallback. A level no band holds gets nothing. A band without `@strength` uses the adapter's
+`--adapter-strength`: the window says *when*, the strength *how much*.
 
 ```bash
 --adapter sda.safetensors --adapter-strength 0.75 --adapter-sigma-window "0.93"
 ```
 
-When a band declares its own magnitude the scalar is a fallback that band never
-reads, so `--adapter-strength 0` beside a window whose bands carry `@strength`
-still places the adapter and the bands decide every step.
+When every band carries its own `@strength`, the plain strength is never read, so
+`--adapter-strength 0` beside such a window still applies the adapter.
 
-**Zero means the step applies nothing.** A zero strength - from a `@0` band, from
-a level no band holds, or from an all-zero step array - skips that adapter's term
-outright for that step, producing exactly what the unadapted model produces. A
-`@0` band is therefore a useful carve-out in the middle of a taper.
+**Zero means that step applies nothing.** A `@0` band, a level no band holds, or an all-zero step
+list skips the adapter for that step, giving exactly what the model gives without it. A `@0` band
+is a handy gap in the middle of a taper.
 
-A window whose bands hold *no* level of the resolved schedule is refused rather
-than silently doing nothing, because that means the bands were written for a
-different step count or a different model. A band that holds levels and declares
-zero is a deliberate choice and stands.
+A window that holds *no* level of the schedule is refused rather than silently doing nothing,
+since it was clearly written for another step count or model. A band that holds levels and
+declares zero is a deliberate choice and stands.
 
-A window is resolved against the schedule the sampler actually walks, including
-one you supplied and one a resolution-dependent shift produced. It needs no step
-count, so nothing has to be edited when the step count changes.
+A window is matched against the schedule the run actually uses, including one you supplied or
+one a size-dependent shift produced. It needs no step count, so it survives step-count changes.
 
-A window and a step array are exclusive: they are two spellings of the same
-thing.
+A window and a step list are two ways to say the same thing, so an adapter takes one or the
+other.
 
 ### Which spelling to use
 
-They are not interchangeable, and neither is a default for the other.
+Neither is a default for the other. A step list is literal and matches what model cards say
+("active for the first 2 of 8 steps"); it breaks when the step count changes, which is why a
+mismatch is an error. A window carries across step counts and is the honest spelling when an
+adapter was trained at a known noise level.
 
-A step array is literal and matches what adapter model cards and community
-tooling describe ("active for the first 2 of 8 steps"). It breaks when the step
-count changes, which is why a mismatch is an error rather than a silent reshape.
-
-A window is portable across step counts and is the honest spelling when an
-adapter was trained at a known noise level. The catch is that the two genuinely
-disagree on some schedules. The Krea community SDA adapter records a training
-floor of 0.93; on the eight-step Turbo schedule that selects steps 0 and 1,
-matching the gate its model card prescribes. On a four-step schedule no level
-falls in its training band at all, so the window selects one step while the
-community recipe uses two:
+The two genuinely disagree on some schedules. The Krea community SDA adapter was trained in the
+band 0.93 to 0.97, and its window `0.93` covers 0.93 up to 1. On the eight-step Turbo schedule
+that selects steps 0 and 1, as its model card prescribes. On a four-step schedule only the first
+level, 1.0, is in the window and none is in the training band, so the window selects one step
+while the community recipe uses two:
 
 | Schedule | Levels | `--adapter-sigma-window 0.93` | `--adapter-step-strengths "1,1,..."` |
 | --- | --- | --- | --- |
@@ -226,74 +193,51 @@ Pick the one that matches what you are reproducing.
 
 ## How a varying adapter is applied
 
-A constant-strength adapter is **fused**: its delta is written into the weight
-once, and every step reads the modified weight. That cannot express a strength
-that changes, because each change point would mean rewriting every adapted
-weight - and for any format whose delta is a function of the base weight, the
-original is gone and the change is not even invertible.
+A constant adapter is merged into the weights once, and every step reads the merged weight. A
+varying strength cannot work that way, so an adapter with a step list or window stays separate: its
+factors are applied to the activations at each step, and the base weight is untouched.
 
-So an adapter with a step array or a window stays **unfused**. Its factors are
-retained in the transformer's compute dtype and applied to activations, leaving
-the base weight untouched. This is cheap only when the delta never has to be
-built densely, which is what limits which formats can vary.
-
-For a rank-32 adapter covering 264 Krea 2 targets, the retained factors are about
-224 MiB, against 23.9 GiB of adapter-touched base weights. One or two varying
-adapters alongside any number of fused ones is the expected case.
-
-### Which formats can vary
+That is cheap only when the update never has to be built in full, which limits the formats:
 
 | Can vary | Why |
 | --- | --- |
-| LoRA, AdaLoRA | A low-rank product applies as two skinny products. |
-| LoKr | A Kronecker product applies by reshaping the input axis; the expansion is never built. |
-| LoHa | The Hadamard product of two rank-r factors expands into one pair of rank r squared, so applied cost and retained size both grow with the square of the rank. Past the rank where that pair outgrows the dense delta, rank 40 on a 3072-wide target, it is refused by name instead. |
+| LoRA, AdaLoRA | A low-rank product applies as two thin products. |
+| LoKr | A Kronecker product applies by reshaping the input; the full update is never built. |
+| LoHa | Its product expands into one pair of rank r squared, so its cost grows with the square of the rank. Above about rank 40 on a 3072-wide target it is refused by name. |
 
-Formats whose delta is a function of the live base weight, DoRA and HiRA and DEFT
-and MiSS among them, have no activation form and are refused by name. Fuse them at
-one constant strength.
+Formats whose update depends on the base weight, including DoRA, HiRA, DEFT, and MiSS, cannot
+vary and are refused by name; merge them at one strength. Memory stays small:
 
-### What this changes numerically
+| Varying adapter | Factors kept in memory |
+| --- | ---: |
+| Rank 32 on 264 Krea 2 targets | About 224 MiB |
 
-A varying run is **not** numerically identical to a fused run at the same
-constant strength. Fusion rounds the combined weight once and then multiplies;
-the unfused path multiplies and adds the delta to the output. Both are correct,
-they round differently, and there is no way to make them agree.
+A varying run is **not** numerically identical to a merged run at the same strength: merging
+rounds the combined weight once, while the separate path adds the update to the output. Both are
+correct, and they round differently. Compare a varying run with another varying run.
 
-Runs without a step array or a window still fuse exactly as before, so existing
-parity comparisons keep their meaning. Compare a varying run against another
-varying run.
+A varying adapter always applies after anything merged into the same weight, whatever the listed
+order. For LoRA-like updates that changes nothing, because addition commutes. With a merged DoRA,
+its normalization is computed without the varying adapter, which then adds on top.
 
-### Composition with fused adapters
+## Krea 2 profiles
 
-Fused adapters compose into the weight at load; varying ones add at forward time.
-So **a varying adapter always applies after anything fused into the same
-weight**, whatever order the adapters were listed in.
+Krea 2 wraps two community adapters as switches, so you need not assemble these controls by hand.
+`--turbo-4step` supplies the four-step recipe, and `--turbo-sda` applies the diversity adapter
+within its own training band.
 
-For LoRA-family deltas this is invisible, because addition commutes. It becomes
-visible with a base-dependent fused adapter: fuse a DoRA and vary a LoRA, and
-DoRA's normalization is computed against base+DoRA with the varying term absent,
-which then rides on top. That is the only tractable option - the alternative
-recomputes DoRA's column norms every step, which is the dense cost being avoided.
-
-## First-class profiles
-
-Krea 2 wraps two community adapters as switches, so the controls above do not
-have to be assembled by hand. `--turbo-4step` supplies the distilled four-step
-recipe as defaults, and `--turbo-sda` applies the diversity adapter gated to its
-own recorded training band. Both accept `--turbo-<name>-step-strengths` and
-`--turbo-<name>-sigma-window`, and using them together prints a warning because
-the pairing is unvalidated. A profile's step array carries its own magnitude, so
-`--turbo-<name>-strength` beside it is an error, exactly as it is for a user
-adapter. See [Krea 2 profiles](KREA2.md#combining-the-two-profiles)
-for the combinations worth exploring.
+Both profiles take step lists and windows: `--turbo-4step-step-strengths`,
+`--turbo-4step-sigma-window`, `--turbo-sda-step-strengths`, and `--turbo-sda-sigma-window`. A
+profile's step list carries its own magnitudes, so `--turbo-4step-strength` or
+`--turbo-sda-strength` beside one is an error. See [Krea 2
+profiles](krea2/adapters.md#both-profiles-together) for combinations worth trying.
 
 ## A worked example
 
-The Krea community SDA diversity adapter is trained at a single high-noise node
-and must be switched off after the first two of eight steps. Its repository ships
-two key formats; the ComfyUI-format file is the native trainer output and maps
-completely, while the diffusers-format conversion mis-splits two module names.
+The Krea community SDA diversity adapter is trained at one high noise level and should switch off
+after the first two of eight steps. Its repository ships two formats; the ComfyUI file is the
+trainer's own output and maps completely, while the Diffusers conversion splits two module names
+wrongly.
 
 ```bash
 kinomlx --model krea2 \
@@ -313,33 +257,25 @@ Adapter result 1/1: krea2_turbo_sda_v1.0_comfy.safetensors
   Model: Krea 2 Turbo | Types: lora | Strength: 1 | Targets: 264/264 | Step Strengths: 1, 1, 0, 0, 0, 0, 0, 0
 ```
 
-Reading the two lines together shows the gate covering the level the adapter was
-trained at, `0.956724` at step 1.
+Read together, the two lines show the gate covering the level the adapter was trained at,
+`0.956724` at step 1.
 
 ## Things that will bite
 
-**Klein KV editing reuses its reference K/V.** It is extracted once at the first
-step and reused, so a strength that changes after that extraction would be read
-back from a cache built at the first step's strength. That combination is refused.
-Fuse the adapter at one constant strength, or enable `recompute_reference_kv`
-(`--recompute-reference-kv`), which extracts the reference K/V again at every step
-for one extra reference forward per step.
+**Klein KV editing reuses its reference keys and values.** They are extracted on the first step,
+so a strength that changes later would be read back at the first step's strength; that combination
+is refused. Merge the adapter at one strength, or add `--recompute-reference-kv`, which extracts
+them again every step for one extra reference pass per step.
 
-**`--turbo-4step` brings its own schedule.** It rewrites the step count, so a
-step array written for eight steps becomes wrong. An explicit `--sigmas` is an
-advanced override that replaces the profile's schedule rather than a conflict
-with it: the array decides the levels and the step count, and a step array
-written for the resulting step count still applies per step.
+**`--turbo-4step` brings its own schedule.** It sets the step count, so a step list written for
+eight steps becomes wrong. An explicit `--sigmas` replaces the profile's schedule rather than
+conflicting with it, and a step list written for the resulting count still applies.
 
-**Changing `--steps` invalidates a step array.** The mismatch is an error naming
-both counts, raised before any weights load. Use a window if you expect to sweep
-step counts.
+**Changing `--steps` breaks a step list.** The mismatch is an error naming both counts, raised
+before any weights load. Use a window if you sweep step counts.
 
-**A window needs the schedule to exist.** It is resolved at the start of
-denoising, not at configuration time, so a malformed band is caught early but an
-empty selection is only discovered once the schedule is known.
+**A window needs the schedule to exist.** It is resolved when denoising starts, so a malformed band
+is caught early but an empty selection only once the schedule is known.
 
-**Alternative spacings are not implemented.** Karras, beta, and similar spacings
-have a place to plug in, but no such scheduler ships today. `--sigmas` is the way
-to run an arbitrary schedule now: compute the levels however you like and pass
-them.
+**Other spacings are not built in.** There is no Karras, beta, or similar spacing yet. To run any
+schedule now, compute the levels however you like and pass them with `--sigmas`.

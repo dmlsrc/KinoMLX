@@ -1,20 +1,23 @@
-"""Native Klein image generation, complete conditioning stations, and output publication."""
+"""Native Klein image generation, complete conditioning stages, and output publication."""
 
 from .adapters.inputs import Flux2AdapterConfig
 from .catalog import Flux2Variant
+from .components import Flux2Components, Flux2ComponentsProvider
 from .generation import Flux2ImageResult, decode_latents, generate_image
 from .output import Flux2OutputPlan, Flux2OutputSink, plan_output
-from .pipeline import Flux2GenerationOutput, generate_flux2
-from .resources import Flux2Resources, inspect_resources
+from .pipelines import Flux2GenerationOutput, generate_flux2
+from .resources import Flux2Resources, prepare_resources
 from .restart import Flux2Restart, PreparedResources
 from .runner import Flux2Error, Flux2Runner
 from .sampling import SamplingRecipe
 from .settings import Flux2Settings
-from .stations import Flux2Conditioning, load_conditioning, save_conditioning
+from .text_conditioning import Flux2Conditioning, load_conditioning, save_conditioning
 from .types import Flux2Request
 
 __all__ = [
     "Flux2AdapterConfig",
+    "Flux2Components",
+    "Flux2ComponentsProvider",
     "Flux2Conditioning",
     "Flux2Error",
     "Flux2GenerationOutput",
@@ -32,8 +35,8 @@ __all__ = [
     "decode_latents",
     "generate_flux2",
     "generate_image",
-    "inspect_resources",
     "load_conditioning",
     "plan_output",
+    "prepare_resources",
     "save_conditioning",
 ]

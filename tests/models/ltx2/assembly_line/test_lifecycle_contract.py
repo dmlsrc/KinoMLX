@@ -3,7 +3,7 @@
 from ._contracts import (
     AdapterSpec,
     ContractResources,
-    DistilledRequest,
+    LTX2Request,
     RecordingComponents,
     assert_balanced,
     effective_profile,
@@ -22,7 +22,7 @@ def _load_event(components: RecordingComponents, component: str):
 def test_distinct_profiles_release_transformer_before_upscaler_load() -> None:
     components = RecordingComponents()
     output = run_distilled_contract(
-        DistilledRequest(
+        LTX2Request(
             stage_1_profile=effective_profile(AdapterSpec("adapter-a", 0.5)),
             stage_2_profile=effective_profile(AdapterSpec("adapter-b", 1.0)),
         ),
@@ -44,7 +44,7 @@ def test_identical_profiles_may_retain_transformer_across_upscale() -> None:
     profile = effective_profile(AdapterSpec("adapter-a", 0.5))
     components = RecordingComponents()
     output = run_distilled_contract(
-        DistilledRequest(stage_1_profile=profile, stage_2_profile=profile),
+        LTX2Request(stage_1_profile=profile, stage_2_profile=profile),
         ContractResources(),
         components=components,
     )
@@ -58,7 +58,7 @@ def test_identical_profiles_may_retain_transformer_across_upscale() -> None:
 def test_close_early_releases_video_decoder_once() -> None:
     components = RecordingComponents()
     output = run_distilled_contract(
-        DistilledRequest(frame_count=4),
+        LTX2Request(frame_count=4),
         ContractResources(),
         components=components,
     )
@@ -77,7 +77,7 @@ def test_close_early_releases_video_decoder_once() -> None:
 def test_exhaustion_releases_video_decoder() -> None:
     components = RecordingComponents()
     output = run_distilled_contract(
-        DistilledRequest(frame_count=2),
+        LTX2Request(frame_count=2),
         ContractResources(),
         components=components,
     )

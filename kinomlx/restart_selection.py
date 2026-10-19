@@ -1,4 +1,4 @@
-"""Select one image of a multi-image source run for a saved-station restart.
+"""Select one image of a multi-image source run for a saved-stage restart.
 
 A run that produced several images records one artifact path per image and keys
 each digest by output index. Every image model resolves that selection the same

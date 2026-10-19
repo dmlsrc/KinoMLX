@@ -5,11 +5,14 @@ from collections.abc import Mapping
 import mlx.core as mx
 
 import kinomlx._mlx_nn as nn
-from kinomlx.kernels import pixel_norm, silu
+from kinomlx.kernels import pixel_norm, pixel_norm_fp16, silu
+from kinomlx.kernels.winograd_conv3d import WinogradConv3d
 
 
 def pixel_norm_bfhwc(x: mx.array, eps: float = 1e-8) -> mx.array:
-    """Apply reference-stepwise PixelNorm over the channels-last dimension."""
+    """Apply PixelNorm over channels, widening FP16's squared reduction."""
+    if x.dtype == mx.float16:
+        return pixel_norm_fp16(x, eps=eps)
     return pixel_norm(x, axis=-1, eps=eps)
 
 
@@ -48,7 +51,7 @@ def lookup_weight(
     return None
 
 
-class NativeConv3dBlock(nn.Module):
+class Conv3dBlock(nn.Module):
     """MLX Conv3d with explicit temporal and spatial padding."""
 
     def __init__(
@@ -59,6 +62,7 @@ class NativeConv3dBlock(nn.Module):
         padding: int = 1,
         causal: bool = False,
         spatial_padding_mode: str = "manual",
+        winograd: bool = False,
     ) -> None:
         super().__init__()
         if in_channels <= 0 or out_channels <= 0:
@@ -77,6 +81,10 @@ class NativeConv3dBlock(nn.Module):
         self.padding = padding
         self.causal = causal
         self.spatial_padding_mode = spatial_padding_mode
+        self._winograd: WinogradConv3d | None
+        self._eager_eval: bool
+        object.__setattr__(self, "_winograd", WinogradConv3d() if winograd else None)
+        object.__setattr__(self, "_eager_eval", False)
         conv_padding = (0, padding, padding) if spatial_padding_mode == "conv" else 0
         self.conv = nn.Conv3d(
             in_channels=in_channels,
@@ -94,6 +102,21 @@ class NativeConv3dBlock(nn.Module):
             )
         causal = self.causal if causal is None else causal
         kernel_size = self.kernel_size
+        bias = self.conv.bias
+
+        if (
+            not causal
+            and kernel_size == 3
+            and self.padding == 1
+            and self.spatial_padding_mode == "conv"
+            and self._winograd is not None
+            and bias is not None
+            and self._winograd.supports(x, self.conv.weight)
+        ):
+            result = self._winograd(x, self.conv.weight, bias)
+            if self._eager_eval:
+                mx.eval(result)
+            return result
 
         if kernel_size > 1:
             if causal:
@@ -110,27 +133,33 @@ class NativeConv3dBlock(nn.Module):
             pad = self.padding
             x = mx.pad(x, [(0, 0), (0, 0), (pad, pad), (pad, pad), (0, 0)])
 
-        return self.conv(x)
+        result = self.conv(x)
+        if self._eager_eval:
+            mx.eval(result)
+        return result
 
 
-class NativeResBlock3d(nn.Module):
+class VAEResBlock3d(nn.Module):
     """Pre-activation VAE residual block in BFHWC layout."""
 
     def __init__(
         self,
         channels: int,
         spatial_padding_mode: str = "manual",
+        winograd: bool = False,
     ) -> None:
         super().__init__()
-        self.conv1 = NativeConv3dBlock(
+        self.conv1 = Conv3dBlock(
             channels,
             channels,
             spatial_padding_mode=spatial_padding_mode,
+            winograd=winograd,
         )
-        self.conv2 = NativeConv3dBlock(
+        self.conv2 = Conv3dBlock(
             channels,
             channels,
             spatial_padding_mode=spatial_padding_mode,
+            winograd=winograd,
         )
 
     def __call__(self, x: mx.array, causal: bool = False) -> mx.array:
@@ -140,7 +169,7 @@ class NativeResBlock3d(nn.Module):
         return x + residual
 
 
-class NativeResBlockGroup(nn.Module):
+class ResBlockGroup(nn.Module):
     """A fixed-width group of VAE residual blocks."""
 
     def __init__(
@@ -148,14 +177,16 @@ class NativeResBlockGroup(nn.Module):
         channels: int,
         num_blocks: int,
         spatial_padding_mode: str = "manual",
+        winograd: bool = False,
     ) -> None:
         super().__init__()
         if num_blocks <= 0:
             raise ValueError("num_blocks must be positive")
         self.res_blocks = [
-            NativeResBlock3d(
+            VAEResBlock3d(
                 channels,
                 spatial_padding_mode=spatial_padding_mode,
+                winograd=winograd,
             )
             for _ in range(num_blocks)
         ]
@@ -233,9 +264,9 @@ def patchify_spatial_bfhwc(
 
 
 __all__ = [
-    "NativeConv3dBlock",
-    "NativeResBlock3d",
-    "NativeResBlockGroup",
+    "Conv3dBlock",
+    "ResBlockGroup",
+    "VAEResBlock3d",
     "lookup_weight",
     "patchify_spatial_bfhwc",
     "pixel_norm_bfhwc",

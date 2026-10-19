@@ -5,11 +5,11 @@ from dataclasses import dataclass, fields
 import mlx.core as mx
 
 from kinomlx.media.frames import VideoFrameStream
-from kinomlx.models.ltx2.generation import GenerationOutput
+from kinomlx.models.ltx2.generation import LTX2GenerationOutput
 from kinomlx.models.ltx2.pipelines.distilled import prepare_stage, run_stage
 from kinomlx.models.ltx2.runner import LTX2Runner
 from kinomlx.models.ltx2.signals import ltx23_sdr_signal
-from kinomlx.models.ltx2.types import DistilledRequest as ProductDistilledRequest
+from kinomlx.models.ltx2.types import LTX2Request as ProductDistilledRequest
 from kinomlx.types import VideoPixelShape
 from tests.models.ltx2.test_distilled_pipeline import (
     _RecordingComponents,
@@ -48,7 +48,7 @@ def generate_synthetic_one_stage(
     text_conditioner=None,
     reporter=None,
     artifact_sink=None,
-) -> GenerationOutput:
+) -> LTX2GenerationOutput:
     """Compose public text, state, denoise, signal, and output products once."""
     del artifact_sink
     if components is None or text_conditioner is None:
@@ -95,7 +95,7 @@ def generate_synthetic_one_stage(
         spec=signal,
         frame_count=request.frames,
     )
-    return GenerationOutput(frames=frames, metadata={"recipe": "synthetic-one-stage"})
+    return LTX2GenerationOutput(frames=frames, metadata={"recipe": "synthetic-one-stage"})
 
 
 def test_raw_condition_owns_no_encoder_or_model() -> None:
@@ -146,7 +146,7 @@ def test_condition_preparation_closes_encoder_before_transformer_load() -> None:
     assert_balanced(components)
 
 
-def test_generic_runner_executes_a_second_public_station_composition() -> None:
+def test_generic_runner_executes_a_second_public_stage_composition() -> None:
     components = _RecordingComponents()
     runner = LTX2Runner(
         resources=_Resources(),

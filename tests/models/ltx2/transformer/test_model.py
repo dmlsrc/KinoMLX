@@ -191,7 +191,7 @@ def test_compiled_block_groups_match_eager_forward() -> None:
     expected = model(video, audio)
     mx.eval(*expected)
 
-    model.compile_block_groups = 1
+    model.compile_block_group_size = 1
     actual = model(video, audio)
     mx.eval(*actual)
 
@@ -205,7 +205,7 @@ def test_compiled_block_groups_keep_low_memory_eval_cadence(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     model = _small_model(mx.float32, layers=2)
-    model.compile_block_groups = 1
+    model.compile_block_group_size = 1
     model._eval_frequency = 8
     evaluations = []
     monkeypatch.setattr(
@@ -224,7 +224,7 @@ def test_compiled_block_groups_preserve_disabled_modality_semantics(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     model = _small_model(mx.float32)
-    model.compile_block_groups = 1
+    model.compile_block_group_size = 1
     monkeypatch.setattr(
         model_module,
         "_compile_transformer_block_group",
@@ -617,7 +617,7 @@ def test_reloadable_source_matches_weights_with_streaming_and_compile(
     path = tmp_path / "weights.safetensors"
     mx.save_safetensors(str(path), dict(tree_flatten(source.parameters())))
     target = _small_model(mx.float32, layers=2)
-    target.compile_block_groups = compiled
+    target.compile_block_group_size = compiled
     loads = []
 
     def load(block_index=None):

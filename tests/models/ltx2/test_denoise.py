@@ -128,16 +128,16 @@ def test_loop_reports_every_step_and_invokes_callback() -> None:
         transformer=model,
         video_context=mx.zeros((1, 1, 4)),
         reporter=reporter,
-        phase="stage",
+        phase="phase",
         callback=lambda step, total: callbacks.append((step, total)),
     )
     assert len(model.calls) == 2
     assert callbacks == [(1, 2), (2, 2)]
     assert reporter.events == [
-        ("start", "stage", {"total": 2, "unit": "step"}),
-        ("advance", "stage", {"advance": 1.0}),
-        ("advance", "stage", {"advance": 1.0}),
-        ("end", "stage", {}),
+        ("start", "phase", {"total": 2, "unit": "step"}),
+        ("advance", "phase", {"advance": 1.0}),
+        ("advance", "phase", {"advance": 1.0}),
+        ("end", "phase", {}),
     ]
 
 
@@ -190,6 +190,30 @@ def test_nonfinite_step_stops_loop_before_callback(modality, invalid):
     assert len(calls) == 1
     assert callbacks == []
     assert reporter.events[-1] == ("end", "denoise", {})
+
+
+@pytest.mark.parametrize(
+    ("transformer_dtype", "hinted"),
+    [(mx.float16, True), (mx.bfloat16, False), (None, False)],
+)
+def test_nonfinite_step_names_bfloat16_only_for_a_float16_transformer(transformer_dtype, hinted):
+    from kinomlx.models.ltx2.denoise import LTX2DenoiseError
+
+    def transformer(video, audio):
+        return tuple(mx.full_like(state.latent, float("inf")) for state in (video, audio))
+
+    with pytest.raises(LTX2DenoiseError, match="stage 1, step 1: .*nonfinite video") as raised:
+        denoise_loop(
+            _state(),
+            _state(),
+            (1.0, 0.5, 0.0),
+            transformer=transformer,
+            video_context=mx.zeros((1, 1, 4)),
+            audio_context=mx.zeros((1, 1, 4)),
+            stage=1,
+            transformer_dtype=transformer_dtype,
+        )
+    assert ("--transformer-dtype bfloat16" in str(raised.value)) is hinted
 
 
 @pytest.mark.parametrize("video_enabled", [True, False])

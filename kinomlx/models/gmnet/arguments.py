@@ -2,11 +2,12 @@
 
 import argparse
 
-from kinomlx.cli._registry import validate_model_parser
 from kinomlx.cli.config_arguments import add_config_arguments
 from kinomlx.cli.invocation import add_invocation_arguments, model_config_epilog
+from kinomlx.cli.parser_contract import validate_model_parser
 from kinomlx.config_record_cli import ConfigArgumentParser
-from kinomlx.model_registry import config_registry, model_choices
+from kinomlx.model_catalog import model_choices
+from kinomlx.model_registry import config_registry
 
 
 def build_parser() -> argparse.ArgumentParser:

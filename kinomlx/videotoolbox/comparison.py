@@ -36,7 +36,7 @@ def render_comparison(
     # Coerce to uint8 RGBA8 for CIImage(kCIFormatRGBA8). The pre half is a
     # deliberately-blocky visualization, so 8-bit is fine. Channel math runs in
     # MLX and the bytes come from the array buffer, so no numpy.
-    if str(pre_up.dtype).split(".")[-1] in ("float16", "float32"):
+    if pre_up.dtype in (mx.float16, mx.float32):
         rgba = mx.clip(pre_up * 255.0, 0, 255).astype(mx.uint8)
     else:
         rgba = pre_up

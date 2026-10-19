@@ -27,7 +27,7 @@ from kinomlx.models.ltx2.upscaler import (
     load_spatial_upscaler_weights,
 )
 from kinomlx.models.ltx2.video_vae.config import VideoVAEConfig
-from kinomlx.models.ltx2.video_vae.loading import load_native_video_vae
+from kinomlx.models.ltx2.video_vae.loading import load_video_vae
 from kinomlx.models.ltx2.weights.keys import weight_family_for_key
 from tests._snapshots import pinned_snapshot
 from tests.models.ltx2._source_weights import family_weights
@@ -182,7 +182,7 @@ def test_real_ltx25_component_parity_reference_boundaries() -> None:
     bundle = None
     video_encoded = video_decoded = None
     try:
-        bundle = load_native_video_vae(
+        bundle = load_video_vae(
             video_weights,
             config=VideoVAEConfig.from_checkpoint(video_path),
         )

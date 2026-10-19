@@ -2,11 +2,11 @@
 
 from dataclasses import replace
 from pathlib import Path
-from typing import Literal
 
 from kinomlx.api_boundaries import APIBoundary, configuration, runtime
 from kinomlx.cli.config_schema import settings_table
 from kinomlx.cli.prompt_arguments import prompt_unconditional_field
+from kinomlx.cli.resource_operation import operation_table
 from kinomlx.cli.seed_arguments import seed_fields
 from kinomlx.config import (
     CliBinding,
@@ -18,8 +18,8 @@ from kinomlx.config import (
 )
 from kinomlx.config.layer_rules import OUTPUT_SELECTION
 from kinomlx.config.source_rules import PROMPT_FILE
-from kinomlx.config.stations import StationPolicy
-from kinomlx.config_bindings import argument_value
+from kinomlx.config.stages import IrrelevantAction, StageMode, StagePolicy
+from kinomlx.config_bindings import CliAction, argument_value
 from kinomlx.config_constraints import field_choices
 from kinomlx.config_surfaces import CONFIG_SURFACES, MODEL_SURFACES, SOURCE_SURFACES
 from kinomlx.invocation_controls import MODEL_CONTROL
@@ -27,8 +27,9 @@ from kinomlx.samplers.sigmas import parse_sigmas
 from kinomlx.settings import Settings
 
 from .adapters.config_schema import ADAPTERS
-from .artifacts import OUTPUT_POLICIES, LTX2ArtifactConfig
+from .artifacts import LTX2ArtifactConfig
 from .config_groups import LTX2ConfigGroup
+from .image_arguments import IMAGES
 from .layer_rules import (
     DURATION_SELECTION,
     DURATION_SERIALIZATION,
@@ -40,114 +41,124 @@ from .layer_rules import (
 from .output_config import (
     OutputConfig,
 )
-from .pipelines.distilled import generate_distilled
-from .pipelines.restart import restart_distilled
+from .output_policies import OUTPUT_POLICIES
+from .pipelines.distilled import generate_ltx2
+from .pipelines.restart import restart_ltx2
 from .resources import prepare_resources
-from .restart import RESTART_PHASE_CHOICES, RestartConfig
+from .restart import RestartConfig
+from .restart_rules import RESTARTS, STAGES, LTX2Stage
 from .runner import API_BOUNDARIES as RUNNER_API_BOUNDARIES
 from .settings import (
     STREAM_TRANSFORMER_RESIDENT_BLOCKS,
     LTX2Settings,
 )
+from .sparse_attention import canonical_layer_ranges, canonical_step_schedule
 from .types import (
-    DistilledRequest,
-    HDRReferenceConditioningConfig,
-    ImageConditioningConfig,
-    VideoVAETilingConfig,
+    LTX2HDRReferenceConditioningConfig,
+    LTX2Request,
+    LTX2VideoVAETilingConfig,
 )
+from .vocabularies import GemmaVariant, LTX2ModelGeneration
 
 F = ConfigFieldSpec
-_LOCKED = (StationPolicy("decode", "locked"), StationPolicy("stage-2", "locked"))
-_DECODE_LOCKED = (StationPolicy("decode", "locked"), StationPolicy("stage-2", "mutable"))
-_MUTABLE = (StationPolicy("decode", "mutable"), StationPolicy("stage-2", "mutable"))
+_LOCKED = (
+    StagePolicy(LTX2Stage.DECODE, StageMode.LOCKED),
+    StagePolicy(LTX2Stage.STAGE_2, StageMode.LOCKED),
+)
+_DECODE_LOCKED = (
+    StagePolicy(LTX2Stage.DECODE, StageMode.LOCKED),
+    StagePolicy(LTX2Stage.STAGE_2, StageMode.MUTABLE),
+)
+_MUTABLE = (
+    StagePolicy(LTX2Stage.DECODE, StageMode.MUTABLE),
+    StagePolicy(LTX2Stage.STAGE_2, StageMode.MUTABLE),
+)
 
 
 def _policy(
-    stage_2: Literal["mutable", "locked", "irrelevant"],
-    decode: Literal["mutable", "locked", "irrelevant"],
+    stage_2: StageMode,
+    decode: StageMode,
     *,
     stage_2_reason: str,
     decode_reason: str,
-    stage_2_action: Literal["ignore", "reject"] | None = None,
-    decode_action: Literal["ignore", "reject"] | None = None,
-) -> tuple[StationPolicy, ...]:
-    """Give one LTX field explicit decisions at both supported restart stations."""
+    stage_2_action: IrrelevantAction | None = None,
+    decode_action: IrrelevantAction | None = None,
+) -> tuple[StagePolicy, ...]:
+    """Give one LTX field explicit decisions at both supported restart stages."""
     return (
-        StationPolicy("stage-2", stage_2, reason=stage_2_reason, irrelevant_action=stage_2_action),
-        StationPolicy("decode", decode, reason=decode_reason, irrelevant_action=decode_action),
+        StagePolicy(
+            LTX2Stage.STAGE_2, stage_2, reason=stage_2_reason, irrelevant_action=stage_2_action
+        ),
+        StagePolicy(
+            LTX2Stage.DECODE, decode, reason=decode_reason, irrelevant_action=decode_action
+        ),
     )
 
 
 _MODEL_SOURCE_POLICIES = {
     "model_generation": _policy(
-        "locked",
-        "locked",
+        StageMode.LOCKED,
+        StageMode.LOCKED,
         stage_2_reason="The saved stage-1 latent fixes checkpoint generation and geometry.",
         decode_reason="The saved latent fixes checkpoint generation and geometry.",
     ),
     "weights_path": _policy(
-        "mutable",
-        "mutable",
+        StageMode.MUTABLE,
+        StageMode.MUTABLE,
         stage_2_reason="A compatible baseline can supply the repeated transformer and decoder.",
         decode_reason="A compatible baseline can supply the decoder; resources inspect its full inventory.",
     ),
-    "gemma_path": _policy(
-        "mutable",
-        "locked",
-        stage_2_reason="The source can supply stage-2 projection or connector identity for saved text.",
-        decode_reason="The source remains part of the inspected inventory, although decode does not encode text.",
-    ),
     "gemma_variant": _policy(
-        "mutable",
-        "locked",
+        StageMode.MUTABLE,
+        StageMode.LOCKED,
         stage_2_reason="Gemma discovery can select stage-2 text projection and connector identity.",
         decode_reason="Gemma discovery remains part of the inspected inventory; decode does not encode text.",
     ),
     "spatial_upscaler_path": _policy(
-        "mutable",
-        "locked",
+        StageMode.MUTABLE,
+        StageMode.LOCKED,
         stage_2_reason="Stage-2 explicitly loads the spatial latent upscaler.",
         decode_reason="The saved latent needs no upscaling, but this source remains in resource inspection.",
     ),
     "transformer_path": _policy(
-        "mutable",
-        "locked",
+        StageMode.MUTABLE,
+        StageMode.LOCKED,
         stage_2_reason="Stage-2 loads a transformer for its repeated denoise.",
         decode_reason="Decode skips transformer execution but resource preparation inspects this source.",
     ),
     "text_encoder_path": _policy(
-        "mutable",
-        "locked",
-        stage_2_reason="The split source can supply projection or connector identity for saved text.",
+        StageMode.MUTABLE,
+        StageMode.LOCKED,
+        stage_2_reason="The text source can supply projection or connector identity for saved text.",
         decode_reason="The source remains in the inspected inventory; decode does not encode text.",
     ),
     "video_vae": _policy(
-        "mutable",
-        "mutable",
+        StageMode.MUTABLE,
+        StageMode.MUTABLE,
         stage_2_reason="Stage-2 media conditions and terminal video decode use this VAE variant.",
         decode_reason="Terminal video decode uses this VAE variant.",
     ),
     "video_vae_path": _policy(
-        "mutable",
-        "mutable",
+        StageMode.MUTABLE,
+        StageMode.MUTABLE,
         stage_2_reason="Stage-2 media conditions and terminal video decode use this VAE source.",
         decode_reason="Terminal video decode uses this VAE source.",
     ),
     "audio_vae_path": _policy(
-        "mutable",
-        "mutable",
+        StageMode.MUTABLE,
+        StageMode.MUTABLE,
         stage_2_reason="Stage-2 and its terminal decode can use this audio VAE source.",
         decode_reason="Terminal audio decode can use this audio VAE source.",
     ),
     "temporal_latent_upscaler_path": _policy(
-        "locked",
-        "locked",
+        StageMode.LOCKED,
+        StageMode.LOCKED,
         stage_2_reason="The restart uses recorded geometry and this source remains in inspected capabilities.",
         decode_reason="Decode uses recorded geometry and this source remains in inspected capabilities.",
     ),
     "duration_head_path": _policy(
-        "locked",
-        "locked",
+        StageMode.LOCKED,
+        StageMode.LOCKED,
         stage_2_reason="The restart uses recorded frame count and this source remains in inspected capabilities.",
         decode_reason="Decode uses recorded frame count and this source remains in inspected capabilities.",
     ),
@@ -158,10 +169,8 @@ _TRANSFORMER_SETTINGS = frozenset(
         "fast_mode",
         "transformer_dtype",
         "adapter_accumulation",
-        "steel_attention",
-        "steel_attention_d64",
-        "steel_attention_probe",
         "compile_attention",
+        "dense_attention_kernel",
         "video_ff_layout_specs",
         "video_ff_layout_layers",
         "video_attn_layout_specs",
@@ -182,7 +191,7 @@ _TRANSFORMER_SETTINGS = frozenset(
         "transformer_retain",
         "transformer_resident_blocks",
         "transformer_compile_group_size",
-        "compile_block_groups",
+        "compile_block_group_size",
     }
 )
 
@@ -205,7 +214,7 @@ _OUTPUT_REASONS = {
     "save_audio_sidecar": "the current audio sidecar",
     "save_hdr_heic_frames": "HDR-only terminal HEIC frames",
     "save_vae_frames": "SDR-only terminal VAE diagnostic frames",
-    "save_all_sidecars": "applicable current-station sidecars",
+    "save_all_sidecars": "applicable current-stage sidecars",
 }
 
 
@@ -214,23 +223,23 @@ def _artifact_policy(
     *,
     stage_2_reason: str,
     decode_reason: str,
-) -> tuple[StationPolicy, ...]:
-    """Derive one artifact field's station modes from where its group is produced.
+) -> tuple[StagePolicy, ...]:
+    """Derive one artifact field's stage modes from where its group is produced.
 
-    A station that produces the group may be asked for it; one that does not
+    A stage that produces the group may be asked for it; one that does not
     cannot, and its explicit request is ignored rather than refused as a change.
     Only the reasons are written by hand, because no synthesized sentence is
     true of every artifact group.
     """
     produced = OUTPUT_POLICIES[field].produced_at
     return tuple(
-        StationPolicy(
-            station,
-            "mutable" if station in produced else "irrelevant",
+        StagePolicy(
+            stage,
+            StageMode.MUTABLE if stage in produced else StageMode.IRRELEVANT,
             reason=reason,
-            irrelevant_action=None if station in produced else "ignore",
+            irrelevant_action=None if stage in produced else IrrelevantAction.IGNORE,
         )
-        for station, reason in (("stage-2", stage_2_reason), ("decode", decode_reason))
+        for stage, reason in (("stage-2", stage_2_reason), ("decode", decode_reason))
     )
 
 
@@ -254,16 +263,16 @@ _ARTIFACT_POLICIES = {
 
 _RESTART_REASONS = {
     "run": "Select the current parent run before loading its manifest.",
-    "phase": "Select the first repeated station before saved-base assembly.",
+    "stage": "Select the first repeated stage before saved-base assembly.",
     "latent_stage": "Select the current source latent stage; stage-2 requires stage-1.",
     "latents": "Select a substitute current-run latent artifact for input validation.",
 }
 
 
 def _completed_table(table: ConfigTableSpec) -> ConfigTableSpec:
-    """Attach the model's exact station decisions to its existing field owners."""
+    """Attach the model's exact stage decisions to its existing field owners."""
     if table.path == ("settings",):
-        # The shared builder already bound this model's stations at declaration.
+        # The shared builder already bound this model's stages at declaration.
         return table
     fields = []
     for field in table.fields:
@@ -272,8 +281,8 @@ def _completed_table(table: ConfigTableSpec) -> ConfigTableSpec:
                 policies = _MODEL_SOURCE_POLICIES[field.name]
             elif field.name in _TRANSFORMER_SETTINGS:
                 policies = _policy(
-                    "mutable",
-                    "locked",
+                    StageMode.MUTABLE,
+                    StageMode.LOCKED,
                     stage_2_reason=f"The repeated stage-2 transformer uses {field.name}.",
                     decode_reason=(
                         f"Decode skips transformer execution, but {field.name} remains part of "
@@ -287,8 +296,8 @@ def _completed_table(table: ConfigTableSpec) -> ConfigTableSpec:
             if use is None:
                 raise ValueError(f"unclassified LTX output field {field.name}")
             policies = _policy(
-                "mutable",
-                "mutable",
+                StageMode.MUTABLE,
+                StageMode.MUTABLE,
                 stage_2_reason=f"The stage-2 run selects {use} after terminal decode.",
                 decode_reason=f"The decode run selects {use} after terminal decode.",
             )
@@ -296,7 +305,12 @@ def _completed_table(table: ConfigTableSpec) -> ConfigTableSpec:
             policies = _ARTIFACT_POLICIES[field.name]
         elif table.path == ("restart",):
             reason = _RESTART_REASONS[field.name]
-            policies = _policy("mutable", "mutable", stage_2_reason=reason, decode_reason=reason)
+            policies = _policy(
+                StageMode.MUTABLE,
+                StageMode.MUTABLE,
+                stage_2_reason=reason,
+                decode_reason=reason,
+            )
         else:
             # Keep the established generation projections; supply their missing
             # independent reason so final inspection can explain each decision.
@@ -309,21 +323,21 @@ def _completed_table(table: ConfigTableSpec) -> ConfigTableSpec:
                     policy,
                     reason=(
                         "The saved latent already embodies this generation or conditioning value."
-                        if policy.mode == "locked"
+                        if policy.mode == StageMode.LOCKED
                         else "The repeated stage-2 path consumes this value before terminal output."
-                        if policy.station == "stage-2"
+                        if policy.stage == LTX2Stage.STAGE_2
                         else "The terminal decode path consumes this value."
                     ),
                 )
-                for policy in field.station_policies
+                for policy in field.stage_policies
             )
-        fields.append(replace(field, station_policies=policies))
-    if not table.stations:
+        fields.append(replace(field, stage_policies=policies))
+    if not table.stages:
         return replace(
             table,
             fields=tuple(fields),
-            stations=RESTART_PHASE_CHOICES,
-            station_record=table.record,
+            stages=RESTARTS,
+            stage_record=table.record,
         )
     return replace(table, fields=tuple(fields))
 
@@ -335,7 +349,8 @@ def _completed_tables(*tables: ConfigTableSpec) -> tuple[ConfigTableSpec, ...]:
 
 CONFIG_SCHEMA = ModelConfigSpec(
     model="ltx2",
-    restart_stations=RESTART_PHASE_CHOICES,
+    stages=STAGES,
+    restart_stages=RESTARTS,
     title="KinoMLX LTX-2 starter configuration",
     introduction=(
         "The prompt below is the only non-default starter value.",
@@ -366,18 +381,16 @@ CONFIG_SCHEMA = ModelConfigSpec(
         ConfigTableSpec(
             path=("generate",),
             cli_generated=True,
-            record=DistilledRequest,
-            stations=RESTART_PHASE_CHOICES,
-            station_record=DistilledRequest,
-            nested=("image", "hdr_reference", "vae_tiling"),
+            record=LTX2Request,
+            stages=RESTARTS,
+            stage_record=LTX2Request,
+            nested=("hdr_reference", "vae_tiling"),
             fields=(
                 *(
-                    replace(
-                        field, station_policies={"seed": _MUTABLE, "seeds": _MUTABLE}[field.name]
-                    )
+                    replace(field, stage_policies={"seed": _MUTABLE, "seeds": _MUTABLE}[field.name])
                     for field in seed_fields(image=False)
                 ),
-                replace(prompt_unconditional_field(), station_policies=_LOCKED),
+                replace(prompt_unconditional_field(), stage_policies=_LOCKED),
                 F(
                     persistence="source",
                     name="prompt_file",
@@ -403,7 +416,7 @@ CONFIG_SCHEMA = ModelConfigSpec(
                     starter="Describe your video here.",
                     multiline=True,
                     strip=True,
-                    station_policies=_LOCKED,
+                    stage_policies=_LOCKED,
                     surfaces=CONFIG_SURFACES,
                 ),
                 F(
@@ -414,7 +427,7 @@ CONFIG_SCHEMA = ModelConfigSpec(
                     persistence="intent",
                     cli_dest="width",
                     cli=CliBinding("LTX-2 generation"),
-                    station_policies=_LOCKED,
+                    stage_policies=_LOCKED,
                     surfaces=CONFIG_SURFACES,
                 ),
                 F(
@@ -425,7 +438,7 @@ CONFIG_SCHEMA = ModelConfigSpec(
                     persistence="intent",
                     cli_dest="height",
                     cli=CliBinding("LTX-2 generation"),
-                    station_policies=_LOCKED,
+                    stage_policies=_LOCKED,
                     surfaces=CONFIG_SURFACES,
                 ),
                 F(
@@ -437,7 +450,7 @@ CONFIG_SCHEMA = ModelConfigSpec(
                     cli_dest="frames",
                     cli=CliBinding("LTX-2 generation"),
                     notes=("Do not combine this with duration or auto_duration in the same layer",),
-                    station_policies=_LOCKED,
+                    stage_policies=_LOCKED,
                     surfaces=CONFIG_SURFACES,
                 ),
                 F(
@@ -449,7 +462,7 @@ CONFIG_SCHEMA = ModelConfigSpec(
                     cli_dest="duration",
                     cli=CliBinding("LTX-2 generation", parse=float),
                     notes=("Do not combine this with frames or auto_duration in the same layer",),
-                    station_policies=_LOCKED,
+                    stage_policies=_LOCKED,
                     surfaces=CONFIG_SURFACES,
                 ),
                 F(
@@ -460,7 +473,7 @@ CONFIG_SCHEMA = ModelConfigSpec(
                     persistence="source",
                     cli_dest="auto_duration",
                     layer_transforms=(DURATION_SELECTION, DURATION_SERIALIZATION),
-                    cli=CliBinding("LTX-2 generation", action="store_true"),
+                    cli=CliBinding("LTX-2 generation", action=CliAction.STORE_TRUE),
                     virtual=True,
                     default=False,
                     notes=("Do not combine this with frames or duration in the same layer",),
@@ -474,7 +487,7 @@ CONFIG_SCHEMA = ModelConfigSpec(
                     persistence="intent",
                     cli_dest="fps",
                     cli=CliBinding("LTX-2 generation"),
-                    station_policies=_LOCKED,
+                    stage_policies=_LOCKED,
                     surfaces=CONFIG_SURFACES,
                 ),
                 F(
@@ -485,29 +498,70 @@ CONFIG_SCHEMA = ModelConfigSpec(
                     persistence="intent",
                     cli_dest="noise_backend",
                     cli=CliBinding("LTX-2 generation"),
-                    choices=field_choices(DistilledRequest, "noise_backend"),
+                    choices=field_choices(LTX2Request, "noise_backend"),
                     choice_help=(
                         ("mlx", "Use KinoMLX's native MLX normal-noise stream"),
                         ("torch-mps", "Match the pinned PyTorch MPS normal-noise stream"),
                     ),
-                    station_policies=_MUTABLE,
+                    stage_policies=_MUTABLE,
                     surfaces=CONFIG_SURFACES,
                 ),
                 F(
-                    "sampler",
-                    "Select the stage-1 sampler policy",
+                    "stage_1_sampler",
+                    "Select the stage-1 sampler",
                     "",
                     "auto",
                     persistence="intent",
-                    cli_dest="sampler",
-                    cli=CliBinding("LTX-2 generation"),
-                    choices=field_choices(DistilledRequest, "sampler"),
-                    choice_help=(
-                        ("auto", "Use the checkpoint generation's published policy"),
-                        ("deterministic", "Use deterministic stage-1 sampling"),
-                        ("ancestral", "Use ancestral stage-1 sampling"),
+                    cli_dest="stage_1_sampler",
+                    cli=CliBinding(
+                        "LTX-2 generation", flags=("--stage1-sampler", "--sampler-stage-1")
                     ),
-                    station_policies=_LOCKED,
+                    choices=field_choices(LTX2Request, "stage_1_sampler"),
+                    choice_help=(
+                        ("auto", "Use the checkpoint generation's published stage-1 sampler"),
+                        ("deterministic", "Use deterministic Euler for stage 1"),
+                        ("ancestral", "Use RF ancestral Euler for stage 1"),
+                    ),
+                    notes=(
+                        "auto is deterministic on LTX-2.3 and ancestral on LTX-2.5. Either "
+                        "explicit value runs on both generations, for experiments.",
+                    ),
+                    stage_policies=_policy(
+                        StageMode.LOCKED,
+                        StageMode.LOCKED,
+                        stage_2_reason="The saved stage-1 latent embodies the stage-1 sampler.",
+                        decode_reason="The saved final latent embodies both stages' samplers.",
+                    ),
+                    surfaces=CONFIG_SURFACES,
+                ),
+                F(
+                    "stage_2_sampler",
+                    "Select the stage-2 sampler",
+                    "",
+                    "auto",
+                    persistence="intent",
+                    cli_dest="stage_2_sampler",
+                    cli=CliBinding(
+                        "LTX-2 generation", flags=("--stage2-sampler", "--sampler-stage-2")
+                    ),
+                    choices=field_choices(LTX2Request, "stage_2_sampler"),
+                    choice_help=(
+                        ("auto", "Use the checkpoint generation's published stage-2 sampler"),
+                        ("deterministic", "Use deterministic Euler for stage 2"),
+                        ("ancestral", "Use RF ancestral Euler for stage 2"),
+                    ),
+                    notes=(
+                        "auto is deterministic on LTX-2.3 and ancestral on LTX-2.5. Either "
+                        "explicit value runs on both generations, for experiments.",
+                    ),
+                    stage_policies=_policy(
+                        StageMode.MUTABLE,
+                        StageMode.LOCKED,
+                        stage_2_reason=(
+                            "A stage-2 restart reruns stage 2 from the saved stage-1 latent."
+                        ),
+                        decode_reason="The saved final latent embodies both stages' samplers.",
+                    ),
                     surfaces=CONFIG_SURFACES,
                 ),
                 F(
@@ -526,7 +580,7 @@ CONFIG_SCHEMA = ModelConfigSpec(
                         "Each stage has its own schedule; overriding one leaves the other "
                         "on its pinned distilled values.",
                     ),
-                    station_policies=_LOCKED,
+                    stage_policies=_LOCKED,
                     surfaces=CONFIG_SURFACES,
                 ),
                 F(
@@ -545,14 +599,149 @@ CONFIG_SCHEMA = ModelConfigSpec(
                         "Each stage has its own schedule; overriding one leaves the other "
                         "on its pinned distilled values.",
                     ),
-                    station_policies=_policy(
-                        "mutable",
-                        "locked",
+                    stage_policies=_policy(
+                        StageMode.MUTABLE,
+                        StageMode.LOCKED,
                         stage_2_reason=(
                             "A stage-2 restart reruns the stage-2 schedule from the saved "
                             "stage-1 latent."
                         ),
                         decode_reason="The saved final latent already embodies the stage-2 schedule.",
+                    ),
+                    surfaces=CONFIG_SURFACES,
+                ),
+                F(
+                    "stage_1_sparse_attention",
+                    "Set stage-1 sparse video self-attention per step",
+                    (
+                        'a Sol-Attn tau or "dense" per step: "dense", "1,1.25,1.5" (one entry '
+                        'per step, or one for every step), or "5-8=1.5" (steps left out stay '
+                        "dense)"
+                    ),
+                    "5-8=1.5",
+                    persistence="intent",
+                    cli_dest="stage_1_sparse_attention",
+                    cli=CliBinding(
+                        "LTX-2 generation",
+                        flags=("--stage1-sparse-attention", "--sparse-attention-stage-1"),
+                        parse=argument_value(canonical_step_schedule, "stage 1 sparse attention"),
+                    ),
+                    notes=(
+                        "Give each step a Sol-Attn tau or dense: 1,1.25,1.5 lists every step, "
+                        "1.5 sets all of them, and 5-8=1.5 sets steps 5 to 8 and leaves the "
+                        "rest dense. A larger tau computes fewer key blocks exactly: faster, "
+                        "and further from dense attention. Only video self-attention is made "
+                        "sparse.",
+                    ),
+                    stage_policies=(
+                        StagePolicy(
+                            LTX2Stage.STAGE_2,
+                            StageMode.LOCKED,
+                            "sparse_attention_stage1_profile",
+                            reason="The saved stage-1 latent embodies stage-1 sparse attention.",
+                        ),
+                        StagePolicy(
+                            LTX2Stage.DECODE,
+                            StageMode.LOCKED,
+                            "sparse_attention_stage_profiles",
+                            reason="The saved final latent embodies both stages' attention.",
+                        ),
+                    ),
+                    surfaces=CONFIG_SURFACES,
+                ),
+                F(
+                    "stage_2_sparse_attention",
+                    "Set stage-2 sparse video self-attention per step",
+                    (
+                        '"auto" for Sol-Engine\'s schedule, or a Sol-Attn tau or "dense" per '
+                        'step: "dense", "1,1.25,1.5" (one entry per step, or one for every '
+                        'step), or "2-3=1.5" (steps left out stay dense)'
+                    ),
+                    "auto",
+                    persistence="intent",
+                    cli_dest="stage_2_sparse_attention",
+                    cli=CliBinding(
+                        "LTX-2 generation",
+                        flags=("--stage2-sparse-attention", "--sparse-attention-stage-2"),
+                        parse=argument_value(canonical_step_schedule, "stage 2 sparse attention"),
+                    ),
+                    notes=(
+                        "auto takes Sol-Engine's published stage-2 schedule, tau 1, 1.25 and "
+                        "1.5 on the distilled stage's three steps. Or give each step a Sol-Attn "
+                        "tau or dense: 1,1.25,1.5 lists every step, 1.5 sets all of them, and "
+                        "2-3=1.5 sets steps 2 and 3 and leaves the rest dense. A larger tau "
+                        "computes fewer key blocks exactly: faster, and further from dense "
+                        "attention. Only video self-attention is made sparse.",
+                    ),
+                    stage_policies=(
+                        StagePolicy(
+                            LTX2Stage.STAGE_2,
+                            StageMode.MUTABLE,
+                            reason="A stage-2 restart reruns stage 2 from the saved stage-1 latent.",
+                        ),
+                        StagePolicy(
+                            LTX2Stage.DECODE,
+                            StageMode.LOCKED,
+                            "sparse_attention_stage_profiles",
+                            reason="The saved final latent embodies both stages' attention.",
+                        ),
+                    ),
+                    surfaces=CONFIG_SURFACES,
+                ),
+                F(
+                    "stage_1_dense_layers",
+                    "Keep these layers dense on sparse stage-1 steps",
+                    'transformer layer numbers and ranges from 0 to 47, like "0,46-47", or "none"',
+                    "0,47",
+                    persistence="intent",
+                    cli_dest="stage_1_dense_layers",
+                    cli=CliBinding(
+                        "LTX-2 generation",
+                        flags=("--stage1-dense-layers", "--dense-layers-stage-1"),
+                        parse=argument_value(canonical_layer_ranges, "stage 1 dense layers"),
+                    ),
+                    notes=("Layer numbers and ranges such as 0,46-47, or none.",),
+                    stage_policies=(
+                        StagePolicy(
+                            LTX2Stage.STAGE_2,
+                            StageMode.LOCKED,
+                            "sparse_attention_stage1_profile",
+                            reason="The saved stage-1 latent embodies stage-1 sparse attention.",
+                        ),
+                        StagePolicy(
+                            LTX2Stage.DECODE,
+                            StageMode.LOCKED,
+                            "sparse_attention_stage_profiles",
+                            reason="The saved final latent embodies both stages' attention.",
+                        ),
+                    ),
+                    surfaces=CONFIG_SURFACES,
+                ),
+                F(
+                    "stage_2_dense_layers",
+                    "Keep these layers dense on sparse stage-2 steps",
+                    'transformer layer numbers and ranges from 0 to 47, like "0,46-47", or "none"',
+                    "0,47",
+                    persistence="intent",
+                    cli_dest="stage_2_dense_layers",
+                    cli=CliBinding(
+                        "LTX-2 generation",
+                        flags=("--stage2-dense-layers", "--dense-layers-stage-2"),
+                        parse=argument_value(canonical_layer_ranges, "stage 2 dense layers"),
+                    ),
+                    notes=("Layer numbers and ranges such as 0,46-47, or none.",),
+                    stage_policies=(
+                        StagePolicy(
+                            LTX2Stage.STAGE_2,
+                            StageMode.MUTABLE,
+                            reason="A stage-2 restart reruns stage 2 from the saved stage-1 latent.",
+                        ),
+                        StagePolicy(
+                            LTX2Stage.DECODE,
+                            StageMode.LOCKED,
+                            "sparse_attention_stage_profiles",
+                            reason="The saved final latent embodies both stages' attention.",
+                        ),
                     ),
                     surfaces=CONFIG_SURFACES,
                 ),
@@ -564,14 +753,14 @@ CONFIG_SCHEMA = ModelConfigSpec(
                     persistence="intent",
                     cli_dest="hdr",
                     cli=CliBinding("LTX-2 generation"),
-                    choices=field_choices(DistilledRequest, "hdr"),
+                    choices=field_choices(LTX2Request, "hdr"),
                     choice_help=(
                         ("SRGB_LINEAR", "Write scene-linear Rec.709 EXR masters"),
                         ("ACESCG", "Write scene-linear ACEScg EXR masters"),
                         ("ACESCCT", "Write ACEScct working-space EXR masters"),
                     ),
                     default_text="unset, which produces SDR output",
-                    station_policies=_MUTABLE,
+                    stage_policies=_MUTABLE,
                     surfaces=CONFIG_SURFACES,
                 ),
                 F(
@@ -581,9 +770,9 @@ CONFIG_SCHEMA = ModelConfigSpec(
                     False,
                     persistence="intent",
                     cli_dest="generate_audio",
-                    cli=CliBinding("LTX-2 generation", action="paired_boolean"),
+                    cli=CliBinding("LTX-2 generation", action=CliAction.PAIRED_BOOLEAN),
                     negative_purpose="Disable the joint audio branch",
-                    station_policies=_MUTABLE,
+                    stage_policies=_MUTABLE,
                     surfaces=CONFIG_SURFACES,
                 ),
                 F(
@@ -593,19 +782,19 @@ CONFIG_SCHEMA = ModelConfigSpec(
                     False,
                     persistence="intent",
                     cli_dest="reference_aligned_audio",
-                    cli=CliBinding("LTX-2 generation", action="boolean"),
-                    station_policies=_LOCKED,
+                    cli=CliBinding("LTX-2 generation", action=CliAction.BOOLEAN),
+                    stage_policies=_LOCKED,
                     surfaces=CONFIG_SURFACES,
                 ),
                 F(
                     "generated_keyframes",
-                    "Reserve stage-1 slots for generated keyframes",
+                    "Reserve generated keyframe slots in both stages",
                     "a non-negative integer",
                     0,
                     persistence="intent",
                     cli_dest="generated_keyframes",
                     cli=CliBinding("LTX-2 generation"),
-                    station_policies=_LOCKED,
+                    stage_policies=_LOCKED,
                     surfaces=CONFIG_SURFACES,
                 ),
                 F(
@@ -616,7 +805,7 @@ CONFIG_SCHEMA = ModelConfigSpec(
                     persistence="intent",
                     cli_dest="text_conditioning",
                     cli=CliBinding("LTX-2 generation"),
-                    station_policies=_DECODE_LOCKED,
+                    stage_policies=_DECODE_LOCKED,
                     surfaces=CONFIG_SURFACES,
                 ),
                 F(
@@ -627,14 +816,58 @@ CONFIG_SCHEMA = ModelConfigSpec(
                     persistence="intent",
                     cli_dest="vae_decode_dtype",
                     cli=CliBinding("LTX-2 generation"),
-                    choices=field_choices(DistilledRequest, "vae_decode_dtype"),
+                    choices=field_choices(LTX2Request, "vae_decode_dtype"),
                     choice_help=(
-                        ("auto", "Use bfloat16 for SDR and float32 for HDR"),
+                        (
+                            "auto",
+                            "Use float16, and bfloat16 again if the first frames overflow",
+                        ),
                         ("bfloat16", "Force bfloat16 VAE decode compute"),
-                        ("float16", "Experimental FP16 compute for the diffusion VAE only"),
+                        ("float16", "Force float16 VAE decode compute"),
                         ("float32", "Force float32 VAE decode compute"),
                     ),
-                    station_policies=_MUTABLE,
+                    stage_policies=_MUTABLE,
+                    surfaces=CONFIG_SURFACES,
+                ),
+                F(
+                    "vae_cache_limit_gb",
+                    "Override the automatic VAE allocator cache limit",
+                    "a finite number greater than or equal to 0; unset selects cache with tiling",
+                    16.0,
+                    persistence="intent",
+                    cli_dest="vae_cache_limit_gb",
+                    cli=CliBinding("LTX-2 generation"),
+                    stage_policies=_MUTABLE,
+                    surfaces=CONFIG_SURFACES,
+                ),
+                F(
+                    "vae_sharpen",
+                    "Sharpen the diffusion VAE decode by unsharp-masking its final-stage input",
+                    "a number from 0 to 10; 0 turns sharpening off",
+                    2.0,
+                    persistence="intent",
+                    cli_dest="vae_sharpen",
+                    cli=CliBinding("LTX-2 generation"),
+                    notes=(
+                        "Applies to the diffusion video VAE only and is not part of the "
+                        "reference decoder; about 1 is subtle and 3 to 4 is strong.",
+                    ),
+                    stage_policies=_MUTABLE,
+                    surfaces=CONFIG_SURFACES,
+                ),
+                F(
+                    "vae_sharpen_radius",
+                    "Set the blur radius of VAE sharpening in output pixels",
+                    "a number greater than 0 and at most 8",
+                    2.0,
+                    persistence="intent",
+                    cli_dest="vae_sharpen_radius",
+                    cli=CliBinding("LTX-2 generation"),
+                    notes=(
+                        "The Gaussian's standard deviation; larger radii also sharpen coarser "
+                        "shapes and can outline them.",
+                    ),
+                    stage_policies=_MUTABLE,
                     surfaces=CONFIG_SURFACES,
                 ),
                 F(
@@ -647,69 +880,45 @@ CONFIG_SCHEMA = ModelConfigSpec(
                     cli=CliBinding(
                         "LTX-2 generation",
                         flags=("--reference-prompt-padding",),
-                        action="paired_boolean",
+                        action=CliAction.PAIRED_BOOLEAN,
                         negative_flags=("--compact-prompt",),
                     ),
                     negative_purpose="Use variable-length Gemma input without maximum padding",
-                    station_policies=_LOCKED,
+                    stage_policies=_LOCKED,
                     surfaces=CONFIG_SURFACES,
                 ),
                 replace(
                     ADAPTERS,
-                    station_policies=(
-                        StationPolicy("stage-2", "locked", "adapter_stage1_profile"),
-                        StationPolicy("decode", "locked", "adapter_stage_profiles"),
+                    stage_policies=(
+                        StagePolicy(LTX2Stage.STAGE_2, StageMode.LOCKED, "adapter_stage1_profile"),
+                        StagePolicy(LTX2Stage.DECODE, StageMode.LOCKED, "adapter_stage_profiles"),
                     ),
                 ),
-            ),
-        ),
-        ConfigTableSpec(
-            path=("generate", "image"),
-            cli_generated=True,
-            record=ImageConditioningConfig,
-            stations=RESTART_PHASE_CHOICES,
-            station_record=ImageConditioningConfig,
-            starter_enabled=False,
-            default_present=False,
-            introduction=(
-                "Optional image conditioning. Uncomment this table header and the "
-                "fields you want to set."
-            ),
-            fields=(
-                F(
-                    "path",
-                    "Set the image-conditioning source",
-                    "a readable image path",
-                    Path("input.png"),
-                    persistence="intent",
-                    cli_dest="image",
-                    environment_key="image",
-                    cli=CliBinding("LTX-2 generation"),
-                    station_policies=_DECODE_LOCKED,
-                    surfaces=CONFIG_SURFACES,
+                replace(
+                    IMAGES,
+                    stage_policies=(
+                        StagePolicy(LTX2Stage.STAGE_2, StageMode.LOCKED, "image_stage1_profile"),
+                        StagePolicy(LTX2Stage.DECODE, StageMode.LOCKED, "image_stage_profiles"),
+                    ),
                 ),
                 F(
-                    "frame_index",
-                    "Choose the conditioned output frame",
-                    "a non-negative integer",
-                    0,
+                    "first_frame_mode",
+                    "Choose how the frame-0 image condition is applied",
+                    "",
+                    "anchor",
                     persistence="intent",
-                    cli_dest="image_frame_index",
-                    environment_key="image_frame_index",
+                    cli_dest="first_frame_mode",
                     cli=CliBinding("LTX-2 generation"),
-                    station_policies=_DECODE_LOCKED,
-                    surfaces=CONFIG_SURFACES,
-                ),
-                F(
-                    "strength",
-                    "Set the image-conditioning strength",
-                    "a number from 0 through 1",
-                    0.95,
-                    persistence="intent",
-                    cli_dest="image_strength",
-                    environment_key="image_strength",
-                    cli=CliBinding("LTX-2 generation"),
-                    station_policies=_DECODE_LOCKED,
+                    choices=field_choices(LTX2Request, "first_frame_mode"),
+                    choice_help=(
+                        ("anchor", "Replace the first frame with the image and hold it fixed"),
+                        ("guide", "Guide a denoised first frame toward the image"),
+                    ),
+                    notes=(
+                        "Only the frame-0 condition reads this; every other condition is "
+                        "guidance either way.",
+                    ),
+                    stage_policies=_LOCKED,
                     surfaces=CONFIG_SURFACES,
                 ),
             ),
@@ -717,9 +926,9 @@ CONFIG_SCHEMA = ModelConfigSpec(
         ConfigTableSpec(
             path=("generate", "hdr_reference"),
             cli_generated=True,
-            record=HDRReferenceConditioningConfig,
-            stations=RESTART_PHASE_CHOICES,
-            station_record=HDRReferenceConditioningConfig,
+            record=LTX2HDRReferenceConditioningConfig,
+            stages=RESTARTS,
+            stage_record=LTX2HDRReferenceConditioningConfig,
             starter_enabled=False,
             default_present=False,
             introduction=(
@@ -736,7 +945,7 @@ CONFIG_SCHEMA = ModelConfigSpec(
                     cli_dest="hdr_reference",
                     environment_key="hdr_reference",
                     cli=CliBinding("LTX-2 generation"),
-                    station_policies=_DECODE_LOCKED,
+                    stage_policies=_DECODE_LOCKED,
                     surfaces=CONFIG_SURFACES,
                 ),
                 F(
@@ -748,7 +957,7 @@ CONFIG_SCHEMA = ModelConfigSpec(
                     cli_dest="hdr_reference_strength",
                     environment_key="hdr_reference_strength",
                     cli=CliBinding("LTX-2 generation"),
-                    station_policies=_DECODE_LOCKED,
+                    stage_policies=_DECODE_LOCKED,
                     surfaces=CONFIG_SURFACES,
                 ),
             ),
@@ -756,9 +965,9 @@ CONFIG_SCHEMA = ModelConfigSpec(
         ConfigTableSpec(
             path=("generate", "vae_tiling"),
             cli_generated=True,
-            record=VideoVAETilingConfig,
-            stations=RESTART_PHASE_CHOICES,
-            station_record=VideoVAETilingConfig,
+            record=LTX2VideoVAETilingConfig,
+            stages=RESTARTS,
+            stage_record=LTX2VideoVAETilingConfig,
             starter_enabled=False,
             introduction=(
                 "Optional VAE decode tiling. Uncomment this table header and the "
@@ -779,13 +988,13 @@ CONFIG_SCHEMA = ModelConfigSpec(
                         VAE_TILING_EFFECTIVE,
                     ),
                     cli=CliBinding("LTX-2 generation"),
-                    choices=field_choices(VideoVAETilingConfig, "mode"),
+                    choices=field_choices(LTX2VideoVAETilingConfig, "mode"),
                     choice_help=(
                         ("auto", "Let the decoder choose a memory-aware tiling plan"),
                         ("single", "Decode the complete latent in one operation"),
                         ("custom", "Use the temporal and spatial tile fields below"),
                     ),
-                    station_policies=_MUTABLE,
+                    stage_policies=_MUTABLE,
                     surfaces=CONFIG_SURFACES,
                 ),
                 F(
@@ -798,7 +1007,7 @@ CONFIG_SCHEMA = ModelConfigSpec(
                     environment_key="vae_temporal_tile_frames",
                     cli=CliBinding("LTX-2 generation"),
                     default_text="unset, or 256 when the mode is custom",
-                    station_policies=_MUTABLE,
+                    stage_policies=_MUTABLE,
                     surfaces=CONFIG_SURFACES,
                 ),
                 F(
@@ -810,7 +1019,7 @@ CONFIG_SCHEMA = ModelConfigSpec(
                     cli_dest="vae_temporal_overlap_frames",
                     environment_key="vae_temporal_overlap_frames",
                     cli=CliBinding("LTX-2 generation"),
-                    station_policies=_MUTABLE,
+                    stage_policies=_MUTABLE,
                     surfaces=CONFIG_SURFACES,
                 ),
                 F(
@@ -822,7 +1031,7 @@ CONFIG_SCHEMA = ModelConfigSpec(
                     cli_dest="vae_spatial_tile_pixels",
                     environment_key="vae_spatial_tile_pixels",
                     cli=CliBinding("LTX-2 generation"),
-                    station_policies=_MUTABLE,
+                    stage_policies=_MUTABLE,
                     surfaces=CONFIG_SURFACES,
                 ),
                 F(
@@ -834,7 +1043,7 @@ CONFIG_SCHEMA = ModelConfigSpec(
                     cli_dest="vae_spatial_overlap_pixels",
                     environment_key="vae_spatial_overlap_pixels",
                     cli=CliBinding("LTX-2 generation"),
-                    station_policies=_MUTABLE,
+                    stage_policies=_MUTABLE,
                     surfaces=CONFIG_SURFACES,
                 ),
             ),
@@ -955,7 +1164,7 @@ CONFIG_SCHEMA = ModelConfigSpec(
                     False,
                     persistence="intent",
                     cli_dest="vsr_save_original",
-                    cli=CliBinding("Output", action="boolean"),
+                    cli=CliBinding("Output", action=CliAction.BOOLEAN),
                     groups=frozenset({ConfigGroup.SAVE_ALL_CANDIDATE}),
                     surfaces=CONFIG_SURFACES,
                 ),
@@ -1003,7 +1212,9 @@ CONFIG_SCHEMA = ModelConfigSpec(
                     persistence="intent",
                     cli_dest="save_run_log",
                     cli=CliBinding(
-                        "Output", flags=("--save-run-log", "--save-metadata"), action="boolean"
+                        "Output",
+                        flags=("--save-run-log", "--save-metadata"),
+                        action=CliAction.BOOLEAN,
                     ),
                     default_text="unset, which inherits the save-all setting",
                     groups=frozenset({ConfigGroup.SAVE_ALL_CANDIDATE}),
@@ -1016,7 +1227,7 @@ CONFIG_SCHEMA = ModelConfigSpec(
                     False,
                     persistence="intent",
                     cli_dest="save_console_log",
-                    cli=CliBinding("Output", action="boolean"),
+                    cli=CliBinding("Output", action=CliAction.BOOLEAN),
                     default_text="unset, which inherits the save-all setting",
                     groups=frozenset({ConfigGroup.SAVE_ALL_CANDIDATE}),
                     surfaces=CONFIG_SURFACES,
@@ -1028,7 +1239,7 @@ CONFIG_SCHEMA = ModelConfigSpec(
                     False,
                     persistence="intent",
                     cli_dest="save_effective_config",
-                    cli=CliBinding("Output", action="boolean"),
+                    cli=CliBinding("Output", action=CliAction.BOOLEAN),
                     default_text="unset, which inherits the save-all setting",
                     groups=frozenset({ConfigGroup.SAVE_ALL_CANDIDATE}),
                     surfaces=CONFIG_SURFACES,
@@ -1040,7 +1251,7 @@ CONFIG_SCHEMA = ModelConfigSpec(
                     False,
                     persistence="intent",
                     cli_dest="save_audio_sidecar",
-                    cli=CliBinding("Output", action="boolean"),
+                    cli=CliBinding("Output", action=CliAction.BOOLEAN),
                     default_text="unset, which inherits the save-all setting",
                     groups=frozenset({ConfigGroup.SAVE_ALL_CANDIDATE}),
                     surfaces=CONFIG_SURFACES,
@@ -1052,7 +1263,7 @@ CONFIG_SCHEMA = ModelConfigSpec(
                     False,
                     persistence="intent",
                     cli_dest="save_hdr_heic_frames",
-                    cli=CliBinding("Output", action="boolean"),
+                    cli=CliBinding("Output", action=CliAction.BOOLEAN),
                     default_text="unset, which stays off because save-all excludes this sequence",
                     groups=frozenset({ConfigGroup.SAVE_ALL_CANDIDATE}),
                     surfaces=CONFIG_SURFACES,
@@ -1064,7 +1275,7 @@ CONFIG_SCHEMA = ModelConfigSpec(
                     False,
                     persistence="intent",
                     cli_dest="save_vae_frames",
-                    cli=CliBinding("Output", action="boolean"),
+                    cli=CliBinding("Output", action=CliAction.BOOLEAN),
                     default_text="unset, which stays off because save-all excludes this sequence",
                     groups=frozenset({ConfigGroup.SAVE_ALL_CANDIDATE}),
                     surfaces=CONFIG_SURFACES,
@@ -1079,15 +1290,15 @@ CONFIG_SCHEMA = ModelConfigSpec(
                     cli=CliBinding(
                         "Output",
                         flags=("--save-all-sidecars", "--save-debug-sidecars"),
-                        action="boolean",
+                        action=CliAction.BOOLEAN,
                     ),
                     surfaces=CONFIG_SURFACES,
                 ),
             ),
         ),
         settings_table(
-            stations=RESTART_PHASE_CHOICES,
-            adapter_weight_check_stations=frozenset({"stage-2"}),
+            stages=RESTARTS,
+            adapter_weight_check_stages=frozenset({"stage-2"}),
         ),
         ConfigTableSpec(
             path=("model_settings",),
@@ -1099,13 +1310,19 @@ CONFIG_SCHEMA = ModelConfigSpec(
                     "model_generation",
                     "Select the checkpoint generation",
                     "",
-                    "2.3",
+                    LTX2ModelGeneration.LTX23,
                     persistence="intent",
                     cli_dest="model_generation",
                     choices=field_choices(LTX2Settings, "model_generation"),
                     choice_help=(
-                        ("2.3", "Discover and run the LTX-2.3 checkpoint family"),
-                        ("2.5", "Discover and run the LTX-2.5 checkpoint family"),
+                        (
+                            LTX2ModelGeneration.LTX23,
+                            "Discover and run the LTX-2.3 checkpoint family",
+                        ),
+                        (
+                            LTX2ModelGeneration.LTX25,
+                            "Discover and run the LTX-2.5 checkpoint family",
+                        ),
                     ),
                     default_text="unset, which uses 2.3 discovery",
                     groups=frozenset({LTX2ConfigGroup.MODEL_GENERATION_SELECTOR}),
@@ -1128,32 +1345,22 @@ CONFIG_SCHEMA = ModelConfigSpec(
                     surfaces=CONFIG_SURFACES,
                 ),
                 F(
-                    "gemma_path",
-                    "Load a monolithic Gemma checkpoint",
-                    "a path to a compatible safetensors file",
-                    Path("gemma.safetensors"),
-                    persistence="intent",
-                    cli_dest="gemma_path",
-                    default_text="auto-discovered",
-                    groups=frozenset(
-                        {
-                            LTX2ConfigGroup.MODEL_SOURCE,
-                            LTX2ConfigGroup.MODEL_GEMMA_SOURCE,
-                        }
-                    ),
-                    surfaces=CONFIG_SURFACES,
-                ),
-                F(
                     "gemma_variant",
                     "Select the LTX-2.3 Gemma source",
                     "",
-                    "qat",
+                    GemmaVariant.QAT,
                     persistence="intent",
                     cli_dest="gemma_variant",
                     choices=field_choices(LTX2Settings, "gemma_variant"),
                     choice_help=(
-                        ("qat", "Use the QAT-unquantized Gemma source paired with LTX-2.3"),
-                        ("plain", "Use the plain instruction-tuned Gemma source"),
+                        (
+                            GemmaVariant.QAT,
+                            "Use the QAT-unquantized Gemma source paired with LTX-2.3",
+                        ),
+                        (
+                            GemmaVariant.PLAIN,
+                            "Use the plain instruction-tuned Gemma source",
+                        ),
                     ),
                     surfaces=CONFIG_SURFACES,
                 ),
@@ -1185,17 +1392,14 @@ CONFIG_SCHEMA = ModelConfigSpec(
                 ),
                 F(
                     "text_encoder_path",
-                    "Load a componentized text stack",
-                    "a directory or safetensors path",
-                    Path("text-encoder/"),
+                    "Load the text encoder from a local path",
+                    "LTX-2.3: a Gemma 3 directory holding config.json, tokenizer.json, and the "
+                    "model safetensors; LTX-2.5: a prepared text-encoder safetensors file",
+                    Path("gemma-3-12b-it/"),
                     persistence="intent",
                     cli_dest="text_encoder_path",
-                    groups=frozenset(
-                        {
-                            LTX2ConfigGroup.MODEL_SOURCE,
-                            LTX2ConfigGroup.MODEL_TEXT_ENCODER_SOURCE,
-                        }
-                    ),
+                    default_text="auto-discovered",
+                    groups=frozenset({LTX2ConfigGroup.MODEL_SOURCE}),
                     surfaces=CONFIG_SURFACES,
                 ),
                 F(
@@ -1276,7 +1480,7 @@ CONFIG_SCHEMA = ModelConfigSpec(
                     "transformer_dtype",
                     "Select transformer storage and compute precision",
                     "",
-                    "bfloat16",
+                    "float16",
                     persistence="intent",
                     cli_dest="transformer_dtype",
                     choices=field_choices(LTX2Settings, "transformer_dtype"),
@@ -1307,30 +1511,19 @@ CONFIG_SCHEMA = ModelConfigSpec(
                     surfaces=CONFIG_SURFACES,
                 ),
                 F(
-                    "steel_attention",
-                    "Enable eligible STEEL attention kernels",
+                    "dense_attention_kernel",
+                    "Run unmasked attention through KinoMLX's FP16 dense attention kernel",
                     "true or false",
                     True,
                     persistence="intent",
-                    cli_dest="steel_attention",
-                    surfaces=CONFIG_SURFACES,
-                ),
-                F(
-                    "steel_attention_d64",
-                    "Enable the head-dimension-64 STEEL path",
-                    "true or false",
-                    True,
-                    persistence="intent",
-                    cli_dest="steel_attention_d64",
-                    surfaces=CONFIG_SURFACES,
-                ),
-                F(
-                    "steel_attention_probe",
-                    "Collect STEEL selection diagnostics",
-                    "true or false when STEEL attention is enabled",
-                    False,
-                    persistence="intent",
-                    cli_dest="steel_attention_probe",
+                    cli_dest="dense_attention_kernel",
+                    notes=(
+                        "Video self- and text attention take it always; the 64-wide audio, "
+                        "audio text and audio-video calls take it with at least 512 tokens on "
+                        "both sides, where it is faster than MLX SDPA. In FP16 it matches MLX "
+                        "SDPA bit for bit on the video calls; elsewhere it differs by rounding. "
+                        "False runs every call on MLX SDPA.",
+                    ),
                     surfaces=CONFIG_SURFACES,
                 ),
                 F(
@@ -1534,12 +1727,12 @@ CONFIG_SCHEMA = ModelConfigSpec(
                     surfaces=CONFIG_SURFACES,
                 ),
                 F(
-                    "compile_block_groups",
-                    "Set the number of block groups to compile",
+                    "compile_block_group_size",
+                    "Compile the resident transformer in groups of this many blocks",
                     "an integer from 1 through 48",
                     48,
                     persistence="intent",
-                    cli_dest="compile_block_groups",
+                    cli_dest="compile_block_group_size",
                     surfaces=CONFIG_SURFACES,
                 ),
             ),
@@ -1557,7 +1750,7 @@ CONFIG_SCHEMA = ModelConfigSpec(
                     persistence="intent",
                     cli_dest="save_latents",
                     output_policy=OUTPUT_POLICIES["save_latents"],
-                    cli=CliBinding("LTX-2 artifacts", action="boolean"),
+                    cli=CliBinding("LTX-2 artifacts", action=CliAction.BOOLEAN),
                     default_text="unset, which inherits the save-all setting",
                     surfaces=CONFIG_SURFACES,
                 ),
@@ -1569,7 +1762,7 @@ CONFIG_SCHEMA = ModelConfigSpec(
                     persistence="intent",
                     cli_dest="save_media_conditioning",
                     output_policy=OUTPUT_POLICIES["save_media_conditioning"],
-                    cli=CliBinding("LTX-2 artifacts", action="boolean"),
+                    cli=CliBinding("LTX-2 artifacts", action=CliAction.BOOLEAN),
                     default_text="unset, which inherits the save-all setting",
                     surfaces=CONFIG_SURFACES,
                 ),
@@ -1584,13 +1777,14 @@ CONFIG_SCHEMA = ModelConfigSpec(
                     cli=CliBinding(
                         "LTX-2 artifacts",
                         flags=("--save-text-conditioning", "--save-text-embeddings"),
-                        action="boolean",
+                        action=CliAction.BOOLEAN,
                     ),
                     default_text="unset, which inherits the save-all setting",
                     surfaces=CONFIG_SURFACES,
                 ),
             ),
         ),
+        operation_table(cli_group="LTX-2 execution", stages=RESTARTS),
         ConfigTableSpec(
             path=("restart",),
             cli_generated=True,
@@ -1611,16 +1805,16 @@ CONFIG_SCHEMA = ModelConfigSpec(
                     surfaces=CONFIG_SURFACES,
                 ),
                 F(
-                    "phase",
-                    "Select the first station to repeat",
+                    "stage",
+                    "Select the first stage to repeat",
                     "",
                     "decode",
                     persistence="intent",
-                    cli_dest="restart_phase",
-                    environment_key="restart_phase",
+                    cli_dest="restart_stage",
+                    environment_key="restart_stage",
                     groups=frozenset({ConfigGroup.SOURCE_SELECTOR}),
                     cli=CliBinding("Restart", flags=("--restart-from",)),
-                    choices=field_choices(RestartConfig, "phase"),
+                    choices=field_choices(RestartConfig, "stage"),
                     choice_help=(
                         ("decode", "Decode an already generated latent"),
                         ("stage-2", "Resume at the second denoising stage"),
@@ -1629,19 +1823,19 @@ CONFIG_SCHEMA = ModelConfigSpec(
                 ),
                 F(
                     "latent_stage",
-                    "Select the saved latent used for decode",
+                    "Select which stage's saved latent to read",
                     "",
-                    "final",
+                    "stage-2",
                     persistence="intent",
                     cli_dest="latent_stage",
                     groups=frozenset({ConfigGroup.SOURCE_SELECTOR}),
                     cli=CliBinding("Restart"),
                     choices=field_choices(RestartConfig, "latent_stage"),
                     choice_help=(
-                        ("final", "Decode the saved final latent"),
-                        ("stage-1", "Decode the saved stage-1 latent"),
+                        ("stage-1", "Read the saved stage-1 latent"),
+                        ("stage-2", "Read the saved final latent, which stage 2 wrote"),
                     ),
-                    default_text='"final" when the restart phase is decode',
+                    default_text="the latest latent written before the restart stage",
                     surfaces=CONFIG_SURFACES,
                 ),
                 F(
@@ -1711,24 +1905,24 @@ CONFIG_SCHEMA = replace(
         ),
         APIBoundary(
             "ltx2",
-            generate_distilled,
+            generate_ltx2,
             (
-                configuration("request", DistilledRequest, "generate"),
+                configuration("request", LTX2Request, "generate"),
                 runtime("resources", "prepared immutable component inventory"),
                 runtime("components", "component provider"),
                 runtime("text_conditioner", "text-conditioning provider"),
                 runtime("reporter", "progress reporter"),
                 runtime("artifact_sink", "artifact writer"),
-                runtime("conditioning", "prepared shared station conditioning"),
+                runtime("conditioning", "prepared shared stage conditioning"),
             ),
         ),
         APIBoundary(
             "ltx2",
-            restart_distilled,
+            restart_ltx2,
             (
-                configuration("request", DistilledRequest, "generate"),
+                configuration("request", LTX2Request, "generate"),
                 runtime("resources", "prepared immutable component inventory"),
-                runtime("restart", "typed prepared station handoff"),
+                runtime("restart", "typed prepared stage handoff"),
                 runtime("components", "component provider"),
                 runtime("text_conditioner", "text-conditioning provider"),
                 runtime("reporter", "progress reporter"),

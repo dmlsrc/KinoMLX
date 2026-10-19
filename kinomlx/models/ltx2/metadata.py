@@ -21,10 +21,11 @@ from .audio_vae.vocoder import BWEVocoderConfig
 from .transformer.graph import convert_checkpoint_key, transformer_parameter_shapes
 from .transformer_config import TransformerConstructorConfig
 from .video_vae.config import VideoVAEConfig
+from .vocabularies import LTX2ModelGeneration
 
-_MISSING = object()
+_MISSING = sentinel("_MISSING")
 
-_SUPPORTED_GENERATIONS = frozenset({"2.3", "2.5"})
+_SUPPORTED_GENERATIONS = frozenset(LTX2ModelGeneration)
 _SUPPORTED_TRANSFORMER_SOURCE_DTYPES = frozenset({"BF16", "F16", "F32", "F8_E4M3"})
 
 
@@ -145,8 +146,8 @@ _LTX25_TRANSFORMER_PRESET: dict[str, object] = {
     "use_prompt_adaln_single": True,
 }
 _TRANSFORMER_PRESETS = {
-    "2.3": _LTX23_TRANSFORMER_PRESET,
-    "2.5": _LTX25_TRANSFORMER_PRESET,
+    LTX2ModelGeneration.LTX23: _LTX23_TRANSFORMER_PRESET,
+    LTX2ModelGeneration.LTX25: _LTX25_TRANSFORMER_PRESET,
 }
 
 
@@ -312,7 +313,7 @@ class LTX2CheckpointConfig:
     video_vae: VideoVAEConfig | None
 
     @property
-    def model_generation(self) -> str:
+    def model_generation(self) -> LTX2ModelGeneration:
         return self.transformer.model_generation
 
     @property
@@ -340,9 +341,9 @@ def _transformer_config(
     ) = _effective_transformer_variant(raw, header=header)
     signature = (ff_bias, keyframe_embedding)
     if signature == (True, False):
-        generation = "2.3"
+        generation = LTX2ModelGeneration.LTX23
     elif signature == (False, True):
-        generation = "2.5"
+        generation = LTX2ModelGeneration.LTX25
     else:
         raise ValueError(
             f"{path.name}: LTX transformer constructor combination ff_bias={ff_bias!r}, "
@@ -718,6 +719,10 @@ _GEMMA4_EXPECTED_ROPE = {
 
 def _inspect_gemma4_text_encoder(path: Path) -> TextEncoderHeaderConfig:
     component = "LTX-2.5 text encoder compatibility"
+    if path.is_dir():
+        raise ValueError(
+            f"{path.name}: {component}: expected a prepared text-encoder safetensors file"
+        )
     header = read_header(path)
     raw_metadata = header.get("__metadata__")
     if not isinstance(raw_metadata, Mapping):
@@ -834,7 +839,7 @@ def _inspect_gemma3_text_encoder(path: Path) -> TextEncoderHeaderConfig:
 def inspect_text_encoder(path: Path, *, model_generation: str) -> TextEncoderHeaderConfig:
     """Inspect the selected generation's text backbone without policing baggage."""
     generation_label(model_generation)
-    if model_generation == "2.3":
+    if model_generation == LTX2ModelGeneration.LTX23:
         return _inspect_gemma3_text_encoder(path)
     return _inspect_gemma4_text_encoder(path)
 

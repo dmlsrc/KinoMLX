@@ -193,8 +193,6 @@ def test_custom_tiling_geometry_survives_effective_normalization():
     [
         ({"weights_path": "base.safetensors"}, "transformer_path"),
         ({"transformer_path": "transformer"}, "weights_path"),
-        ({"gemma_path": "gemma.safetensors"}, "text_encoder_path"),
-        ({"text_encoder_path": "text-encoder"}, "gemma_path"),
         ({"video_vae": "conv"}, "video_vae_path"),
     ],
 )

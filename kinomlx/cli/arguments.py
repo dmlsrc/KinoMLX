@@ -2,7 +2,7 @@
 
 import argparse
 
-from kinomlx.model_registry import DEFAULT_MODEL, model_choices
+from kinomlx.model_catalog import DEFAULT_MODEL, model_choices
 
 from ._registry import model_summary
 from .invocation import add_invocation_arguments

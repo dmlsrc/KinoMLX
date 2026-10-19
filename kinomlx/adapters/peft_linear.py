@@ -4,7 +4,7 @@ import math
 
 import mlx.core as mx
 
-from .formats import AdapterOperation, LinearAdapterOptions
+from .formats import AdapterKind, AdapterOperation, LinearAdapterOptions
 
 
 def _shape(value: mx.array, shape: tuple[int, ...], name: str) -> mx.array:
@@ -56,7 +56,7 @@ def _grouped_lora(
 ) -> mx.array:
     out, inp = base.shape
     rank, block = options.rank, options.block_size
-    if operation.kind == "qalora":
+    if operation.kind == AdapterKind.QALORA:
         if inp % block:
             raise ValueError("QALoRA group size must divide the input width")
         pooled = inp // block
@@ -167,25 +167,25 @@ def peft_linear_delta(operation: AdapterOperation, base: mx.array) -> mx.array:
     if options is None:
         raise ValueError(f"PEFT {operation.kind} requires validated PEFT configuration")
     factors = operation.factors
-    if operation.kind == "beft":
+    if operation.kind == AdapterKind.BEFT:
         if operation.part != "bias" or base.ndim != 1:
             raise ValueError("BEFT requires an existing Linear bias target")
         added = _shape(factors["bias"], (1, base.size), "BEFT bias").reshape(base.shape)
         if "base_bias" in factors:
             added = added + _shape(factors["base_bias"], base.shape, "BEFT trained bias") - base
         return added
-    if operation.kind == "road":
+    if operation.kind == AdapterKind.ROAD:
         if base.ndim != (1 if operation.part == "bias" else 2):
             raise ValueError("ROAD requires a Linear weight or bias")
         return _road(operation, base, options)
     if operation.part != "weight" or base.ndim != 2:
         raise ValueError(f"{operation.kind} requires a Linear weight target")
     out, inp = base.shape
-    if operation.kind in ("bdlora", "qalora"):
+    if operation.kind in (AdapterKind.BDLORA, AdapterKind.QALORA):
         return _grouped_lora(operation, base, options)
-    if operation.kind == "hira":
+    if operation.kind == AdapterKind.HIRA:
         return base * _pair(operation, (out, inp), options.rank)
-    if operation.kind == "delora":
+    if operation.kind == AdapterKind.DELORA:
         rank = options.rank
         down = _shape(factors["A"], (rank, inp), "DeLoRA A")
         up = _shape(factors["B"], (out, rank), "DeLoRA B")
@@ -194,7 +194,7 @@ def peft_linear_delta(operation: AdapterOperation, base: mx.array) -> mx.array:
         a_norm = mx.maximum(mx.sqrt(mx.sum(down * down, axis=1)), 1e-4)
         b_norm = mx.maximum(mx.sqrt(mx.sum(up * up, axis=0)), 1e-4)
         return ((up * (gain / rank / (a_norm * b_norm))[None, :]) @ down) * norms[None, :]
-    if operation.kind == "c3a":
+    if operation.kind == AdapterKind.C3A:
         size = options.block_size
         if inp % size or out % size:
             raise ValueError("C3A block_size must divide input and output widths")
@@ -202,7 +202,7 @@ def peft_linear_delta(operation: AdapterOperation, base: mx.array) -> mx.array:
         positions = (mx.arange(size)[None, :] - mx.arange(size)[:, None]) % size
         blocks = kernel[:, :, positions]
         return blocks.transpose(0, 2, 1, 3).reshape(base.shape) / inp
-    if operation.kind == "miss":
+    if operation.kind == AdapterKind.MISS:
         rank = options.rank
         if options.variant == "bat":
             if inp % rank or out % rank:
@@ -215,11 +215,11 @@ def peft_linear_delta(operation: AdapterOperation, base: mx.array) -> mx.array:
             raise ValueError("MISS mini_r must divide the output width")
         block = _shape(factors["block"], (rank, width), "MISS block")
         return mx.tile(block.T, (out // width, math.ceil(inp / rank)))[:, :inp]
-    if operation.kind == "gralora":
+    if operation.kind == AdapterKind.GRALORA:
         return _gralora(operation, base, options)
-    if operation.kind == "peanut":
+    if operation.kind == AdapterKind.PEANUT:
         return _peanut(operation, base, options)
-    if operation.kind == "deft":
+    if operation.kind == AdapterKind.DEFT:
         rank = min(options.rank, out)
         projection = _shape(factors["P"], (out, rank), "DEFT P")
         if options.variant == "qr":
@@ -234,7 +234,7 @@ def peft_linear_delta(operation: AdapterOperation, base: mx.array) -> mx.array:
         learned = _shape(factors["R"], (rank, inp), "DEFT R")
         scale = options.scale / rank if options.scale else 1.0
         return projection @ (learned * scale - removed)
-    if operation.kind == "shira":
+    if operation.kind == AdapterKind.SHIRA:
         rows, columns = options.index_bounds
         if rows[1] >= out or columns[1] >= inp:
             raise ValueError("SHIRA COO index is outside the target weight")
@@ -243,7 +243,7 @@ def peft_linear_delta(operation: AdapterOperation, base: mx.array) -> mx.array:
             raise ValueError("SHIRA weight must be a vector")
         indices = factors["indices"].astype(mx.int32)
         return mx.zeros(base.shape, dtype=mx.float32).at[indices[0], indices[1]].add(values)
-    if operation.kind == "supertuning":
+    if operation.kind == AdapterKind.SUPERTUNING:
         if options.index_bounds[0][1] >= base.size:
             raise ValueError("SUPERTUNING flat index is outside the target weight")
         indices = factors["indices"].astype(mx.int32)

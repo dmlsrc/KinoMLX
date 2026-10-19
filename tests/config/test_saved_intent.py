@@ -32,7 +32,7 @@ def saved_payload(intent):
         json.dumps(
             {
                 "schema_version": RUN_SCHEMA_VERSION,
-                "configuration": configuration_payload("flux2", intent),
+                "configuration": configuration_payload(config_registry().model("flux2"), intent),
                 "effective_config": {"generate": {"steps": 999, "guidance": 999}},
             },
             default=str,
@@ -51,7 +51,9 @@ def test_saved_explicit_defaults_and_record_presence_survive_indexed_replay(monk
         .state()
     )
     payload = saved_payload(original)
-    restored = read_configuration(payload, model="flux2", source="saved.json")
+    restored = read_configuration(
+        payload, schema=config_registry().model("flux2"), source="saved.json"
+    )
     assert restored.explicit == original.explicit
     assert restored.replacements == original.replacements
     monkeypatch.setenv("KINO_VERBOSE", "true")
@@ -63,7 +65,9 @@ def test_saved_explicit_defaults_and_record_presence_survive_indexed_replay(monk
     assert result.values["generate"]["adapters"][1] == {"path": "second", "strength": 1.0}
     assert "steps" not in result.values["generate"]
     assert "guidance" not in result.values["generate"]
-    second = read_configuration(saved_payload(result), model="flux2", source="second.json")
+    second = read_configuration(
+        saved_payload(result), schema=config_registry().model("flux2"), source="second.json"
+    )
     assert second.explicit == result.explicit
     assert second.replacements == result.replacements
 
@@ -73,7 +77,7 @@ def test_run_record_requires_intent_and_labels_effective_values_separately(tmp_p
     intent = sources("generate.seed=0").prepare().state()
     RunRecord(
         path,
-        model="flux2",
+        schema=config_registry().model("flux2"),
         config_intent=intent,
         effective_config={"generate": {"seed": 0, "steps": 4}},
         argv=[],
@@ -85,7 +89,9 @@ def test_run_record_requires_intent_and_labels_effective_values_separately(tmp_p
     assert "invocation" not in payload
     assert payload["configuration"]["values"]["generate"] == {"seed": 0, "seeds": None}
     assert payload["effective_config"]["generate"]["steps"] == 4
-    restored = read_configuration(payload, model="flux2", source=str(path))
+    restored = read_configuration(
+        payload, schema=config_registry().model("flux2"), source=str(path)
+    )
     assert restored.explicit == intent.explicit
     assert ("generate", "seed") in restored.explicit
 
@@ -96,7 +102,7 @@ def test_missing_or_unsupported_run_format_has_no_fallback(version):
     payload["schema_version"] = version
     payload["invocation"] = {"generate": {"seed": 0}}
     with pytest.raises(ConfigError, match="unsupported run schema"):
-        read_configuration(payload, model="flux2", source="saved")
+        read_configuration(payload, schema=config_registry().model("flux2"), source="saved")
 
 
 @pytest.mark.parametrize("field", ["format", "model", "values", "explicit", "replacements"])
@@ -104,7 +110,7 @@ def test_every_saved_configuration_member_is_required(field):
     payload = saved_payload(PreparedConfig({}, {}))
     del payload["configuration"][field]
     with pytest.raises(ConfigError, match="expected fields"):
-        read_configuration(payload, model="flux2", source="saved")
+        read_configuration(payload, schema=config_registry().model("flux2"), source="saved")
 
 
 @pytest.mark.parametrize("path", [[], [True], ["generate", "seed", -1], ["generate", "missing"]])
@@ -112,7 +118,7 @@ def test_saved_presence_cannot_name_invalid_or_absent_values(path):
     payload = saved_payload(sources("generate.seed=0").prepare().state())
     payload["configuration"]["explicit"] = [path]
     with pytest.raises(ConfigError, match="invalid field path|absent from values"):
-        read_configuration(payload, model="flux2", source="saved")
+        read_configuration(payload, schema=config_registry().model("flux2"), source="saved")
 
 
 def test_saved_unknown_fields_fail_before_current_source_file_io(tmp_path):
@@ -130,7 +136,7 @@ def test_saved_collection_markers_do_not_survive_whole_collection_replacement():
     )
     assert result.replacements == frozenset({("generate", "adapters")})
     snapshot = copy.deepcopy(saved_payload(result))
-    restored = read_configuration(snapshot, model="flux2", source="saved")
+    restored = read_configuration(snapshot, schema=config_registry().model("flux2"), source="saved")
     assert restored.replacements == result.replacements
 
 
@@ -158,7 +164,7 @@ def test_public_restart_readers_require_current_configuration_before_artifact_io
     reader = module.RestartManifest.load if model == "flux2" else module.load_restart_manifest
     selector = module.Flux2RestartConfig if model == "flux2" else module.RestartConfig
     with pytest.raises(ValueError, match="unsupported run schema|configuration: expected"):
-        reader(selector(source))
+        reader(selector(source), schema=config_registry().model(model))
 
 
 @pytest.mark.parametrize("field", ["format", "model"])
@@ -166,13 +172,13 @@ def test_saved_configuration_rejects_an_unsupported_identity(field):
     payload = saved_payload(PreparedConfig({}, {}))
     payload["configuration"][field] = "unsupported"
     with pytest.raises(ConfigError, match="unsupported format or model"):
-        read_configuration(payload, model="flux2", source="saved")
+        read_configuration(payload, schema=config_registry().model("flux2"), source="saved")
 
 
 def test_saved_presence_cannot_address_a_primitive_sequence_element():
     payload = saved_payload(sources("generate.seeds=[0,1]").prepare().state())
     payload["configuration"]["explicit"] = [["generate", "seeds", 0]]
-    decoded = read_configuration(payload, model="flux2", source="saved")
+    decoded = read_configuration(payload, schema=config_registry().model("flux2"), source="saved")
     with pytest.raises(ConfigError, match="presence does not match its declared fields"):
         sources().prepare(decoded)
 
@@ -197,7 +203,9 @@ def test_api_settings_base_is_saved_with_its_env_mask_and_actual_presence(monkey
     assert ("settings", "verbose") in original.explicit
     assert ("settings", "quiet") not in original.explicit
     assert original.origins[("settings", "verbose")].location.kind == "api"
-    restored = read_configuration(saved_payload(original), model="flux2", source="saved")
+    restored = read_configuration(
+        saved_payload(original), schema=config_registry().model("flux2"), source="saved"
+    )
     replay = sources().prepare(restored).state()
     assert replay.values["settings"]["quiet"] is False
     assert replay.values["settings"]["verbose"] is False
@@ -259,12 +267,12 @@ def test_cli_overrides_api_settings_through_the_same_source_precedence():
 )
 def test_saved_boundaries_reject_unresolved_source_inputs(model, values):
     with pytest.raises(ConfigError, match="source-only input must be resolved"):
-        configuration_payload(model, PreparedConfig(values, {}))
-    configuration = configuration_payload(model, PreparedConfig({}, {}))
+        configuration_payload(config_registry().model(model), PreparedConfig(values, {}))
+    configuration = configuration_payload(config_registry().model(model), PreparedConfig({}, {}))
     configuration["values"] = values
     payload = {"schema_version": RUN_SCHEMA_VERSION, "configuration": configuration}
     with pytest.raises(ConfigError, match="source-only input must be resolved"):
-        read_configuration(payload, model=model, source="saved")
+        read_configuration(payload, schema=config_registry().model(model), source="saved")
 
 
 @pytest.mark.parametrize(
@@ -277,15 +285,15 @@ def test_saved_boundaries_reject_unresolved_source_inputs(model, values):
 )
 def test_saved_boundaries_validate_registered_shape(values, error):
     with pytest.raises(ConfigError, match=error):
-        configuration_payload("flux2", PreparedConfig(values, {}))
+        configuration_payload(config_registry().model("flux2"), PreparedConfig(values, {}))
     payload = saved_payload(PreparedConfig({}, {}))
     payload["configuration"]["values"] = values
     with pytest.raises(ConfigError, match=error):
-        read_configuration(payload, model="flux2", source="saved")
+        read_configuration(payload, schema=config_registry().model("flux2"), source="saved")
 
 
 def test_every_model_field_declares_persistence():
-    from kinomlx.model_registry import model_choices
+    from kinomlx.model_catalog import model_choices
 
     for model in model_choices():
         for _, declaration in config_registry().model(model).field_items():

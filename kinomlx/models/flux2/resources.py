@@ -1,11 +1,13 @@
 """Immutable, header-validated Klein resources with explicit source accounting."""
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from functools import cached_property
 from pathlib import Path
 
 from kinomlx._json import JsonObject
 from kinomlx.huggingface import resolve_cached_snapshot
+from kinomlx.image_restart_config import IMAGE_STAGES, ImageStage
 from kinomlx.io.identity import payload_digest
 from kinomlx.io.safetensors import inspect_safetensors
 from kinomlx.memory_policy import MLXMemoryPolicy
@@ -15,6 +17,7 @@ from kinomlx.modeling.artifacts import (
     inspect_tokenizer_source,
     inspect_weight_source,
 )
+from kinomlx.modeling.dtypes import DTypePolicy, FloatDType
 from kinomlx.settings import Settings
 from kinomlx.tokenizers.byte_bpe import QWEN_TOKENIZER_TABLE_POLICY, ByteBPETables
 from kinomlx.tokenizers.loading import load_tokenizer_tables
@@ -26,6 +29,21 @@ from .settings import Flux2Settings
 from .shapes import text_shapes, transformer_shapes, vae_shapes
 
 KINDS = ("tokenizer", "text_encoder", "transformer", "vae")
+# The prepared components each stage needs. A restart reopens those of the
+# stages it runs; a normal run reopens every kind.
+STAGE_COMPONENTS: Mapping[str, tuple[str, ...]] = frozendict(
+    {
+        ImageStage.TEXT: ("tokenizer", "text_encoder"),
+        ImageStage.DENOISE: ("transformer",),
+        ImageStage.DECODE: ("vae",),
+    }
+)
+
+
+def restart_components(stage: str) -> frozenset[str]:
+    """The prepared component kinds a restart at ``stage`` reopens."""
+    running = IMAGE_STAGES[IMAGE_STAGES.index(stage) :]
+    return frozenset(*STAGE_COMPONENTS[stage] for stage in running)
 
 
 @dataclass(frozen=True)
@@ -45,7 +63,7 @@ class Flux2Component:
     graph_identity: str
     identity: str
     bindings: tuple[Flux2Binding, ...] = ()
-    dtype_policy: str = "bfloat16"
+    dtype_policy: DTypePolicy = FloatDType.BFLOAT16
 
     @cached_property
     def tokenizer_tables(self) -> ByteBPETables:
@@ -139,7 +157,7 @@ def _validate_weights(kind: str, source: WeightSource) -> tuple[Flux2Binding, ..
     return tuple(bindings)
 
 
-def weight_component(kind: str, source: WeightSource, *, dtype: str) -> Flux2Component:
+def weight_component(kind: str, source: WeightSource, *, dtype: FloatDType) -> Flux2Component:
     """Validate source provenance and preparation policy independently of persistence."""
     graph = validate_config(kind, source.config_path)
     bindings = _validate_weights(kind, source)
@@ -155,7 +173,16 @@ def weight_component(kind: str, source: WeightSource, *, dtype: str) -> Flux2Com
     return Flux2Component(kind, source, graph, identity, bindings, dtype)
 
 
-def inspect_resources(settings: Flux2Settings, *, infrastructure: Settings) -> Flux2Resources:
+def _component_dtype(kind: str, settings: Flux2Settings) -> FloatDType:
+    """Select the dtype one component binds at; only two are user-selectable."""
+    if kind == "transformer":
+        return settings.transformer_dtype
+    if kind == "vae":
+        return settings.vae_dtype
+    return FloatDType.BFLOAT16
+
+
+def prepare_resources(settings: Flux2Settings, *, infrastructure: Settings) -> Flux2Resources:
     """Validate the source components without loading tensor payloads."""
     settings.validate()
     infrastructure.validate()
@@ -189,7 +216,7 @@ def inspect_resources(settings: Flux2Settings, *, infrastructure: Settings) -> F
         validate_config("scheduler", root / "scheduler/scheduler_config.json")
     components = []
     for kind in KINDS:
-        dtype = settings.transformer_dtype if kind == "transformer" else "bfloat16"
+        dtype = _component_dtype(kind, settings)
         if kind not in sources:
             assert root is not None
             sources[kind] = inspect_component_source(kind, root / kind)

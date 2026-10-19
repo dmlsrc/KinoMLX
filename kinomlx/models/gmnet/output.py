@@ -13,7 +13,7 @@ from kinomlx.debug.metadata import selected_execution_sidecar_paths
 from kinomlx.errors import KinoMLXError
 from kinomlx.io.output_paths import OutputCollisionError, timestamped_output_base
 from kinomlx.io.reservation import PathReservation, PathReservationError
-from kinomlx.media.signals import ColorPrimaries, ColorTransfer, ExrDeliverySpec, ExrSampleType
+from kinomlx.media.signals import ColorPrimaries, ColorTransfer, ExrDeliverySpec, SampleDType
 from kinomlx.reporting import NullReporter, Reporter
 from kinomlx.videotoolbox.exr import save_exr_frame
 from kinomlx.videotoolbox.heic import save_pq_heic_frame
@@ -211,7 +211,7 @@ def _default_exr_writer(result: ExpansionResult, path: Path) -> object:
     delivery = ExrDeliverySpec(
         primaries=ColorPrimaries.REC709,
         transfer=ColorTransfer.LINEAR,
-        sample_type=ExrSampleType.FLOAT16,
+        sample_type=SampleDType.FLOAT16,
         color_space_tag="Linear sRGB",
     )
     return save_exr_frame(result.linear_rgb, path, delivery=delivery)

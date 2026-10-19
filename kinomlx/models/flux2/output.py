@@ -10,6 +10,7 @@ import mlx.core as mx
 
 from kinomlx.config_rules import validate_record
 from kinomlx.debug.metadata import selected_execution_sidecar_paths
+from kinomlx.image_restart_config import ImageStage
 from kinomlx.io.fingerprints import file_sha256
 from kinomlx.io.image import save_image
 from kinomlx.io.output_bundle import (
@@ -27,7 +28,7 @@ from kinomlx.restart_selection import fingerprint_key
 from .generation import Flux2ImageResult
 from .output_policies import OUTPUT_POLICIES
 from .sampling import SamplingRecipe
-from .stations import save_conditioning
+from .text_conditioning import save_conditioning
 
 
 @dataclass(frozen=True)
@@ -47,7 +48,7 @@ class Flux2OutputPlan:
         return len(dict(self.artifacts)["images"])
 
     def targets(self) -> tuple[Path, ...]:
-        return tuple(path for _, paths in self.artifacts for path in paths) + tuple(
+        return tuple(*paths for _, paths in self.artifacts) + tuple(
             path for _, path in self.execution_sidecars
         )
 
@@ -111,7 +112,7 @@ def plan_output(
         if OUTPUT_POLICIES[f"save_{name}"].selected(
             selected,
             save_all=config.save_all_sidecars,
-            station="decode" if decode else "generate",
+            stage=ImageStage.DECODE if decode else ImageStage.TEXT,
             field=f"save_{name}",
         ):
             artifacts.append(
@@ -202,14 +203,14 @@ class Flux2OutputSink:
                             save_image(peer, result.pixels)
                         elif name == "text_conditioning":
                             if result.conditioning is None:
-                                raise ValueError("Result has no complete conditioning station")
+                                raise ValueError("Result has no complete conditioning stage")
                             save_conditioning(peer, result.conditioning, recipe)
                         else:
                             value = (
                                 result.latents if name == "final_latents" else result.initial_noise
                             )
                             if value is None or not bool(mx.all(mx.isfinite(value)).item()):
-                                raise ValueError(f"Result has no finite {name} station")
+                                raise ValueError(f"Result has no finite {name} stage")
                             tensors = {name: value}
                             if name == "initial_noise":
                                 if result.sigmas is None:

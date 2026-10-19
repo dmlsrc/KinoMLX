@@ -9,7 +9,7 @@ from kinomlx.config import ConfigError
 from kinomlx.config_rules import validate_record
 from kinomlx.models.flux2.types import Flux2Request
 from kinomlx.models.krea2.types import Krea2Request
-from kinomlx.models.ltx2.types import DistilledRequest
+from kinomlx.models.ltx2.types import LTX2Request
 
 
 @pytest.fixture(params=["ltx2", "krea2", "flux2"])
@@ -61,7 +61,7 @@ def test_prompt_conflicts_respect_effective_precedence(model_cli, tmp_path):
         assemble("--config", str(config), "--prompt-unconditional")
 
 
-@pytest.mark.parametrize("factory", [Flux2Request, Krea2Request, DistilledRequest])
+@pytest.mark.parametrize("factory", [Flux2Request, Krea2Request, LTX2Request])
 def test_public_requests_preserve_intent_through_replace(factory):
     request = factory(prompt_unconditional=True)
     assert replace(request, seed=123).prompt_unconditional

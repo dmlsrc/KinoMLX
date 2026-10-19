@@ -11,7 +11,7 @@ import math
 import mlx.core as mx
 
 from .basis import basis_delta
-from .formats import AdapterOperation
+from .formats import AdapterKind, AdapterOperation
 from .fourier import fourier_delta
 from .glora import peft_glora_delta
 from .lora import LoRAEntry, compute_delta
@@ -49,9 +49,9 @@ def plain_lora_entry(operation: AdapterOperation) -> LoRAEntry | None:
     fast path and the live activation path so both recognize the same subset.
     """
     factors = operation.factors
-    if operation.kind == "adalora":
+    if operation.kind == AdapterKind.ADALORA:
         return adalora_entry(operation)
-    if operation.kind != "lora" or operation.part != "weight":
+    if operation.kind != AdapterKind.LORA or operation.part != "weight":
         return None
     if "magnitude" in factors or "mid" in factors:
         return None
@@ -71,7 +71,7 @@ def loha_pairs(
     with full reconstruction.
     """
     factors = operation.factors
-    if operation.kind != "loha" or operation.part != "weight" or len(shape) != 2:
+    if operation.kind != AdapterKind.LOHA or operation.part != "weight" or len(shape) != 2:
         return None
     if "magnitude" in factors or any(f"hada_t{index}" in factors for index in (1, 2)):
         return None
@@ -132,7 +132,7 @@ def intrinsic_scale(operation: AdapterOperation, rank: int | None) -> float:
     zero_alpha_means_unit = (
         operation.alpha == 0.0
         and denominator is not None
-        and operation.kind in ("lora", "loha", "lokr")
+        and operation.kind in (AdapterKind.LORA, AdapterKind.LOHA, AdapterKind.LOKR)
     )
     intrinsic = (
         1.0
@@ -283,7 +283,7 @@ def _glora(operation: AdapterOperation, base: mx.array) -> tuple[mx.array, int]:
 def _orthogonal(operation: AdapterOperation, base: mx.array) -> mx.array:
     _matrix_target(base, operation.kind.upper())
     blocks = operation.factors["oft_blocks"].astype(mx.float32)
-    ndim = 4 if operation.kind == "boft" else 3
+    ndim = 4 if operation.kind == AdapterKind.BOFT else 3
     if blocks.ndim != ndim or blocks.shape[-1] != blocks.shape[-2]:
         raise ValueError(f"{operation.kind} needs square rotation blocks with {ndim} axes")
     block_size = blocks.shape[-1]
@@ -300,7 +300,7 @@ def _orthogonal(operation: AdapterOperation, base: mx.array) -> mx.array:
     # MLX 0.32 has no GPU inverse. Only these small rotation blocks use CPU;
     # dense reconstruction and the model remain on the GPU.
     rotation = (identity + skew) @ mx.linalg.inv(identity - skew, stream=mx.cpu)
-    if operation.kind == "oft":
+    if operation.kind == AdapterKind.OFT:
         adapted = (
             mx.swapaxes(rotation, -1, -2) @ base.reshape(block_count, block_size, -1)
         ).reshape(base.shape)
@@ -355,43 +355,50 @@ def reconstruct_delta(
     factors = operation.factors
     kind = operation.kind
     if operation.linear_options is not None:
-        if kind in ("vera", "pvera", "randlora", "vblora", "unilora", "tinylora"):
+        if kind in (
+            AdapterKind.VERA,
+            AdapterKind.PVERA,
+            AdapterKind.RANDLORA,
+            AdapterKind.VBLORA,
+            AdapterKind.UNILORA,
+            AdapterKind.TINYLORA,
+        ):
             return basis_delta(operation, base) * operation.scalar
-        if kind == "waveft":
+        if kind == AdapterKind.WAVEFT:
             return wavelet_delta(operation, base) * operation.scalar
         return peft_linear_delta(operation, base) * operation.scalar
-    if kind == "fourierft":
+    if kind == AdapterKind.FOURIERFT:
         return fourier_delta(operation, base)
-    if kind == "glora_peft":
+    if kind == AdapterKind.GLORA_PEFT:
         return peft_glora_delta(operation, base, base_weight)
-    if kind in ("oft_peft", "boft_peft", "hra"):
+    if kind in (AdapterKind.OFT_PEFT, AdapterKind.BOFT_PEFT, AdapterKind.HRA):
         return peft_orthogonal_delta(operation, base)
     if operation.part == "bias":
-        if kind == "ia3_peft":
+        if kind == AdapterKind.IA3_PEFT:
             vector = factors["ia3_vector"].astype(mx.float32).reshape(-1)
             _same_shape(vector.shape, base.shape, "PEFT IA3 bias")
             trained_bias = factors.get("base_bias", base).astype(mx.float32)
             _same_shape(trained_bias.shape, base.shape, "PEFT IA3 trained bias")
             return (trained_bias * vector - base) * operation.scalar
-        if kind == "lora":
+        if kind == AdapterKind.LORA:
             delta = factors["up_bias"].astype(mx.float32)
             scale = intrinsic_scale(operation, factors["down"].shape[0])
         else:
             delta, scale = factors["delta"].astype(mx.float32), operation.scalar
         _same_shape(delta.shape, base.shape, "adapter bias")
-        if kind == "set":
+        if kind == AdapterKind.SET:
             delta = delta - base
-        if kind == "lora" and "base_bias" in factors:
+        if kind == AdapterKind.LORA and "base_bias" in factors:
             replacement = factors["base_bias"].astype(mx.float32)
             _same_shape(replacement.shape, base.shape, "saved base bias")
             return replacement - base + delta * scale
         return delta * scale
-    if kind in ("full", "norm", "set"):
+    if kind in (AdapterKind.FULL, AdapterKind.NORM, AdapterKind.SET):
         role = {"full": "diff", "norm": "w_norm", "set": "set_weight"}[kind]
         value = factors[role].astype(mx.float32)
         _same_shape(value.shape, base.shape, kind)
-        return (value - base if kind == "set" else value) * operation.scalar
-    if kind == "ia3":
+        return (value - base if kind == AdapterKind.SET else value) * operation.scalar
+    if kind == AdapterKind.IA3:
         _matrix_target(base, "IA3")
         on_input = bool(factors["on_input"].item())
         vector = factors["weight"].astype(mx.float32)
@@ -399,7 +406,7 @@ def reconstruct_delta(
         if vector.size != expected:
             raise ValueError("IA3 vector does not match its selected input/output axis")
         return base * vector.reshape((1, -1) if on_input else (-1, 1)) * operation.scalar
-    if kind == "ia3_peft":
+    if kind == AdapterKind.IA3_PEFT:
         _matrix_target(base, "PEFT IA3")
         on_input = ia3_input_scale(operation)
         vector = factors["ia3_vector"].astype(mx.float32)
@@ -407,24 +414,24 @@ def reconstruct_delta(
             vector.shape, (1, base.shape[1]) if on_input else (base.shape[0], 1), "PEFT IA3"
         )
         return base * (vector - 1.0) * operation.scalar
-    if kind == "adalora":
+    if kind == AdapterKind.ADALORA:
         entry = adalora_entry(operation)
         expected_shape = (factors["up"].shape[0], factors["down"].shape[1])
         _same_shape(expected_shape, base.shape, "AdaLoRA")
         return mx.zeros_like(base) if entry is None else compute_delta(entry) * operation.scalar
-    if kind in ("oft", "boft"):
+    if kind in (AdapterKind.OFT, AdapterKind.BOFT):
         return _orthogonal(operation, base)
     rank: int | None
-    if kind == "lora":
+    if kind == AdapterKind.LORA:
         delta = _low_rank(
             factors["up"], factors["down"], factors.get("mid"), base.shape, "LoRA/LoCon"
         )
         rank = factors["down"].shape[0]
-    elif kind == "loha":
+    elif kind == AdapterKind.LOHA:
         delta, rank = _loha(operation, base)
-    elif kind == "lokr":
+    elif kind == AdapterKind.LOKR:
         delta, rank = _lokr(operation, base)
-    elif kind == "glora":
+    elif kind == AdapterKind.GLORA:
         delta, rank = _glora(operation, base)
     else:
         raise ValueError(f"unsupported static adapter family: {kind}")

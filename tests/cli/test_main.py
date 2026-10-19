@@ -34,7 +34,7 @@ from kinomlx.models.ltx2.artifacts import (
     distilled_stage_latents_artifact,
     text_conditioning_artifact,
 )
-from kinomlx.models.ltx2.generation import GenerationOutput
+from kinomlx.models.ltx2.generation import LTX2GenerationOutput
 from kinomlx.models.ltx2.run_logging import _stage_strength_details
 from kinomlx.models.ltx2.runner import LTX2Error
 from kinomlx.models.ltx2.signals import ltx23_sdr_signal
@@ -55,8 +55,8 @@ def _generation_output(
     audio_waveform=None,
     audio_sample_rate: int | None = None,
     metadata: dict[str, object] | None = None,
-) -> GenerationOutput:
-    return GenerationOutput(
+) -> LTX2GenerationOutput:
+    return LTX2GenerationOutput(
         frames=_frame_stream(),
         audio_waveform=audio_waveform,
         audio_sample_rate=audio_sample_rate,
@@ -804,7 +804,7 @@ def test_success_dispatch_reaches_generation_output_adapter(
     class _Runner:
         def run(self, _recipe, config):
             generated_configs.append(config)
-            return GenerationOutput(
+            return LTX2GenerationOutput(
                 frames=frames,
                 audio_waveform=waveform,
                 audio_sample_rate=48_000,
@@ -1055,51 +1055,6 @@ def test_run_record_lists_the_separate_vae_frame_dump(
     assert payload["planned_outputs"]["vae_frames"] == str(frame_directory)
 
 
-def test_steel_probe_trace_summary_is_written_to_run_record(
-    monkeypatch,
-    tmp_path: Path,
-) -> None:
-    import kinomlx.models.ltx2.command as main_module
-
-    output = tmp_path / "final.mp4"
-    summary = {
-        "enabled": True,
-        "scope": "process_compiled_traces",
-        "counter_unit": "compiled_trace",
-        "hit_d128": 4,
-    }
-
-    class _Runner:
-        def run(self, _recipe, _config):
-            return _generation_output()
-
-    def fake_write_generation(*_args, **_kwargs):
-        output.touch()
-        return output
-
-    monkeypatch.setenv("KINO_LTX2_STEEL_ATTENTION_PROBE", "1")
-    monkeypatch.setattr(main_module, "create_runner", lambda *_args, **_kwargs: _Runner())
-    monkeypatch.setattr(main_module, "write_generation", fake_write_generation)
-    monkeypatch.setattr("kinomlx.models.ltx2.command.steel_attention_summary", lambda: summary)
-
-    assert (
-        main(
-            [
-                "--quiet",
-                "--prompt",
-                "test",
-                "--output",
-                str(output),
-                "--save-run-log",
-            ]
-        )
-        == 0
-    )
-    payload = json.loads((tmp_path / "final_run.json").read_text(encoding="utf-8"))
-    assert payload["diagnostics"]["steel_attention"] == summary
-    assert payload["diagnostics"]["memory"]["counter_source"] == "mlx_allocator"
-
-
 def test_run_record_captures_stage_memory_and_lazy_generation_diagnostics(
     monkeypatch,
     tmp_path: Path,
@@ -1127,7 +1082,7 @@ def test_run_record_captures_stage_memory_and_lazy_generation_diagnostics(
 
     class _Runner:
         def run(self, _recipe, _config):
-            return GenerationOutput(
+            return LTX2GenerationOutput(
                 frames=_frame_stream(),
                 diagnostics_provider=lambda: expected_vae,
             )
@@ -1928,7 +1883,7 @@ def test_cancellation_without_completed_outputs_stays_minimal(monkeypatch, capsy
         (
             ["--model", "ltx2", "--prompt", "x", "--prompt-unconditional", "--print-config"],
             "[generate]: prompt_unconditional cannot be combined with prompt or prompt_file",
-            ("DistilledRequest", "unconditional_prompt"),
+            ("LTX2Request", "unconditional_prompt"),
         ),
         (
             [
@@ -1939,12 +1894,12 @@ def test_cancellation_without_completed_outputs_stays_minimal(monkeypatch, capsy
                 "--set",
                 "restart.run=absent.json",
                 "--set",
-                "restart.phase=denoise",
+                "restart.stage=denoise",
                 "--set",
                 "restart.latents=latents.safetensors",
                 "--print-config",
             ],
-            "[restart]: restart latents apply only when phase=decode",
+            "[restart]: restart latents apply only when stage=decode",
             ("RestartConfig", "restart_selection"),
         ),
     ],

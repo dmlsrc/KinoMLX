@@ -7,6 +7,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import cast
 
+from kinomlx.cli.resource_operation import Operation, refuse_resource_only_work
 from kinomlx.cli.seed_config import seed_config
 from kinomlx.config import (
     ConfigError,
@@ -43,8 +44,9 @@ from kinomlx.settings import Settings
 from .artifacts import LTX2ArtifactConfig, requested_artifacts, sidecar_paths
 from .output_config import OutputConfig, sidecar_selection
 from .restart import RestartConfig, RestartManifest, load_restart_manifest
+from .restart_rules import LTX2Stage
 from .settings import LTX2Settings
-from .types import DistilledRequest
+from .types import LTX2Request
 
 
 @dataclass(frozen=True)
@@ -52,10 +54,11 @@ class Invocation:
     """One fully typed CLI or TOML invocation."""
 
     model: str
-    request: DistilledRequest
+    request: LTX2Request
     output: OutputConfig
     settings: Settings
     model_settings: LTX2Settings
+    operation: Operation
     model_artifacts: LTX2ArtifactConfig
     resolved_config: dict[str, object]
     config_intent: PreparedConfig
@@ -70,28 +73,30 @@ class Invocation:
 
 
 @dataclass(frozen=True)
-class _StationRecords:
+class _StageRecords:
     """One side of a restart comparison, built by the single shared record path."""
 
     settings: Settings
     model_settings: LTX2Settings
     model_artifacts: LTX2ArtifactConfig
-    request: DistilledRequest
+    operation: Operation
+    request: LTX2Request
     output: OutputConfig
 
-    def station_mapping(self, restart: RestartConfig) -> dict[str, object]:
-        """Return the six root records one station admission compares."""
+    def stage_mapping(self, restart: RestartConfig) -> dict[str, object]:
+        """Return the seven root records one stage admission compares."""
         return {
             "settings": self.settings,
             "model_settings": self.model_settings,
             "generate": self.request,
             "output": self.output,
             "model_artifacts": self.model_artifacts,
+            "operation": self.operation,
             "restart": restart,
         }
 
 
-def _station_records(
+def _stage_records(
     values: Mapping[str, object],
     *,
     base_settings: Settings,
@@ -99,7 +104,7 @@ def _station_records(
     table_prefix: str = "",
     validate_invocation: bool,
     model_settings_overrides: Mapping[str, object] | None = None,
-) -> _StationRecords:
+) -> _StageRecords:
     """Build every root record from one normalized mapping, for either restart side.
 
     Both sides of a restart comparison run through this one path so a field
@@ -135,8 +140,13 @@ def _station_records(
         values.get("model_artifacts", {}),
         table=f"[{table_prefix}model_artifacts]",
     )
+    operation = dataclass_from_mapping(
+        Operation,
+        values.get("operation", {}),
+        table=f"[{table_prefix}operation]",
+    )
     request = dataclass_from_mapping(
-        DistilledRequest,
+        LTX2Request,
         values.get("generate", {}),
         table=f"[{table_prefix}generate]",
     )
@@ -147,7 +157,7 @@ def _station_records(
         values.get("output", {}),
         table=f"[{table_prefix}output]",
     )
-    return _StationRecords(settings, model_settings, model_artifacts, request, output)
+    return _StageRecords(settings, model_settings, model_artifacts, operation, request, output)
 
 
 def _validate_restart_changes(
@@ -160,13 +170,13 @@ def _validate_restart_changes(
     schema = config_registry().model("ltx2")
     refuse_restart_changes(
         schema,
-        schema.station_changes(
+        schema.stage_changes(
             current,
             parent,
-            station=restart.config.phase,
+            stage=restart.config.stage,
             active_explicit=active_explicit,
         ),
-        station=restart.config.phase,
+        stage=restart.config.stage,
     )
 
 
@@ -187,11 +197,11 @@ def assemble(
     restart_base = PreparedConfig({}, {})
     if restart_config is not None:
         with restart_source(restart_config.run):
-            restart = load_restart_manifest(restart_config)
+            restart = load_restart_manifest(restart_config, schema=schema)
             restart_base = schema.normalize_prepared_layer(restart.base_config())
     inputs = sources.prepare(
         rebase_configuration(restart_base, restart_base.values),
-        station="generate" if restart is None else restart.config.phase,
+        stage=LTX2Stage.TEXT if restart is None else restart.config.stage,
     )
     intent = inputs.state()
     merged = schema.normalize_config(intent.values)
@@ -260,7 +270,7 @@ def assemble(
             base_model_settings,
             **{path[1]: value for path, value in source_resets.items()},
         )
-    current = _station_records(
+    current = _stage_records(
         merged,
         base_settings=base_settings,
         base_model_settings=base_model_settings,
@@ -270,13 +280,24 @@ def assemble(
     settings = current.settings
     model_settings = current.model_settings
     model_artifacts = current.model_artifacts
+    operation = current.operation
     request = current.request
     output = current.output
+    refuse_resource_only_work(
+        dry_run=operation.dry_run,
+        requested=bool(
+            request.prompt
+            or request.prompt_unconditional
+            or restart is not None
+            or request.text_conditioning is not None
+        ),
+        work="generation or restart",
+    )
     if restart is not None:
         # The parent run did not itself have to be a restart. Its four restart
         # selectors describe this invocation, not completed parent work, so both
         # sides carry the same selection record.
-        parent = _station_records(
+        parent = _stage_records(
             schema.normalize_config(restart_base.values),
             base_settings=base_settings,
             base_model_settings=base_model_settings,
@@ -285,8 +306,8 @@ def assemble(
         )
         _validate_restart_changes(
             restart,
-            current.station_mapping(restart.config),
-            parent.station_mapping(restart.config),
+            current.stage_mapping(restart.config),
+            parent.stage_mapping(restart.config),
             active_explicit=inputs.active_explicit_paths(),
         )
 
@@ -296,6 +317,7 @@ def assemble(
         "output": dataclass_to_mapping(output),
         "settings": dataclass_to_mapping(settings),
         "model_settings": dataclass_to_mapping(model_settings),
+        "operation": dataclass_to_mapping(operation),
         "model_artifacts": dataclass_to_mapping(model_artifacts),
     }
     if restart is not None:
@@ -306,6 +328,7 @@ def assemble(
         output=output,
         settings=settings,
         model_settings=model_settings,
+        operation=operation,
         model_artifacts=model_artifacts,
         resolved_config=resolved,
         config_intent=intent,
@@ -327,18 +350,18 @@ def validate_for_execution(invocation: Invocation) -> None:
         requested_artifacts(
             invocation.model_artifacts,
             save_all=output.save_all_sidecars,
-            has_media_conditioning=invocation.request.image is not None
+            has_media_conditioning=bool(invocation.request.images)
             or invocation.request.hdr_reference is not None,
-            station="generate" if restart is None else restart.config.phase,
-            source_latent_stage="final" if restart is None else restart.selected_latent_stage,
+            stage=LTX2Stage.TEXT if restart is None else restart.config.stage,
+            source_latent_stage=None if restart is None else restart.selected_latent_stage,
         )
     except ValueError as exc:
         raise ConfigError(f"[model_artifacts].{exc}") from exc
-    if restart is not None and restart.config.phase == "decode":
+    if restart is not None and restart.config.stage == "decode":
         return
     if (
         restart is not None
-        and restart.config.phase == "stage-2"
+        and restart.config.stage == LTX2Stage.STAGE_2
         and invocation.request.text_conditioning is None
     ):
         raise ConfigError(
@@ -350,7 +373,7 @@ def validate_for_execution(invocation: Invocation) -> None:
         raise ConfigError(f"[generate]: {exc}") from exc
 
 
-def effective_generate_config(request: DistilledRequest) -> dict[str, object]:
+def effective_generate_config(request: LTX2Request) -> dict[str, object]:
     """Project one request into the resolved ``generate`` table the run sidecars record.
 
     Nested records keep their input presence, so an adapter control the user
@@ -369,7 +392,7 @@ def effective_generate_config(request: DistilledRequest) -> dict[str, object]:
         )["generate"],
     )
     if request.duration is not None:
-        # DistilledRequest resolves duration to the exact valid frame count.
+        # LTX2Request resolves duration to the exact valid frame count.
         generate.pop("duration", None)
     if request.frames is None and request.duration is None:
         generate["auto_duration"] = True

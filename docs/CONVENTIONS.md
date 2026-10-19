@@ -19,26 +19,86 @@ the [user guides](../README.md#documentation) explain how to run it.
 
 ## Documentation
 
-The README and model, adapter, weight, and performance guides are for users.
-Explain technical details through their effects on performance, support,
-reliability, correctness, usability, or reproducibility. Preserve precise public
-API contracts, including shapes, valid configuration, and lifetime requirements.
-Do not turn those guides into implementation status reports or instructions for
-extending private APIs.
+The README and the user guides, every page under `docs/` except this one and STRUCTURE, are for
+people using KinoMLX through the CLI, config files, or Python, not for people maintaining it. Before
+writing a sentence, ask why a user would care; leave out what they cannot act on. Contributor rules
+belong here, and the package map and implementation notes in STRUCTURE. Design history, measurement
+receipts, and kernel internals stay out of both the guides and this document.
 
-Put contributor rules here. STRUCTURE may contain implementation notes, package
-responsibilities, and a code map. Keep design history and measurement receipts
-separate from the current rules; this document describes the conventions to follow.
+### Layout
 
-Give shared behavior one main explanation and link to it from the model guides.
-Keep model-specific limits and runnable examples next to their workflows. Do not
-copy a diagnostic script into several guides. Update affected docs when behavior
-changes; do not preserve an obsolete default as a competing recommendation.
+- `README.md` is the landing page: what KinoMLX is, requirements, install, a quick start, and a
+  map of the guides.
+- Each model has a folder, `docs/<model>/`. Its `README.md` is the overview: what the model makes,
+  its variants, a quick start, a table of the folder's pages, limits, and licenses.
+- Each other page in a model folder covers one task: model files (`downloads.md`, or
+  `weights.md` for GMNet's converted checkpoints), generating, editing or image conditioning,
+  adapters, restart, the Python API (`api.md`), and the argument catalog (`arguments.md`). A model
+  with speed and memory choices has a performance page of its own, separate from usage.
+- Behavior every model shares has one page at the top of `docs/`: USAGE, CONFIG, ADAPTERS,
+  SCHEDULES, WEIGHTS, and PERFORMANCE. Model pages link to it instead of repeating it, and keep
+  their own limits and runnable examples next to their workflows.
 
-Use US English and plain ASCII in source, comments, docstrings, docs, and commit
-messages. Use Unicode only when required by actual data or an upstream identifier.
-Public functions and classes need a concise summary docstring, followed by details
-when callers need them. Each module's docstring states what that module owns.
+### Argument catalogs
+
+`docs/<model>/arguments.md` lists every argument the model's parser accepts, grouped by task. The
+config utilities and infrastructure settings are listed once, in `docs/CONFIG.md`; every other
+argument, `--dry-run` included, is listed in each model catalog that accepts it. The converters'
+arguments are in `docs/WEIGHTS.md` and `docs/gmnet/weights.md`.
+
+Catalogs use HTML tables, so an enumerated argument can give each value its own row:
+
+```html
+<table>
+<thead><tr><th>Argument</th><th>Default</th><th>Value</th><th>What it does</th></tr></thead>
+<tbody>
+<tr><td rowspan="2" valign="top"><code>--noise-backend</code></td><td rowspan="2" valign="top"><code>mlx</code></td><td><code>mlx</code></td><td>KinoMLX's own noise; the normal choice.</td></tr>
+<tr><td><code>torch-mps</code></td><td>Reproduce PyTorch MPS noise, to compare against tools that use it.</td></tr>
+</tbody>
+</table>
+```
+
+- List aliases in the argument cell, comma-separated, and boolean pairs as `--x`, `--no-x` with
+  the value `<em>flag</em>`.
+- Take each default from the configuration registry (`kinomlx config inspect`), or from the
+  parser for command utilities and converters; never guess it. Write a prose default, such as
+  *none* or *off; follows save-all*, in `<em>`.
+- Say what the user gets or decides, not how the code does it.
+- Keep TOML and environment names out of the tables. Each catalog ends with a short table of
+  the names that differ from their flags, and points to `kinomlx config init`, which writes them
+  all.
+
+### Writing
+
+- Give each paragraph one topic and a few sentences. When a paragraph starts on a second topic,
+  split it.
+- Lead with what the user gets, chooses, or risks, then the detail that supports it.
+- Use tables for choices and examples for workflows.
+- Keep measured numbers a user plans with, such as run time, memory peak, or a quality
+  difference, with the hardware they came from. Put them in a table, here and in the CHANGELOG,
+  never inside a sentence; the sentence before the table names the hardware and setup. Leave
+  kernel microbenchmarks out.
+- Keep public API contracts precise: shapes, dtypes, lifetime requirements, and valid
+  configuration.
+- Do not write implementation status reports, internal mechanisms, instructions for extending
+  private APIs, or migration notes about removed spellings; the CHANGELOG owns migrations.
+- Update every affected page when behavior changes, and do not keep an obsolete default as a
+  competing recommendation. Do not copy a diagnostic script into several guides.
+
+Use US English and plain ASCII in source, comments, docstrings, docs, and commit messages. Use
+Unicode only when required by actual data or an upstream identifier. Public functions and classes
+need a concise summary docstring, followed by details when callers need them. Each module's
+docstring states what that module owns.
+
+Documentation changes run `rumdl check .` and the documentation tests:
+
+- `tests/test_documentation_links.py` resolves every relative link and anchor, including those
+  inside HTML tables, which Markdown lint does not read.
+- `tests/cli/test_readme_surface.py` checks that every flag and environment variable written in
+  code, in Markdown or inside HTML `<code>`, exists.
+- `tests/cli/test_argument_catalog.py` fails when a parser flag appears in no catalog, when a
+  model or converter catalog lists a flag its parser lacks, or when `docs/CONFIG.md` lists a flag
+  no parser accepts.
 
 ## Architecture and ownership
 
@@ -88,7 +148,7 @@ network must not inherit artificial diffusion or video concepts.
 
 ## Python style, imports, and types
 
-KinoMLX requires Python 3.14 or newer and uses native deferred annotations.
+KinoMLX requires Python 3.15 or newer and uses native deferred annotations.
 Do not add `from __future__ import annotations`, `typing.TYPE_CHECKING`, or
 `typing_extensions.TYPE_CHECKING`. Annotation dependencies are ordinary imports:
 there is one import graph for execution and type checking.
@@ -120,6 +180,81 @@ unsupported generic tensor annotations.
 | Private helpers | Leading underscore |
 | Constants | `UPPER_SNAKE`, grouped under the module or record that owns them |
 
+### Closed sets of strings
+
+A closed set of strings earns a `StrEnum` when this project decides its
+membership. Decide that by asking who would have to agree to add a member. If the
+answer is us, name it. If the answer is a file format, a library we call, or an
+operating-system API, leave it a string: the safetensors header spellings
+(`BF16`, `F8_E4M3`), argparse's `nargs` values (`?`, `+`, `*`) and codec names
+such as `utf-8` are their owners' vocabularies, and naming them would invent a
+domain word for a foreign contract and force a conversion at every handoff. A
+mixed set still counts as ours when we decide which of the foreign spellings we
+support, as `CliAction` does: four of its values are argparse's and are forwarded
+verbatim, while `boolean` and `paired_boolean` are ours.
+
+Declare the enum once and derive every tuple from it:
+
+```python
+class TransformerQuantize(StrEnum):
+    OFF = "off"
+    MXFP8_BLOCKS = "mxfp8-blocks"
+
+
+TRANSFORMER_QUANTIZE_MODES = tuple(item.value for item in TransformerQuantize)
+```
+
+Never hand-write a second copy of the members. A hand-kept tuple beside the enum
+is the failure this rule exists to prevent: `transformer_quantize` had three
+spellings of one set and `model_generation` had five, and in both cases the copy
+a `ChoiceConstraint` actually read had drifted out of sight of the one a reader
+would find first.
+
+Type the field, the parameter and the return with the vocabulary, not with `str`.
+An annotation wider than the contract hides real bugs: twelve `str | mx.Dtype`
+parameters funneled into a resolver that already narrowed to `FloatDType`, and
+narrowing them surfaced five sites handing a `DTypePolicy` to a float resolver
+where a `json` or `source` directive would have arrived as an unrecognized string
+deep inside a pipeline.
+
+Compare with `==`, not `is`. A `StrEnum` member equals and hashes as its value, so
+`in`, `==`, set membership and dict keys all work against a bare string, and a
+frozen record a caller constructs with one holds that string rather than the
+member. Identity comparison silently takes the other branch there. The
+annotations are what catch a misspelling, at the call site, where mypy can say so.
+
+Resolve a directive at the boundary that can refuse it. A vocabulary carrying an
+instruction rather than a value -- `auto`, `source`, `json` -- must be resolved
+where a caller can be told why it cannot be bound, not passed into arithmetic
+that will fail later with a worse message.
+
+Leave a value parsed from a file as a string. A saved sidecar's recorded dtype
+policy, a restart record's source generation and an adapter's factor-role keys all
+come back from disk and must be compared as data; typing them as a member would
+claim a guarantee the file cannot give.
+
+Put the vocabulary in a leaf module that both the record and its rules can import.
+A record and the rule that judges it import each other in this codebase --
+`types.py` imports `request_rules.py`, `settings.py` imports `settings_rules.py` --
+so a vocabulary declared in either half is unreachable from the other. LTX's four
+live in `models/ltx2/vocabularies.py` for exactly that reason. A shared vocabulary
+is also only shareable as far as its module's import cost reaches: `media/` cannot
+import `modeling.dtypes` because that executes the modeling package, which reaches
+`mlx.nn`, so `media/` declares its own `SampleDType` and says why.
+
+Before a mechanical rename, check the word for a second meaning. `"generate"` was a
+stage member as well as the `[generate]` configuration table until the stage
+meaning was retired; `"width"`, `"height"` and `"decode"` still collide the same way.
+Convert from an enumerated list of sites, not a
+blanket replace, and confirm the behavior afterward -- a regex that stripped
+constant names from import lists also emptied a set literal, leaving
+`transformer_quantize in {}`, which silently disabled quantization and which Ruff
+and mypy both accepted. Only a behavior test caught it.
+
+`scripts/hygiene/literals.py` in the tools repository reports the sites that break
+these rules and separates them from the word collisions. Run it over the package
+and the tests together; its first bucket needs no judgment.
+
 ## Configuration and command boundaries
 
 The frozen public configuration registry is the source of truth for model fields,
@@ -127,8 +262,9 @@ shared tables, CLI destinations/help, TOML parsing and serialization, templates,
 environment discovery, and implications. Add a field through its owning schema;
 do not manually mirror it across each input and output surface.
 
-The shared model catalog lives in `kinomlx.model_registry`; saved configuration and CLI
-consumers use the same frozen registry. Every `ConfigFieldSpec` explicitly declares
+The shared model catalog lives in `kinomlx.model_catalog`, and `kinomlx.model_registry`
+builds the frozen configuration registry from every model's contribution; saved
+configuration and CLI consumers use that same registry. Every `ConfigFieldSpec` explicitly declares
 `persistence="intent"` for canonical input or `persistence="source"` for a spelling
 that source resolution must consume. Saved readers, writers, and intent serialization
 validate registered field shapes and reject unresolved source inputs. They do not silently
@@ -176,7 +312,7 @@ selection use this mechanism. Effective rules run after precedence merging throu
 uses that path. `prepare_layer()` first executes declared source rules and then pure layer
 normalization. Prompt-file reads declare `read_files` effects,
 which registration permits only in the source phase. LTX source selection compiles from owned
-field groups with checked membership. Station applicability is a separate per-field declaration
+field groups with checked membership. Stage applicability is a separate per-field declaration
 described below; layer origins flow through assembly but not into saved-intent serialization.
 
 Source preparation validates registered paths, table shapes, primitive types, and declared
@@ -196,7 +332,7 @@ environment variable, behind each present key.
 `InvocationLayers.merge()` owns ENV < saved base < file < CLI < ordered overrides. A saved base is
 required typed configuration state and must be supplied during preparation, never attached later.
 Caller-supplied Settings records suppress only their corresponding ENV tables. Model code
-still owns saved-manifest selection, station-specific adjustments, and typed runtime construction.
+still owns saved-manifest selection, stage-specific adjustments, and typed runtime construction.
 Named layers are source context; complete per-field provenance remains separate work.
 
 Sparse configuration output retains explicit source presence, including values equal to defaults.
@@ -212,32 +348,31 @@ and replacement markers separately from `effective_config` observations. Restart
 state through
 the current schema. Missing or unsupported formats fail without old-snapshot recovery.
 
-Environment reads belong to the shared mechanism in `kinomlx.settings`, not scattered
-`os.environ` calls. Bare settings construction uses deterministic field defaults;
-environment resolution happens explicitly at invocation boundaries. Settings are
-frozen and presence-tracked. Klein requests separate constructor-local seed bounds and choices
-from final field-owned prompt, seed-selection and saved-conditioning rules. Call the request
-validator on surviving effective inputs; generation recipes do so before consuming sources.
-Tracked constructors and structured sources share coercion in
-`config_values.py`; supplied primitive types are checked before post-init, nested records are built
-through the same path, and type aliases retain their declared sequence behavior. Record state lives
-below the coercer to avoid registry/Settings import cycles. Use `replace_config()` for supplied edits
-and `derive_config()` for
-resolved observations that retain the existing supplied-field set. `with_overrides()` uses tracked
-copying and filters absent optional overrides. Ordinary runtime records can use `dataclasses.replace()`;
-default-filled constructor arguments must not be used to reconstruct configuration presence.
+Environment reads belong to the shared mechanism in `kinomlx.settings`, not scattered `os.environ`
+calls. Bare settings construction uses deterministic field defaults; environment resolution happens
+explicitly at invocation boundaries. Settings are frozen and presence-tracked. Klein requests
+separate constructor-local seed bounds and choices from final field-owned prompt, seed-selection and
+saved-conditioning rules. Call the request validator on surviving effective inputs; generation
+recipes do so before consuming sources. Tracked constructors and structured sources share coercion
+in `config_values.py`; supplied primitive types are checked before post-init, nested records are
+built through the same path, and type aliases retain their declared sequence behavior. Record state
+lives below the coercer to avoid registry/Settings import cycles. Use `replace_config()` for
+supplied edits and `derive_config()` for resolved observations that retain the existing
+supplied-field set. `with_overrides()` uses tracked copying and filters absent optional overrides.
+Ordinary runtime records can use `dataclasses.replace()`; default-filled constructor arguments must
+not be used to reconstruct configuration presence.
 
 Final record validation descends through nested dataclasses and record arrays, reporting concrete
 member paths and indexes. LTX VAE tiling uses this boundary for overlap/size policy after merging;
 its grid and nonnegative-value constraints remain local admission checks. Runtime tiling conversion
 validates the same owned policy before constructing decoder plans.
 
-Coupled Settings checks run through `EnvironmentSettings.validate()` after composition. A field
-owns each pure `RecordRule`, including its name and complete read set. Registration rejects unknown
-reads and conflicting rule identities; inspection exposes the same declarations. Primitive admission
-must not run these checks before later layers can explicitly resolve a cross-field conflict. Final assembly
-and resource boundaries run the validator even when a Settings record currently declares no rules,
-so adding a field-owned rule cannot bypass an existing entry point.
+Coupled Settings checks run through `EnvironmentSettings.validate()` after composition. A field owns
+each pure `RecordRule`, including its name and complete read set. Registration rejects unknown reads
+and conflicting rule identities; inspection exposes the same declarations. Primitive admission must
+not run these checks before later layers can explicitly resolve a cross-field conflict. Final
+assembly and resource boundaries run the validator even when a Settings record currently declares no
+rules, so adding a field-owned rule cannot bypass an existing entry point.
 
 Rules that distinguish an explicit default from an omitted input declare `presence_reads`
 as a subset of their value read set. The callback receives immutable `RuleInputs` with only
@@ -297,27 +432,27 @@ Public model APIs remain the execution surface used by the CLI.
 
 ### Declaring restart and public API ownership
 
-Every contribution states its restart applicability. `ModelConfigSpec.restart_stations`
-names the model's saved stations, or is empty with a `no_restart_reason` for a model that
-has no saved restart operation. Each registered table covers exactly those stations, and
-each non-virtual field declares one `StationPolicy` per station with a reason that
+Every contribution states its restart applicability. `ModelConfigSpec.restart_stages`
+names the model's saved stages, or is empty with a `no_restart_reason` for a model that
+has no saved restart operation. Each registered table covers exactly those stages, and
+each non-virtual field declares one `StagePolicy` per stage with a reason that
 `kinomlx config inspect` prints. A policy is `mutable` when replay may use a new value,
-`locked` when an earlier station already consumed it, or `irrelevant` when the station
+`locked` when an earlier stage already consumed it, or `irrelevant` when the stage
 cannot use it at all; an irrelevant policy also declares whether an explicitly supplied
 value is rejected or ignored. Reuse the shared `settings_table()` and
-`image_output_table()` builders, which require the model's stations, rather than
+`image_output_table()` builders, which require the model's stages, rather than
 restating infrastructure policy per model.
 
 Adding an ordinary field therefore needs its typed record member, its `ConfigFieldSpec`
-with persistence, surfaces and station policies, and nothing else: no parser list, no
+with persistence, surfaces and stage policies, and nothing else: no parser list, no
 consumer inventory, no second policy table. Registration rejects a missing binding,
-missing persistence, missing or duplicated station coverage, a policy without a reason,
+missing persistence, missing or duplicated stage coverage, a policy without a reason,
 an environment-name collision and a reused record member whose meaning was changed.
 
 Public entry points declare parameter ownership with `APIBoundary`. A configuration
 parameter refers to its registered table or to a projection of that table's record;
 runtime ports such as component providers, reporters, callbacks, prepared resources and
-station handoffs are classified as runtime-only, so they never gain an environment or
+stage handoffs are classified as runtime-only, so they never gain an environment or
 TOML representation. Validation compares declarations against the real callable
 signature and annotations, requires projections to track constructor presence, and
 therefore fails when a new parameter appears without an owner.
@@ -328,6 +463,84 @@ type parameter and is declared runtime on all four models; the concrete entry po
 registered table. Registration refuses a runtime declaration whose annotation names a
 registered table record, so a real configuration parameter cannot be relabeled as a
 nonserializable port while an unbounded type parameter stays one.
+
+### Prepared Klein recipe policy
+
+Klein request fields own negative-row cardinality and source-geometry relationships as
+final input rules. These checks do not read source images. Recipe capability rules require
+an explicit variant observation and validate external CFG, negative conditioning and adapter
+schedule lengths against the resolved recipe. Direct sampling recipes use the same profile
+default resolver and CFG policy; their constructors admit local values and their `resolved()`
+operation validates final relationships. An explicit sigma schedule owns its execution step
+count without overwriting the separately retained input step count.
+
+### Stage output availability
+
+A family with saved restarts declares a stage model in three parts: its stages in
+execution order, the stage that produces each saved artifact, and the artifacts a restart
+at each later stage reads back. Klein and Krea share one, `text`, `denoise`, `decode`, in
+`image_restart_config.py`; LTX declares `text`, `stage-1`, `stage-2`, `decode` in
+`models/ltx2/restart_rules.py`. A run starts at the first stage, or at a restart stage: a
+later stage whose inputs a saved run's products supply. `--restart-from` names it, and
+each family's stage enum is the only vocabulary. The restart stages are the keys of the
+consumes map, in choice order, the first being the default.
+
+Availability is derived, never written. `produced_at_stages` in `config/stages.py` turns
+the three declarations into the `OutputPolicy` frozensets the registry reads, by one
+rule: an artifact is producible from a start stage when its producing stage runs from
+there, or when that start stage read it and so can re-emit it. That is why Krea and Klein
+decode publish final latents again and both denoise stages publish text conditioning
+again, and why LTX's stage-1 conditioning is producible only from a normal run. Where a
+restart may read more than one latent, as LTX decode may read stage 1's or stage 2's,
+the derivation sees everything it can read and the run narrows to the one
+`latent_stage` selects.
+
+The restart record rules and readers look up the same declarations rather than restating
+them: a record is refused unless it carries exactly the artifacts its stage reads, a
+reader selects the read artifact by name from the same map, and Klein reads which
+prepared components the stages it runs need from a per-stage map. Each model declares its
+stages to the registry, which validates a start stage against the first stage and the
+restart stages. Registration checks the boolean owner. Image restart readers derive
+unavailable parent output defaults from the policy. Shared invocation preparation filters
+unavailable implications in every current source layer while retaining explicit true and
+false requests and their provenance. An explicit unavailable request fails validation
+even when save-all is enabled. Both image output planners consume the same declarations.
+
+Stage output availability describes artifact production; it does not replace the
+per-field mutable/locked comparison policy for request inputs. Those decisions are
+judgment, not derivation: LTX keeps `seed` mutable at decode because its video decoder
+reads a decoder seed, while Krea and Klein lock it because their decoders read none. Krea
+restricts text conditioning to its text recipe, so an edit run cannot save a text-only
+restart.
+
+### Invocation utility controls
+
+`kinomlx.invocation_controls` owns bootstrap and configuration utility inputs: their names,
+typed CLI bindings, defaults, help, phase, dependencies and surface exclusions. Bootstrap
+and complete model parsers consume the same declarations. Parser validation checks these
+controls as well as configuration fields; they are no longer an unchecked destination list.
+The model selector links to its canonical field and shares its binding with each model schema.
+
+Configuration inspection includes invocation controls and their supported/excluded surfaces.
+Config-file selection, ordered override input and print/save modes are command utilities;
+they do not become fake TOML fields or saved generation values. Utility dependencies, such
+as the output mode required by `--only-non-defaults`, are checked by the shared utility boundary.
+
+### Required configuration surface policy
+
+Each `ConfigFieldSpec` explicitly selects a `SurfacePolicy`. The shared policies cover normal
+typed inputs, source spellings, model selection and structured-only contributions. A policy
+reports every transport as supported or deliberately unavailable with a reason. A field cannot
+claim ordinary CLI support without a binding, or retain a binding while excluding CLI. Deliberate
+ENV exclusions remove the binding; supplying its unregistered variable still fails strict ENV
+admission. Settings records retain their owned ENV bindings; they cannot independently exclude
+that same surface in schema metadata. Collection members must support the transports admitted
+by their parent collection. Virtual source spellings explicitly exclude typed-record API arguments.
+
+Ordinary configuration fields participate in TOML and ordered overrides and expose their typed
+record members through the API. Runtime objects and command utilities belong to their distinct
+boundary declarations. Configuration inspection reports field and nested-member policies and
+invocation control exclusions directly from these declarations.
 
 ## Weights and adapters
 
@@ -370,10 +583,11 @@ For magnitude/rotation formats, strength scales the completed change from the ba
 not a fractional internal normalization parameter. Saved full weights and trained
 biases retain replacement semantics; compose saved bias contributions once.
 
-Preserve format-specific alpha and scalar handling, including LTX's direct-strength
-mapping, configured PEFT scaling, dense LoKr's unit-scale exception, and saved-zero
-alpha semantics. The [adapter scaling reference](ADAPTERS.md#strength-alpha-and-effective-scale)
-is the authoritative user explanation; do not duplicate the equations here.
+Preserve format-specific alpha and scalar handling, including LTX's direct-strength mapping of
+community exports, configured PEFT scaling on every model, dense LoKr's unit-scale exception, and
+saved-zero alpha semantics. The [adapter scaling
+reference](ADAPTERS.md#strength-alpha-and-effective-scale) is the authoritative user explanation; do
+not duplicate the equations here.
 
 Reject ambiguous target aliases, conflicting operations, and unknown semantic tensors
 on recognized targets. Do not invent missing bases, mappings, or trainer state.
@@ -398,8 +612,9 @@ branches require explicit selection; generic conversion must not guess one.
 
 ## Precision and numerical correctness
 
-LTX, Krea, and Klein transformers default to BF16. FP16 is an explicit speed option;
-both use two bytes per value. Keep the selected dtype coherent across projections,
+LTX transformers default to FP16, which measured closer to FP32 than BF16 and
+faster; Krea and Klein transformers default to BF16, with FP16 an explicit speed
+option. Both use two bytes per value. Keep the selected dtype coherent across projections,
 feed-forward layers, attention, and activations. Unintended FP32 promotion changes
 memory use and kernel selection. Diagnostic FP32 support remains model-specific.
 
@@ -499,7 +714,18 @@ set so reference frameworks do not become accidental inference requirements.
 ## Tests and validation
 
 Run tests from the repository root with the project virtual environment active.
-MLX tests require an Apple Silicon environment with access to Metal.
+MLX tests require an Apple Silicon environment with access to Metal. Install the test tooling
+with the `dev` extra, then run the normal suite:
+
+```bash
+uv pip install -e ".[dev]"
+python -m pytest tests
+```
+
+The suite runs with `-n auto`, one worker per physical core. Pass `-n 0` for one process when
+debugging, and under `coverage run`, which observes only the controller process. Test files are
+written to per-test temporary directories, which pytest may keep after a run under its retention
+policy.
 
 Tests mirror package responsibilities under `tests/`. Add tests for meaningful
 regressions, public contracts, and independently derived numerical behavior, not
@@ -523,6 +749,14 @@ every invocation, including the cheap real-asset tests: a header read, tokenizer
 parity, or one small component load resolves its input the way the product does and
 skips with the reason when the cache does not hold it. Registered markers are the
 only markers a test may use (`--strict-markers`).
+
+```bash
+python -m pytest tests --run-heavy -m heavy
+python -m pytest tests --run-heavy -m 'heavy and not slow'
+```
+
+Heavy tests need the checkpoints locally and can take substantial time and temporary disk space;
+some full-pipeline gates also need their own opt-in environment variables.
 
 Run the repository's configured gates for the changed surface. From the repository
 root with its virtual environment active:
@@ -591,57 +825,3 @@ detailed body.
 
 When changing a project convention, update this document along with the affected
 code and explain the reason in the change description.
-
-### Prepared Klein recipe policy
-
-Klein request fields own negative-row cardinality and source-geometry relationships as
-final input rules. These checks do not read source images. Recipe capability rules require
-an explicit variant observation and validate external CFG, negative conditioning and adapter
-schedule lengths against the resolved recipe. Direct sampling recipes use the same profile
-default resolver and CFG policy; their constructors admit local values and their `resolved()`
-operation validates final relationships. An explicit sigma schedule owns its execution step
-count without overwriting the separately retained input step count.
-
-### Station output availability
-
-Artifact fields can bind an `OutputPolicy` declaring the stations that produce them.
-Registration checks the boolean owner and station identities. Image restart readers derive
-unavailable parent output defaults from this policy. Shared invocation preparation filters
-unavailable implications in every current source layer while retaining explicit true and
-false requests and their provenance. An explicit unavailable request fails validation even
-when save-all is enabled. Both image output planners consume the same declarations.
-
-Station output availability describes artifact production; it does not replace the separate
-mutable/locked comparison policy for request inputs. A restart station re-emits what it
-consumed and still holds, so Krea and Klein decode both publish final latents and both
-denoise stations publish text conditioning again. Krea restricts text conditioning to its
-text recipe, so an edit run cannot save a text-only restart.
-
-### Invocation utility controls
-
-`kinomlx.invocation_controls` owns bootstrap and configuration utility inputs: their names,
-typed CLI bindings, defaults, help, phase, dependencies and surface exclusions. Bootstrap
-and complete model parsers consume the same declarations. Parser validation checks these
-controls as well as configuration fields; they are no longer an unchecked destination list.
-The model selector links to its canonical field and shares its binding with each model schema.
-
-Configuration inspection includes invocation controls and their supported/excluded surfaces.
-Config-file selection, ordered override input and print/save modes are command utilities;
-they do not become fake TOML fields or saved generation values. Utility dependencies, such
-as the output mode required by `--only-non-defaults`, are checked by the shared utility boundary.
-
-### Required configuration surface policy
-
-Each `ConfigFieldSpec` explicitly selects a `SurfacePolicy`. The shared policies cover normal
-typed inputs, source spellings, model selection and structured-only contributions. A policy
-reports every transport as supported or deliberately unavailable with a reason. A field cannot
-claim ordinary CLI support without a binding, or retain a binding while excluding CLI. Deliberate
-ENV exclusions remove the binding; supplying its unregistered variable still fails strict ENV
-admission. Settings records retain their owned ENV bindings; they cannot independently exclude
-that same surface in schema metadata. Collection members must support the transports admitted
-by their parent collection. Virtual source spellings explicitly exclude typed-record API arguments.
-
-Ordinary configuration fields participate in TOML and ordered overrides and expose their typed
-record members through the API. Runtime objects and command utilities belong to their distinct
-boundary declarations. Configuration inspection reports field and nested-member policies and
-invocation control exclusions directly from these declarations.

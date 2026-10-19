@@ -93,20 +93,20 @@ def test_version_exposed() -> None:
 
 def test_ltx2_public_api_is_exported_from_model_package() -> None:
     from kinomlx.models.ltx2 import (
-        DistilledRequest,
-        DistilledRestart,
-        ImageConditioningConfig,
+        LTX2ImageConditioningConfig,
+        LTX2Request,
+        LTX2Restart,
         LTX2Runner,
         LTX2Settings,
-        restart_distilled,
+        restart_ltx2,
     )
 
-    assert DistilledRequest.__name__ == "DistilledRequest"
-    assert DistilledRestart.__name__ == "DistilledRestart"
-    assert ImageConditioningConfig.__name__ == "ImageConditioningConfig"
+    assert LTX2Request.__name__ == "LTX2Request"
+    assert LTX2Restart.__name__ == "LTX2Restart"
+    assert LTX2ImageConditioningConfig.__name__ == "LTX2ImageConditioningConfig"
     assert LTX2Runner.__name__ == "LTX2Runner"
     assert LTX2Settings.__name__ == "LTX2Settings"
-    assert restart_distilled.__name__ == "restart_distilled"
+    assert restart_ltx2.__name__ == "restart_ltx2"
 
 
 def test_gmnet_public_api_is_exported_from_model_package() -> None:
@@ -142,10 +142,10 @@ def test_krea2_public_api_is_exported_from_model_package() -> None:
         Krea2Resources,
         Krea2Settings,
         Krea2TextConditioner,
+        Krea2TextConditionerPort,
         Krea2TextConditioning,
         Krea2TextConditioningProvenance,
         Krea2Variant,
-        NativeKrea2TextConditioner,
         prepare_resources,
     )
 
@@ -153,11 +153,11 @@ def test_krea2_public_api_is_exported_from_model_package() -> None:
     assert Krea2PromptConditioning.__name__ == "Krea2PromptConditioning"
     assert Krea2Resources.__name__ == "Krea2Resources"
     assert Krea2Settings.__name__ == "Krea2Settings"
-    assert Krea2TextConditioner.__name__ == "Krea2TextConditioner"
+    assert Krea2TextConditionerPort.__name__ == "Krea2TextConditionerPort"
     assert Krea2TextConditioning.__name__ == "Krea2TextConditioning"
     assert Krea2TextConditioningProvenance.__name__ == "Krea2TextConditioningProvenance"
     assert Krea2Variant.__name__ == "Krea2Variant"
-    assert NativeKrea2TextConditioner.__name__ == "NativeKrea2TextConditioner"
+    assert Krea2TextConditioner.__name__ == "Krea2TextConditioner"
     assert prepare_resources.__name__ == "prepare_resources"
 
 

@@ -20,7 +20,7 @@ from kinomlx.models.ltx2.weights.quantization import (
 from kinomlx.models.ltx2.weights.schema import (
     LAYOUT_KEY_PREFIX,
     QUANT_KEY_PREFIX,
-    TRANSFORMER_QUANTIZE_OFF,
+    TransformerQuantize,
 )
 from kinomlx.models.ltx2.weights.validation import validate_model_weight_graph
 
@@ -35,7 +35,7 @@ class TransformerBlockStreamer:
         expected_model: nn.Module | None = None,
         include_audio: bool | None = None,
         expected_block_schemas: tuple[frozenset[str], ...] | None = None,
-        transformer_quantize: str = TRANSFORMER_QUANTIZE_OFF,
+        transformer_quantize: TransformerQuantize = TransformerQuantize.OFF,
         video_ff_quantize_specs: tuple[tuple[str, str], ...] = (),
         video_ff_quantize_group_size: int | None = None,
         video_ff_quantize_bits: int | None = None,

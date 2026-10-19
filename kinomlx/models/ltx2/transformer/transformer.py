@@ -6,6 +6,7 @@ import mlx.core as mx
 
 import kinomlx._mlx_nn as nn
 
+from ..sparse_attention import SparseAttentionStep
 from .attention import Attention, rms_norm
 from .execution import TransformerExecution
 from .feed_forward import FeedForward
@@ -58,10 +59,8 @@ class TransformerConfig:
     context_dim: int
     ff_bias: bool = True
     apply_gated_attention: bool = True
-    use_steel_attention: bool = True
     compile_attention: bool = True
-    steel_attention_d64: bool = True
-    steel_attention_probe: bool = False
+    dense_attention_kernel: bool = True
 
 
 @dataclass(frozen=True)
@@ -80,6 +79,7 @@ class TransformerArgs:
     cross_scale_shift_timestep: mx.array | None = None
     cross_gate_timestep: mx.array | None = None
     enabled: bool = True
+    sparse_attention: SparseAttentionStep | None = None
 
 
 class BasicAVTransformerBlock(nn.Module):
@@ -98,16 +98,12 @@ class BasicAVTransformerBlock(nn.Module):
         self.idx = idx
         self.norm_eps = norm_eps
         video_attention_backend = {
-            "use_steel_attention": video_config.use_steel_attention,
             "compile_attention": video_config.compile_attention,
-            "steel_attention_d64": video_config.steel_attention_d64,
-            "steel_attention_probe": video_config.steel_attention_probe,
+            "dense_kernel": video_config.dense_attention_kernel,
         }
         audio_attention_backend = {
-            "use_steel_attention": audio_config.use_steel_attention,
             "compile_attention": audio_config.compile_attention,
-            "steel_attention_d64": audio_config.steel_attention_d64,
-            "steel_attention_probe": audio_config.steel_attention_probe,
+            "dense_kernel": audio_config.dense_attention_kernel,
         }
 
         self.attn1 = Attention(
@@ -260,10 +256,12 @@ class BasicAVTransformerBlock(nn.Module):
                 shift,
                 self.norm_eps,
             )
+            sparse = video.sparse_attention
             attended = self.attn1(
                 normalized,
                 pe=video.positional_embeddings,
                 mask=video.self_attention_mask,
+                sparse=sparse if sparse is not None and sparse.applies_to(self.idx) else None,
             )
             video_value = _compiled_gated_residual(video_value, attended, gate)
             video_value = (

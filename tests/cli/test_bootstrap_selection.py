@@ -10,7 +10,7 @@ import pytest
 from kinomlx.cli._registry import _bootstrap_options, resolve_model_selection
 from kinomlx.cli.invocation import add_selection_arguments
 from kinomlx.cli.main import main
-from kinomlx.model_registry import model_choices
+from kinomlx.model_catalog import model_choices
 
 
 @pytest.mark.parametrize("model", ["gmnet", "flux2", "krea2", "ltx2"])

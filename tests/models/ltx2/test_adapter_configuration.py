@@ -9,7 +9,7 @@ from kinomlx.config import ConfigError, dataclass_from_mapping
 from kinomlx.config.assembly import collect_invocation_sources
 from kinomlx.config.provenance import PreparedConfig
 from kinomlx.config_records import record_intent
-from kinomlx.models.ltx2 import DistilledRequest, LTX2AdapterConfig
+from kinomlx.models.ltx2 import LTX2AdapterConfig, LTX2Request
 from kinomlx.models.ltx2.arguments import build_parser
 from kinomlx.models.ltx2.config import assemble, effective_generate_config
 from kinomlx.models.ltx2.config_schema import CONFIG_SCHEMA
@@ -69,7 +69,7 @@ def test_per_seed_projection_matches_the_assembled_sidecar_table():
     )
     assert "duration" not in per_seed
     assert per_seed["frames"] == invocation.request.frames
-    automatic = effective_generate_config(DistilledRequest(prompt="scene", frames=None))
+    automatic = effective_generate_config(LTX2Request(prompt="scene", frames=None))
     assert automatic["auto_duration"] is True
 
 
@@ -93,27 +93,27 @@ def test_indexed_and_whole_replacements_cannot_bypass_completed_stage_locks(
     inputs = collect_invocation_sources(CONFIG_SCHEMA, build_parser().parse_args(tokens)).prepare(
         PreparedConfig(base, {})
     )
-    current = dataclass_from_mapping(DistilledRequest, inputs.merge()["generate"], table="generate")
-    parent = dataclass_from_mapping(DistilledRequest, base["generate"], table="generate")
+    current = dataclass_from_mapping(LTX2Request, inputs.merge()["generate"], table="generate")
+    parent = dataclass_from_mapping(LTX2Request, base["generate"], table="generate")
     expected = (("generate", "adapters"),)
-    assert CONFIG_SCHEMA.locked_changes(("generate",), current, parent, station="stage-2") == (
+    assert CONFIG_SCHEMA.locked_changes(("generate",), current, parent, stage="stage-2") == (
         expected if stage2_locked else ()
     )
-    assert CONFIG_SCHEMA.locked_changes(("generate",), current, parent, station="decode") == (
+    assert CONFIG_SCHEMA.locked_changes(("generate",), current, parent, stage="decode") == (
         expected if decode_locked else ()
     )
 
 
 def test_stage2_only_record_does_not_change_the_completed_first_stage():
-    parent = DistilledRequest(adapters=(LTX2AdapterConfig(Path("first"), strength=0.5),))
-    current = DistilledRequest(
+    parent = LTX2Request(adapters=(LTX2AdapterConfig(Path("first"), strength=0.5),))
+    current = LTX2Request(
         adapters=(
             *parent.adapters,
             LTX2AdapterConfig(Path("second"), stage1_strength=0, stage2_strength=-0.5),
         )
     )
-    assert CONFIG_SCHEMA.locked_changes(("generate",), current, parent, station="stage-2") == ()
-    assert CONFIG_SCHEMA.locked_changes(("generate",), current, parent, station="decode") == (
+    assert CONFIG_SCHEMA.locked_changes(("generate",), current, parent, stage="stage-2") == ()
+    assert CONFIG_SCHEMA.locked_changes(("generate",), current, parent, stage="decode") == (
         ("generate", "adapters"),
     )
 
@@ -134,4 +134,4 @@ def test_retired_stage_arrays_fail_in_structured_and_python_inputs(retired, tmp_
     with pytest.raises(ConfigError, match=retired):
         assemble(build_parser().parse_args(["--config", str(config), "--adapter", "replacement"]))
     with pytest.raises(TypeError, match=retired):
-        DistilledRequest(**{retired: ()})
+        LTX2Request(**{retired: ()})

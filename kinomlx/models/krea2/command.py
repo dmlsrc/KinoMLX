@@ -1,5 +1,6 @@
 """Installed ``--model krea2`` preparation and text-to-image command."""
 
+import functools
 import logging
 import time
 from contextlib import ExitStack
@@ -19,6 +20,7 @@ from kinomlx.cli.presentation import (
     render_model_error,
     render_run_success,
 )
+from kinomlx.cli.resource_operation import report_resources
 from kinomlx.config import ConfigError
 from kinomlx.debug import (
     RunRecord,
@@ -28,6 +30,7 @@ from kinomlx.debug import (
     write_effective_config,
 )
 from kinomlx.errors import KinoMLXError, RunCanceled
+from kinomlx.image_restart_config import ImageStage
 from kinomlx.io.output_bundle import BundleReservation
 from kinomlx.io.output_paths import reserve_output_base
 from kinomlx.model_registry import config_registry
@@ -35,10 +38,13 @@ from kinomlx.models.krea2.output import Krea2OutputSink, plan_krea2_output
 from kinomlx.models.krea2.resources import prepare_resources
 from kinomlx.models.krea2.runner import Krea2Runner
 from kinomlx.reporter_stack import command_reporter
-from kinomlx.reporting import Reporter, ScopedReporter, TimingReport, TimingReporter
+from kinomlx.reporting import ScopedReporter, TimingReport, TimingReporter
 from kinomlx.samplers.sigmas import render_sigmas
 from kinomlx.settings import Settings
-from kinomlx.ui import configure_logging, configure_logging_from_settings
+from kinomlx.ui import (
+    configure_logging,
+    configure_logging_from_settings,
+)
 
 from .adapters.edit_profile import resolve_edit_adapters
 from .adapters.turbo_profile import resolve_turbo_adapters
@@ -65,8 +71,8 @@ def _log_request(invocation: Krea2Invocation) -> None:
     tiling: str = request.vae_tiling
     if tiling == "custom":
         tiling += f"; tile={request.vae_tile_size}px; stride={request.vae_tile_stride}px"
-    restart_phase = None if invocation.restart is None else invocation.restart.config.phase
-    if restart_phase != "decode" and request.turbo_4step and invocation.variant.value == "raw":
+    restart_stage = None if invocation.restart is None else invocation.restart.config.stage
+    if restart_stage != "decode" and request.turbo_4step and invocation.variant.value == "raw":
         _log.warning(
             "The four-step adapter was trained for Krea Turbo. With Raw, also supply "
             "a standard 8-step Turbo LoRA through --adapter."
@@ -76,7 +82,7 @@ def _log_request(invocation: Krea2Invocation) -> None:
         run_facts.append(("Seeds", ", ".join(map(str, request.selected_seeds()))))
     if invocation.restart is not None:
         run_facts.append(("Source run", invocation.restart.source_run))
-        if restart_phase == "decode":
+        if restart_stage == "decode":
             run_facts.append(("Final latents", invocation.restart.selected_latents))
         else:
             assert request.text_conditioning is not None
@@ -85,18 +91,18 @@ def _log_request(invocation: Krea2Invocation) -> None:
         _log,
         model=_model_name(invocation),
         action=("edit" if request.source_images else "generate")
-        if restart_phase is None
-        else f"restart {restart_phase}",
+        if restart_stage is None
+        else f"restart {restart_stage}",
         resolution=f"{request.width}x{request.height}",
         prompts=len(request.prompts),
         images=request.image_count,
         seed=request.selected_seeds()[0],
         extra=run_facts,
     )
-    if restart_phase is not None and invocation.output.save_all_sidecars:
-        _log.info("Save-all sidecars limited to outputs produced by the %s restart", restart_phase)
+    if restart_stage is not None and invocation.output.save_all_sidecars:
+        _log.info("Save-all sidecars limited to outputs produced by the %s restart", restart_stage)
     compute_facts: list[tuple[str, object]] = []
-    if restart_phase != "decode":
+    if restart_stage != "decode":
         compute_facts.extend(
             (
                 ("Denoiser", invocation.model_settings.denoise_mode),
@@ -122,7 +128,7 @@ def _log_request(invocation: Krea2Invocation) -> None:
             "  System prompt: %s",
             request.system_prompt or "(empty system message)",
         )
-    if request.source_images and restart_phase != "decode":
+    if request.source_images and restart_stage != "decode":
         log_section(
             _log,
             "Editing",
@@ -168,7 +174,7 @@ def _log_request(invocation: Krea2Invocation) -> None:
                 turbo["revision"],
             )
         log_adapter_selections(_log, selections)
-    elif restart_phase != "decode":
+    elif restart_stage != "decode":
         selections, turbo = resolve_turbo_adapters(
             invocation.settings.hf_home,
             enabled=request.turbo_4step,
@@ -222,10 +228,7 @@ def _log_resources(
         facts.extend(
             (
                 ("Recipe", resources.recipe_identity),
-                (
-                    "Denoise mode",
-                    "reference" if resources.reference_denoise else "optimized",
-                ),
+                ("Denoise mode", resources.denoise_mode),
                 ("Distilled", str(resources.capabilities.is_distilled).lower()),
             )
         )
@@ -267,20 +270,6 @@ def _log_resources(
     )
 
 
-def _run_inspect(invocation: Krea2Invocation, reporter: Reporter) -> dict[str, object]:  # noqa: ARG001
-    resources = prepare_resources(
-        invocation.model_settings,
-        infrastructure=invocation.settings,
-    )
-    _log_resources(resources)
-    return {
-        "action": "inspect",
-        "outputs": {},
-        "resources": resources.to_dict(),
-        "warnings": [],
-    }
-
-
 def _run_generate(
     invocation: Krea2Invocation,
     reporter: TimingReporter,
@@ -302,14 +291,14 @@ def _run_generate(
             "Krea source variant changed after configuration resolution: "
             f"{invocation.variant.value} -> {runner.resources.variant.value}"
         )
-    restart_phase = None if invocation.restart is None else invocation.restart.config.phase
+    restart_stage = None if invocation.restart is None else invocation.restart.config.stage
     _log_resources(
         runner.resources,
-        decoder_only=restart_phase == "decode",
+        decoder_only=restart_stage == "decode",
         text_replay=request.text_conditioning is not None,
     )
     planned_recipe = None
-    if restart_phase != "decode":
+    if restart_stage != "decode":
         _, planned_recipe = resolve_request_recipe(runner.resources, request)
         log_section(
             _log,
@@ -322,14 +311,14 @@ def _run_generate(
                 ("Sigmas", render_sigmas(timestep_schedule(planned_recipe))),
             ),
         )
-    if restart_phase is None:
+    if restart_stage is None:
         generation = runner.generate(
             request,
             on_image=lambda index, image: output_sink.write_image(
                 index, image, reservation=reservation
             ),
         )
-    elif restart_phase == "decode":
+    elif restart_stage == "decode":
         assert invocation.restart is not None
         generation = runner.restart(
             request,
@@ -422,8 +411,8 @@ def _run_generation_command(
 ]:
     request = invocation.request
     assert request is not None
-    station = "generate" if invocation.restart is None else invocation.restart.config.phase
-    plan = plan_krea2_output(request, invocation.variant, invocation.output, station=station)
+    stage = ImageStage.TEXT if invocation.restart is None else invocation.restart.config.stage
+    plan = plan_krea2_output(request, invocation.variant, invocation.output, stage=stage)
     command_argv = ["kinomlx", *argv]
     sidecar_errors: list[dict[str, str]] = []
     run_record = None
@@ -440,7 +429,7 @@ def _run_generation_command(
 
         def reserve(base: Path) -> BundleReservation[Krea2OutputPlan]:
             selected = plan_krea2_output(
-                request, invocation.variant, invocation.output, base=base, station=station
+                request, invocation.variant, invocation.output, base=base, stage=stage
             )
             return output_stack.enter_context(selected.reserve())
 
@@ -495,7 +484,7 @@ def _run_generation_command(
                 try:
                     run_record = RunRecord(
                         run_log,
-                        model="krea2",
+                        schema=config_registry().model("krea2"),
                         effective_config=invocation.resolved_config,
                         config_intent=invocation.config_intent,
                         argv=command_argv,
@@ -616,60 +605,43 @@ def run_krea2_command(argv: list[str]) -> int:
     if config_exit is not None:
         return config_exit
 
+    if invocation.operation.dry_run:
+        return report_resources(
+            "krea2",
+            functools.partial(
+                prepare_resources, invocation.model_settings, infrastructure=invocation.settings
+            ),
+            log=_log_resources,
+            json_output=invocation.settings.json_output,
+        )
+
+    try:
+        validate_for_execution(invocation)
+    except ConfigError as exc:
+        return render_error(
+            f"config error: {exc}",
+            json_output=invocation.settings.json_output,
+        )
+
     started = time.perf_counter()
-    payload: dict[str, object]
-    timings: TimingReport
-    diagnostics: dict[str, object]
-    sidecar_errors: list[dict[str, str]] = []
-    planned_outputs: dict[str, object] | None = None
-    if invocation.request is None:
-        try:
-            log_section(
-                _log,
-                "Run",
-                (("Model", _model_name(invocation)), ("Action", "inspect")),
-            )
-            with ExitStack() as stack:
-                reporter = command_reporter(stack, invocation.settings)
-                reporter.memory_checkpoint("run_start")
-                payload = _run_inspect(invocation, reporter)
-                timings = reporter.to_dict()
-                memory = reporter.memory_to_dict()
-                diagnostics = {"memory": memory} if memory else {}
-        except (
-            KinoMLXError,
-            FileNotFoundError,
-            OSError,
-            TypeError,
-            ValueError,
-            RuntimeError,
-        ) as exc:
-            return render_model_error(
-                "krea2",
-                "preparation",
-                exc,
-                json_output=invocation.settings.json_output,
-            )
-    else:
-        try:
-            validate_for_execution(invocation)
-            payload, timings, diagnostics, sidecar_errors, planned_outputs = (
-                _run_generation_command(invocation, argv)
-            )
-        except (
-            KinoMLXError,
-            FileNotFoundError,
-            OSError,
-            TypeError,
-            ValueError,
-            RuntimeError,
-        ) as exc:
-            return render_model_error(
-                "krea2",
-                "restart" if invocation.restart is not None else "generation",
-                exc,
-                json_output=invocation.settings.json_output,
-            )
+    try:
+        payload, timings, diagnostics, sidecar_errors, planned_outputs = _run_generation_command(
+            invocation, argv
+        )
+    except (
+        KinoMLXError,
+        FileNotFoundError,
+        OSError,
+        TypeError,
+        ValueError,
+        RuntimeError,
+    ) as exc:
+        return render_model_error(
+            "krea2",
+            "restart" if invocation.restart is not None else "generation",
+            exc,
+            json_output=invocation.settings.json_output,
+        )
 
     elapsed = time.perf_counter() - started
     outputs = payload["outputs"]

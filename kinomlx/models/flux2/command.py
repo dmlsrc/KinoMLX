@@ -1,6 +1,6 @@
-"""Human-facing Klein generation, preparation, and saved-station commands."""
+"""Human-facing Klein generation, preparation, and saved-stage commands."""
 
-import json
+import functools
 import logging
 import time
 from collections.abc import Callable
@@ -22,6 +22,7 @@ from kinomlx.cli.presentation import (
     render_model_error,
     render_run_success,
 )
+from kinomlx.cli.resource_operation import report_resources
 from kinomlx.config import ConfigError
 from kinomlx.config.persistence import read_configuration
 from kinomlx.debug.metadata import (
@@ -32,6 +33,7 @@ from kinomlx.debug.metadata import (
     write_effective_config,
 )
 from kinomlx.errors import RunCanceled
+from kinomlx.image_restart_config import ImageStage
 from kinomlx.io.fingerprints import file_sha256
 from kinomlx.io.image import image_size
 from kinomlx.io.output_bundle import BundleReservation, protect_sources
@@ -45,7 +47,6 @@ from kinomlx.settings import Settings
 from kinomlx.ui import (
     configure_logging,
     configure_logging_from_settings,
-    configure_machine_output,
 )
 
 from .adapters.loading import prepare_flux2_adapters
@@ -54,7 +55,7 @@ from .config import Flux2Invocation, assemble
 from .config_schema import CONFIG_SCHEMA
 from .image_processing import output_size, reference_geometry
 from .output import Flux2OutputPlan, Flux2OutputSink, plan_output
-from .resources import Flux2Resources, inspect_resources
+from .resources import Flux2Resources, prepare_resources
 from .restart import Flux2Restart
 from .runner import Flux2Runner
 from .types import Flux2Request
@@ -88,7 +89,7 @@ def _log_run(invocation: Flux2Invocation, resolution: str) -> None:
     log_run_header(
         _log,
         model=f"FLUX.2 Klein {invocation.model_settings.variant.title()}",
-        action=f"restart {restart.phase}" if restart else "edit" if editing else "generate",
+        action=f"restart {restart.stage}" if restart else "edit" if editing else "generate",
         resolution=resolution,
         prompts=len(request.prompts()),
         images=request.image_count,
@@ -102,9 +103,14 @@ def _log_run(invocation: Flux2Invocation, resolution: str) -> None:
         ),
     )
     compute: list[tuple[str, object]] = []
-    if restart is None or restart.phase != "decode":
+    if restart is None or restart.stage != ImageStage.DECODE:
         compute.append(("Transformer dtype", invocation.model_settings.transformer_dtype))
-    compute.extend((("VAE dtype", "bfloat16"), ("VAE tiling", "off")))
+    compute.extend(
+        (
+            ("VAE dtype", invocation.model_settings.vae_dtype),
+            ("VAE tiling", "off"),
+        )
+    )
     log_section(_log, "Compute", compute)
 
 
@@ -138,10 +144,10 @@ def _log_resources(resources: Flux2Resources) -> None:
 
 def _log_geometry(invocation: Flux2Invocation) -> tuple[int, int]:
     request = invocation.generate
-    station = invocation.conditioning
-    if station is not None:
-        size = (request.width or station.width, request.height or station.height)
-        geometries = station.geometries
+    stage = invocation.conditioning
+    if stage is not None:
+        size = (request.width or stage.width, request.height or stage.height)
+        geometries = stage.geometries
     else:
         sizes = tuple(image_size(path) for path in request.source_images)
         size = output_size(
@@ -225,7 +231,9 @@ def _source_paths(invocation: Flux2Invocation, arguments: object) -> tuple[Path,
     if invocation.restart:
         paths.append(invocation.restart.selection.run)
         previous = read_configuration(
-            invocation.restart.payload, model="flux2", source=str(invocation.restart.selection.run)
+            invocation.restart.payload,
+            schema=CONFIG_SCHEMA,
+            source=str(invocation.restart.selection.run),
         )
         previous_generate = cast(dict[str, object], previous.values.get("generate", {}))
         paths.extend(
@@ -251,7 +259,7 @@ def _run_images(
     variant = invocation.model_settings.variant
     recipe = generate.recipe(variant)
     restart = invocation.restart
-    decode = restart is not None and restart.selection.phase == "decode"
+    decode = restart is not None and restart.selection.stage == ImageStage.DECODE
     count = 1 if decode else generate.image_count
     plan = plan_output(
         invocation.output,
@@ -262,11 +270,11 @@ def _run_images(
         sources=sources,
         decode=decode,
     )
-    # Admit all selected stations and adapters before any model preparation or loading.
+    # Admit all selected stages and adapters before any model preparation or loading.
     prepared = (
         restart.resources(
             variant,
-            phase=restart.selection.phase,
+            stage=restart.selection.stage,
             check_adapter_weights=settings.check_adapter_weights,
         )
         if restart
@@ -275,7 +283,7 @@ def _run_images(
     if not decode:
         prepare_flux2_adapters(generate.resolved_adapters())
     resources = (
-        None if restart else inspect_resources(invocation.model_settings, infrastructure=settings)
+        None if restart else prepare_resources(invocation.model_settings, infrastructure=settings)
     )
     resource_description = (
         resources.describe()
@@ -357,7 +365,7 @@ def _run_images(
                     record_path,
                     lambda: RunRecord(
                         record_path,
-                        model="flux2",
+                        schema=CONFIG_SCHEMA,
                         effective_config=invocation.resolved_config,
                         config_intent=invocation.config_intent,
                         argv=["kinomlx", *arguments],
@@ -417,7 +425,10 @@ def _run_images(
                         latents=restart.artifact("final_latents", restart.selection.latents)
                     )
                     if decode
-                    else Flux2Restart(phase="denoise", text_conditioning=generate.text_conditioning)
+                    else Flux2Restart(
+                        stage=ImageStage.DENOISE,
+                        text_conditioning=generate.text_conditioning,
+                    )
                 )
                 output = runner.restart(generate, selection, conditioning=invocation.conditioning)
             else:
@@ -556,12 +567,14 @@ def run_flux2_command(arguments: list[str]) -> int:
             return config_result
         if not invocation.operation.dry_run:
             return _run_images(invocation, arguments, sources)
-        resources = inspect_resources(invocation.model_settings, infrastructure=settings)
-        result = resources.describe()
-        configure_machine_output("kinomlx.models.flux2.stdout").info(
-            "%s", json.dumps(result, indent=2)
+        return report_resources(
+            "flux2",
+            functools.partial(
+                prepare_resources, invocation.model_settings, infrastructure=settings
+            ),
+            log=_log_resources,
+            json_output=json_output,
         )
-        return 0
     except ConfigError as exc:
         return render_error(f"config error: {exc}", json_output=json_output)
     except (ArithmeticError, OSError, ValueError, TypeError, RuntimeError) as exc:

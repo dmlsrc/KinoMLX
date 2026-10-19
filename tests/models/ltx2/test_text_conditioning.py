@@ -1,4 +1,4 @@
-"""Encoder-neutral text-conditioning station and provenance contracts."""
+"""Encoder-neutral text-conditioning stage and provenance contracts."""
 
 from pathlib import Path
 from types import SimpleNamespace
@@ -10,13 +10,13 @@ import kinomlx.models.ltx2.text_conditioning as text_module
 from kinomlx.memory_policy import MLXMemoryPolicy
 from kinomlx.models.ltx2.resources import ComponentKind
 from kinomlx.models.ltx2.text_conditioning import (
-    NativeTextConditioner,
-    TextConditioningProvenance,
+    LTX2TextConditioner,
+    LTX2TextConditioningProvenance,
     text_conditioning_provenance,
 )
 from kinomlx.models.ltx2.text_encoder.encoder import AudioVideoGemmaEncoderOutput
 from kinomlx.models.ltx2.text_encoder.tokenizer_derivation import derive_tokenizer
-from kinomlx.models.ltx2.types import DistilledRequest
+from kinomlx.models.ltx2.types import LTX2Request
 
 from .text_encoder._tokenizer_fixtures import tokenizer_json
 
@@ -35,12 +35,12 @@ class _Resources:
     def __init__(
         self,
         *,
-        gemma_path: Path | None = Path("gemma"),
+        text_encoder_path: Path | None = Path("gemma"),
         generation: str = "ltx-2.3",
         tokenizer_source: Path | None = None,
     ) -> None:
         if tokenizer_source is not None:
-            gemma_path = tokenizer_source
+            text_encoder_path = tokenizer_source
         self.capabilities = SimpleNamespace(
             model_generation=generation,
             text_encoder_family=(
@@ -51,10 +51,10 @@ class _Resources:
         self.components = {
             ComponentKind.TEXT_ENCODER: (
                 None
-                if gemma_path is None
+                if text_encoder_path is None
                 else SimpleNamespace(
                     kind=ComponentKind.TEXT_ENCODER,
-                    source_path=gemma_path,
+                    source_path=text_encoder_path,
                     source_fingerprint="text-fingerprint",
                     metadata=_Metadata("gemma4-12b-ltx"),
                 )
@@ -80,7 +80,7 @@ class _Resources:
         }
 
     @property
-    def gemma_path(self) -> Path | None:
+    def text_encoder_path(self) -> Path | None:
         text = self.components[ComponentKind.TEXT_ENCODER]
         return None if text is None else text.source_path
 
@@ -112,8 +112,8 @@ def _encoded(tokens: int = 2) -> AudioVideoGemmaEncoderOutput:
     )
 
 
-def _provenance() -> TextConditioningProvenance:
-    return TextConditioningProvenance(
+def _provenance() -> LTX2TextConditioningProvenance:
+    return LTX2TextConditioningProvenance(
         model_generation="ltx-2.3",
         text_encoder_identity="gemma-3-12b-it",
         projection_identity="ltx-2.3-av-connectors:connector-fingerprint",
@@ -143,7 +143,7 @@ def test_legacy_sidecar_identity_is_accepted_only_for_ltx23(tmp_path: Path) -> N
     assert _provenance().is_compatible_with(expected_23)
 
     expected_25 = text_conditioning_provenance(_Resources(generation="2.5", tokenizer_source=cache))
-    legacy_25 = TextConditioningProvenance(
+    legacy_25 = LTX2TextConditioningProvenance(
         model_generation="2.5",
         text_encoder_identity=expected_25.text_encoder_identity,
         projection_identity=expected_25.projection_identity,
@@ -178,8 +178,8 @@ def test_ltx25_incompatible_schema3_sidecar_fails_before_prompt_models(
     )
 
     with pytest.raises(ValueError, match="provenance does not match"):
-        NativeTextConditioner()(
-            DistilledRequest(text_conditioning=sidecar),
+        LTX2TextConditioner()(
+            LTX2Request(text_conditioning=sidecar),
             resources,
         )
 
@@ -197,8 +197,8 @@ def test_schema3_replay_does_not_derive_tokenizer(monkeypatch, tmp_path: Path) -
         "load_text_conditioning",
         lambda *_args, **_kwargs: (_encoded(), metadata),
     )
-    result = NativeTextConditioner()(
-        DistilledRequest(text_conditioning=tmp_path / "text.safetensors"),
+    result = LTX2TextConditioner()(
+        LTX2Request(text_conditioning=tmp_path / "text.safetensors"),
         resources,
     )
     assert result.replay_receipt["identity_match"] is True
@@ -222,9 +222,9 @@ def test_saved_conditioning_bypasses_prompt_models(monkeypatch, tmp_path: Path) 
         lambda *_args, **_kwargs: pytest.fail("saved conditioning must not load Gemma"),
     )
 
-    result = NativeTextConditioner()(
-        DistilledRequest(text_conditioning=sidecar),
-        _Resources(gemma_path=None),
+    result = LTX2TextConditioner()(
+        LTX2Request(text_conditioning=sidecar),
+        _Resources(text_encoder_path=None),
     )
 
     assert result.prompt == "saved prompt"
@@ -251,8 +251,8 @@ def test_incompatible_sidecar_fails_before_prompt_encoding(monkeypatch, tmp_path
     )
 
     with pytest.raises(ValueError, match="provenance does not match"):
-        NativeTextConditioner()(
-            DistilledRequest(text_conditioning=sidecar),
+        LTX2TextConditioner()(
+            LTX2Request(text_conditioning=sidecar),
             _Resources(),
         )
 
@@ -285,8 +285,8 @@ def test_restart_replay_observes_identity_mismatch_without_veto(
     )
 
     with caplog.at_level("WARNING", logger="kinomlx.models.ltx2.text_conditioning"):
-        result = NativeTextConditioner(replay_identity_policy="observe")(
-            DistilledRequest(text_conditioning=sidecar),
+        result = LTX2TextConditioner(replay_identity_policy="observe")(
+            LTX2Request(text_conditioning=sidecar),
             _Resources(),
         )
 
@@ -298,21 +298,21 @@ def test_restart_replay_observes_identity_mismatch_without_veto(
     assert "identity is advisory during restart" in caplog.text
 
 
-def test_prompt_station_delegates_concrete_encoder_selection_to_resources(monkeypatch) -> None:
+def test_prompt_stage_delegates_concrete_encoder_selection_to_resources(monkeypatch) -> None:
     calls = []
     monkeypatch.setattr(
         text_module,
         "encode_text",
         lambda prompt, **kwargs: calls.append((prompt, kwargs)) or _encoded(),
     )
-    request = DistilledRequest(prompt="a lighthouse", pad_prompt_to_max=False)
+    request = LTX2Request(prompt="a lighthouse", pad_prompt_to_max=False)
 
-    result = NativeTextConditioner()(request, _Resources())
+    result = LTX2TextConditioner()(request, _Resources())
 
     assert result.prompt == "a lighthouse"
     assert result.provenance == _provenance()
     assert calls[0][0] == "a lighthouse"
-    assert calls[0][1]["gemma_path"] == Path("gemma")
+    assert calls[0][1]["text_encoder_path"] == Path("gemma")
     assert calls[0][1]["connector_path"] == Path("transformer.safetensors")
     assert calls[0][1]["projection_path"] == Path("text.safetensors")
     assert calls[0][1]["config_path"] == Path("transformer.safetensors")
@@ -320,7 +320,7 @@ def test_prompt_station_delegates_concrete_encoder_selection_to_resources(monkey
     assert calls[0][1]["pad_prompt_to_max"] is False
 
 
-def test_ltx25_prompt_station_selects_packaged_text_projection_and_connectors(
+def test_ltx25_prompt_stage_selects_packaged_text_projection_and_connectors(
     monkeypatch,
     tmp_path: Path,
 ) -> None:
@@ -331,25 +331,25 @@ def test_ltx25_prompt_station_selects_packaged_text_projection_and_connectors(
         lambda prompt, **kwargs: calls.append((prompt, kwargs)) or _encoded(),
     )
     resources = _Resources(
-        gemma_path=Path("text.safetensors"),
+        text_encoder_path=Path("text.safetensors"),
         generation="2.5",
         tokenizer_source=_tokenizer_source(tmp_path),
     )
 
-    NativeTextConditioner()(DistilledRequest(prompt="a lighthouse"), resources)
+    LTX2TextConditioner()(LTX2Request(prompt="a lighthouse"), resources)
 
-    assert calls[0][1]["gemma_path"] == tmp_path / "tokenizer.json"
+    assert calls[0][1]["text_encoder_path"] == tmp_path / "tokenizer.json"
     assert calls[0][1]["projection_path"] == Path("text.safetensors")
     assert calls[0][1]["connector_path"] == Path("transformer.safetensors")
     assert calls[0][1]["config_path"] == Path("transformer.safetensors")
     assert calls[0][1]["model_generation"] == "2.5"
 
 
-def test_prompt_station_requires_the_selected_encoder_assets() -> None:
+def test_prompt_stage_requires_the_selected_encoder_assets() -> None:
     with pytest.raises(FileNotFoundError, match="no local gemma-3-12b-it"):
-        NativeTextConditioner()(
-            DistilledRequest(prompt="a lighthouse"),
-            _Resources(gemma_path=None),
+        LTX2TextConditioner()(
+            LTX2Request(prompt="a lighthouse"),
+            _Resources(text_encoder_path=None),
         )
 
 
@@ -364,16 +364,16 @@ def test_empty_prompt_saved_conditioning_contract(monkeypatch, tmp_path, policy,
         "load_text_conditioning",
         lambda *a, **k: (_encoded(4), metadata),
     )
-    request = DistilledRequest(
+    request = LTX2Request(
         text_conditioning=tmp_path / "text.safetensors",
         prompt_unconditional=True,
     )
-    conditioner = NativeTextConditioner(replay_identity_policy=policy)
+    conditioner = LTX2TextConditioner(replay_identity_policy=policy)
     if prompt == "":
-        assert conditioner(request, _Resources(gemma_path=None)).prompt == ""
+        assert conditioner(request, _Resources(text_encoder_path=None)).prompt == ""
     else:
         with pytest.raises(ValueError, match="empty saved"):
-            conditioner(request, _Resources(gemma_path=None))
+            conditioner(request, _Resources(text_encoder_path=None))
 
 
 @pytest.mark.parametrize("generation", ["ltx-2.3", "2.5"])

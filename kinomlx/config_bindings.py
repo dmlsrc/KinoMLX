@@ -4,8 +4,10 @@ import argparse
 import types
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
-from pathlib import Path
+from enum import StrEnum
 from typing import Annotated, Literal, TypeAliasType, Union, get_args, get_origin
+
+from kinomlx.config_transport import CLI_PARSED_SCALARS, enum_vocabulary
 
 
 def argument_value[T](parse: Callable[[str], T], name: str) -> Callable[[str], T]:
@@ -42,9 +44,28 @@ def _scalar_types(annotation: object, *, repeated: bool) -> set[type[object]]:
         if origin is tuple and (len(arguments) != 2 or arguments[1] is not Ellipsis):
             raise TypeError(f"CLI binding needs a codec for {annotation!r}")
         return _scalar_types(arguments[0], repeated=False)
-    if annotation in (str, int, float, Path) and isinstance(annotation, type):
+    if enum_vocabulary(annotation) is not None:
+        return {str}
+    if annotation in CLI_PARSED_SCALARS and isinstance(annotation, type):
         return {annotation}
     raise TypeError(f"CLI binding needs a codec for {annotation!r}")
+
+
+class CliAction(StrEnum):
+    """The argparse actions this project supports, plus the two it adds.
+
+    Four of these are argparse's own spellings and are forwarded verbatim, so
+    their values are not ours to rename. Which four are supported is our
+    decision, and ``boolean`` and ``paired_boolean`` are ours entirely: they
+    expand into a pair of flags before argparse ever sees them.
+    """
+
+    STORE = "store"
+    APPEND = "append"
+    BOOLEAN = "boolean"
+    STORE_TRUE = "store_true"
+    STORE_FALSE = "store_false"
+    PAIRED_BOOLEAN = "paired_boolean"
 
 
 @dataclass(frozen=True)
@@ -57,10 +78,7 @@ class CliBinding:
 
     group: str
     flags: tuple[str, ...] = ()
-    action: (
-        Literal["store", "append", "boolean", "store_true", "store_false", "paired_boolean"]
-        | type[argparse.Action]
-    ) = "store"
+    action: CliAction | type[argparse.Action] = CliAction.STORE
     parse: Callable[[str], object] | None = None
     nargs: int | Literal["?", "+", "*"] | None = None
     const: object = None
@@ -69,14 +87,7 @@ class CliBinding:
 
     def __post_init__(self) -> None:
         if isinstance(self.action, str):
-            if self.action not in (
-                "store",
-                "append",
-                "boolean",
-                "store_true",
-                "store_false",
-                "paired_boolean",
-            ):
+            if self.action not in CliAction:
                 raise ValueError(f"unsupported CLI action {self.action!r}")
         elif not isinstance(self.action, type) or not issubclass(self.action, argparse.Action):
             raise TypeError("CLI action must be a supported action or argparse.Action class")
@@ -86,7 +97,7 @@ class CliBinding:
             and (type(self.nargs) is not int or self.nargs < 1)
         ):
             raise ValueError("CLI arity must be positive or ?, +, *")
-        if self.negative_flags and self.action != "paired_boolean":
+        if self.negative_flags and self.action != CliAction.PAIRED_BOOLEAN:
             raise ValueError("negative CLI flags require a paired boolean action")
         if self.negative_flags:
             all_flags = self.flags + self.negative_flags
@@ -129,15 +140,10 @@ class CliBinding:
         if len(scalars) != 1:
             raise TypeError(f"CLI binding needs a codec for {annotation!r}")
         scalar = scalars.pop()
-        if scalar is str:
-            return str
-        if scalar is int:
-            return int
-        if scalar is float:
-            return float
-        if scalar is Path:
-            return Path
-        raise TypeError(f"unsupported CLI scalar type {scalar!r}")
+        if scalar not in CLI_PARSED_SCALARS:
+            raise TypeError(f"unsupported CLI scalar type {scalar!r}")
+        # Each parsed scalar constructs from one string, so it is its own parser.
+        return scalar
 
     def add_argument(
         self,
@@ -201,7 +207,7 @@ class CliBinding:
         )
         flags = self.option_strings(action.dest)
         if self.action == "boolean":
-            flags = tuple(option for flag in flags for option in (flag, "--no-" + flag[2:]))
+            flags = tuple(*(flag, "--no-" + flag[2:]) for flag in flags)
         expected_nargs = (
             0
             if self.action in ("boolean", "store_true", "store_false", "paired_boolean")
@@ -227,8 +233,8 @@ class CliBinding:
             "--no-" + flag.removeprefix("--") for flag in self.option_strings(destination)
         )
         return (
-            replace(self, action="store_true", negative_flags=()),
-            replace(self, action="store_false", flags=negative, negative_flags=()),
+            replace(self, action=CliAction.STORE_TRUE, negative_flags=()),
+            replace(self, action=CliAction.STORE_FALSE, flags=negative, negative_flags=()),
         )
 
     def add_arguments(

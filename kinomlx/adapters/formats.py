@@ -9,49 +9,56 @@ import math
 import re
 from collections.abc import Collection, Mapping
 from dataclasses import dataclass
+from enum import StrEnum
 from typing import Literal, cast
 
 import mlx.core as mx
 
-type AdapterKind = Literal[
-    "lora",
-    "adalora",
-    "loha",
-    "lokr",
-    "glora",
-    "glora_peft",
-    "fourierft",
-    "ia3",
-    "ia3_peft",
-    "oft",
-    "boft",
-    "oft_peft",
-    "boft_peft",
-    "hra",
-    "full",
-    "norm",
-    "set",
-    "beft",
-    "hira",
-    "delora",
-    "c3a",
-    "miss",
-    "road",
-    "gralora",
-    "peanut",
-    "deft",
-    "shira",
-    "supertuning",
-    "vera",
-    "pvera",
-    "randlora",
-    "vblora",
-    "unilora",
-    "tinylora",
-    "bdlora",
-    "qalora",
-    "waveft",
-]
+
+class AdapterKind(StrEnum):
+    """Every adapter format this project can parse and fuse.
+
+    Membership is decided here, not by an upstream release, because a
+    format only becomes parseable once its math is implemented.
+    """
+
+    LORA = "lora"
+    ADALORA = "adalora"
+    LOHA = "loha"
+    LOKR = "lokr"
+    GLORA = "glora"
+    GLORA_PEFT = "glora_peft"
+    FOURIERFT = "fourierft"
+    IA3 = "ia3"
+    IA3_PEFT = "ia3_peft"
+    OFT = "oft"
+    BOFT = "boft"
+    OFT_PEFT = "oft_peft"
+    BOFT_PEFT = "boft_peft"
+    HRA = "hra"
+    FULL = "full"
+    NORM = "norm"
+    SET = "set"
+    BEFT = "beft"
+    HIRA = "hira"
+    DELORA = "delora"
+    C3A = "c3a"
+    MISS = "miss"
+    ROAD = "road"
+    GRALORA = "gralora"
+    PEANUT = "peanut"
+    DEFT = "deft"
+    SHIRA = "shira"
+    SUPERTUNING = "supertuning"
+    VERA = "vera"
+    PVERA = "pvera"
+    RANDLORA = "randlora"
+    VBLORA = "vblora"
+    UNILORA = "unilora"
+    TINYLORA = "tinylora"
+    BDLORA = "bdlora"
+    QALORA = "qalora"
+    WAVEFT = "waveft"
 
 
 @dataclass(frozen=True)
@@ -289,34 +296,34 @@ def _validate_structure(operation: AdapterOperation) -> None:
         if role != "on_input" and value.dtype not in (mx.float32, mx.float16, mx.bfloat16):
             raise ValueError(f"adapter {operation.prefix!r} factor {role!r} must be floating point")
     pairs: list[tuple[str, str, str | None]] = []
-    if operation.kind in ("lora", "adalora"):
+    if operation.kind in (AdapterKind.LORA, AdapterKind.ADALORA):
         if operation.part == "bias":
             if factors["down"].ndim < 2 or factors["up_bias"].ndim != 1:
                 raise ValueError("LoRA B bias must be a vector with a valid down factor")
         else:
             pairs = [("up", "down", "mid")]
-        if operation.kind == "adalora":
+        if operation.kind == AdapterKind.ADALORA:
             if factors["down"].ndim != 2 or factors["up"].ndim != 2:
                 raise ValueError("AdaLoRA requires two-dimensional factors")
             rank = factors["down"].shape[0]
             if factors["diagonal"].shape != (rank, 1):
                 raise ValueError("AdaLoRA singular values must have shape (rank, 1)")
-    elif operation.kind == "loha":
+    elif operation.kind == AdapterKind.LOHA:
         pairs = [(f"hada_w{i}_a", f"hada_w{i}_b", f"hada_t{i}") for i in (1, 2)]
-    elif operation.kind == "lokr":
+    elif operation.kind == AdapterKind.LOKR:
         pairs = [
             (f"lokr_w{i}_a", f"lokr_w{i}_b", "lokr_t2" if i == 2 else None)
             for i in (1, 2)
             if f"lokr_w{i}" not in factors
         ]
-    elif operation.kind == "glora":
+    elif operation.kind == AdapterKind.GLORA:
         pairs = [("a1", "a2", None), ("b1", "b2", "bm")]
     for up_key, down_key, mid_key in pairs:
         up, down = factors[up_key], factors[down_key]
         if up.ndim < 2 or down.ndim < 2:
             raise ValueError(f"adapter {operation.prefix!r} factors must have at least two axes")
         mid = None if mid_key is None else factors.get(mid_key)
-        transposed_up = mid is not None and operation.kind in ("loha", "lokr")
+        transposed_up = mid is not None and operation.kind in (AdapterKind.LOHA, AdapterKind.LOKR)
         up_rank = up.shape[0 if transposed_up else 1]
         if mid is None:
             if up_rank != down.shape[0]:
@@ -340,7 +347,10 @@ def _operation(
     if rank_denominator is not None and rank_denominator < 0:
         raise ValueError("AdaLoRA ranknum must be nonnegative")
     biases: list[AdapterOperation] = []
-    bias_roles: tuple[tuple[str, AdapterKind], ...] = (("diff_b", "full"), ("b_norm", "norm"))
+    bias_roles: tuple[tuple[str, AdapterKind], ...] = (
+        ("diff_b", AdapterKind.FULL),
+        ("b_norm", AdapterKind.NORM),
+    )
     for role, bias_kind in bias_roles:
         if role in remaining:
             bias = remaining.pop(role)
@@ -355,13 +365,13 @@ def _operation(
         return biases
 
     signatures: tuple[tuple[AdapterKind, frozenset[str]], ...] = (
-        ("lora", frozenset({"down", "up", "mid", "up_bias", "diagonal"})),
+        (AdapterKind.LORA, frozenset({"down", "up", "mid", "up_bias", "diagonal"})),
         (
-            "loha",
+            AdapterKind.LOHA,
             frozenset({"hada_w1_a", "hada_w1_b", "hada_w2_a", "hada_w2_b", "hada_t1", "hada_t2"}),
         ),
         (
-            "lokr",
+            AdapterKind.LOKR,
             frozenset(
                 {
                     "lokr_w1",
@@ -374,23 +384,23 @@ def _operation(
                 }
             ),
         ),
-        ("glora", frozenset({"a1", "a2", "b1", "b2", "bm"})),
-        ("ia3", frozenset({"on_input"})),
-        ("ia3_peft", frozenset({"ia3_vector"})),
-        ("oft", frozenset({"oft_blocks"})),
-        ("oft_peft", frozenset({"oft_packed", "oft_legacy", "oft_scale"})),
-        ("boft_peft", frozenset({"boft_rotation", "boft_scale"})),
-        ("hra", frozenset({"hra_vectors"})),
-        ("fourierft", frozenset({"spectrum"})),
+        (AdapterKind.GLORA, frozenset({"a1", "a2", "b1", "b2", "bm"})),
+        (AdapterKind.IA3, frozenset({"on_input"})),
+        (AdapterKind.IA3_PEFT, frozenset({"ia3_vector"})),
+        (AdapterKind.OFT, frozenset({"oft_blocks"})),
+        (AdapterKind.OFT_PEFT, frozenset({"oft_packed", "oft_legacy", "oft_scale"})),
+        (AdapterKind.BOFT_PEFT, frozenset({"boft_rotation", "boft_scale"})),
+        (AdapterKind.HRA, frozenset({"hra_vectors"})),
+        (AdapterKind.FOURIERFT, frozenset({"spectrum"})),
         (
-            "glora_peft",
+            AdapterKind.GLORA_PEFT,
             frozenset(
                 f"glora_{label}_{part}" for label in "ABCDE" for part in ("Xd", "Xu", "X", "zeros")
             ),
         ),
-        ("full", frozenset({"diff"})),
-        ("norm", frozenset({"w_norm"})),
-        ("set", frozenset({"set_weight"})),
+        (AdapterKind.FULL, frozenset({"diff"})),
+        (AdapterKind.NORM, frozenset({"w_norm"})),
+        (AdapterKind.SET, frozenset({"set_weight"})),
     )
     found = [kind for kind, roles in signatures if roles & remaining.keys()]
     if len(found) != 1:
@@ -398,23 +408,23 @@ def _operation(
             f"adapter {prefix!r} has ambiguous or unsupported factors: {sorted(remaining)}"
         )
     kind = found[0]
-    if kind == "lora" and "diagonal" in remaining:
-        kind = "adalora"
-    if rank_value is not None and kind != "adalora":
+    if kind == AdapterKind.LORA and "diagonal" in remaining:
+        kind = AdapterKind.ADALORA
+    if rank_value is not None and kind != AdapterKind.ADALORA:
         raise ValueError("ranknum is only defined for AdaLoRA")
     required: set[str]
     optional: set[str] = set()
-    if kind == "lora":
+    if kind == AdapterKind.LORA:
         required = {"down", "up"}
         optional = {"mid", "up_bias", "magnitude"}
-    elif kind == "adalora":
+    elif kind == AdapterKind.ADALORA:
         required = {"down", "up", "diagonal"}
-    elif kind == "loha":
+    elif kind == AdapterKind.LOHA:
         required = {"hada_w1_a", "hada_w1_b", "hada_w2_a", "hada_w2_b"}
         optional = {"hada_t1", "hada_t2", "magnitude"}
         if ("hada_t1" in remaining) != ("hada_t2" in remaining):
             raise ValueError(f"adapter {prefix!r} needs both LoHa Tucker factors")
-    elif kind == "lokr":
+    elif kind == AdapterKind.LOKR:
         required = set()
         optional = {"lokr_t2", "magnitude"}
         for side in ("lokr_w1", "lokr_w2"):
@@ -424,30 +434,30 @@ def _operation(
                 required.update({f"{side}_a", f"{side}_b"})
         if "lokr_t2" in remaining and "lokr_w2" in remaining:
             raise ValueError(f"adapter {prefix!r} mixes dense LoKr W2 and Tucker factors")
-    elif kind == "glora":
+    elif kind == AdapterKind.GLORA:
         required = {"a1", "a2", "b1", "b2"}
         optional = {"bm"}
-    elif kind == "ia3":
+    elif kind == AdapterKind.IA3:
         required = {"weight", "on_input"}
         flag = _scalar(remaining["on_input"], keys["on_input"])
         if flag not in (0.0, 1.0):
             raise ValueError(f"adapter {prefix!r} IA3 on_input must be 0 or 1")
-    elif kind == "ia3_peft":
+    elif kind == AdapterKind.IA3_PEFT:
         required = {"ia3_vector"}
-    elif kind == "oft":
+    elif kind == AdapterKind.OFT:
         required = {"oft_blocks"}
         optional = {"rescale"}
         if remaining["oft_blocks"].ndim == 4:
-            kind = "boft"
-    elif kind == "oft_peft":
+            kind = AdapterKind.BOFT
+    elif kind == AdapterKind.OFT_PEFT:
         required = {"oft_legacy", "oft_scale"} if "oft_legacy" in remaining else {"oft_packed"}
-    elif kind == "boft_peft":
+    elif kind == AdapterKind.BOFT_PEFT:
         required = {"boft_rotation", "boft_scale"}
-    elif kind == "hra":
+    elif kind == AdapterKind.HRA:
         required = {"hra_vectors"}
-    elif kind == "fourierft":
+    elif kind == AdapterKind.FOURIERFT:
         required = {"spectrum"}
-    elif kind == "glora_peft":
+    elif kind == AdapterKind.GLORA_PEFT:
         required = set()
         for label in "ABCDE":
             roles = {role for role in remaining if role.startswith(f"glora_{label}_")}
@@ -494,7 +504,7 @@ def _operation(
         biases.append(
             AdapterOperation(
                 prefix,
-                "lora",
+                AdapterKind.LORA,
                 "bias",
                 {"up_bias": remaining.pop("up_bias"), "down": remaining["down"]},
                 (keys["up_bias"],),
@@ -537,7 +547,7 @@ def parse_adapter(
                 named_adapters.add(saved.adapter_name)
             role = "delta" if saved.part == "bias" else "set_weight"
             operations.append(
-                AdapterOperation(saved.prefix, "set", saved.part, {role: value}, (key,))
+                AdapterOperation(saved.prefix, AdapterKind.SET, saved.part, {role: value}, (key,))
             )
             continue
         matched = split_factor_key(key)
@@ -588,14 +598,14 @@ def validate_inventory_values(
     empty = set(allow_empty) | {
         key
         for operation in inventory.operations
-        if operation.kind == "adalora" and operation.factors["down"].shape[0] == 0
+        if operation.kind == AdapterKind.ADALORA and operation.factors["down"].shape[0] == 0
         for key in operation.source_keys
     }
     validate_adapter_values(weights, allow_empty=empty)
     disabled = [
         mx.all(value == 0)
         for operation in inventory.operations
-        if operation.kind == "glora_peft"
+        if operation.kind == AdapterKind.GLORA_PEFT
         for role, value in operation.factors.items()
         if role.endswith("_zeros")
     ]

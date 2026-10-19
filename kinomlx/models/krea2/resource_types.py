@@ -5,12 +5,14 @@ from enum import StrEnum
 from functools import cached_property
 from pathlib import Path
 
+from kinomlx._json import JsonObject
 from kinomlx.io.identity import object_digest, payload_digest
 from kinomlx.memory_policy import MLXMemoryPolicy
+from kinomlx.modeling.dtypes import DTypePolicy
 from kinomlx.tokenizers.byte_bpe import ByteBPETables
 from kinomlx.tokenizers.loading import load_tokenizer_tables
 
-from .catalog import Krea2VAEDecoder, Krea2Variant
+from .catalog import Krea2VAEDecoder, Krea2Variant, variant_spec
 from .metadata import (
     Krea2ModelIndex,
     Krea2SchedulerConfig,
@@ -18,7 +20,7 @@ from .metadata import (
     Krea2TransformerConfig,
     Krea2VAEConfig,
 )
-from .settings import OPTIMIZED_DENOISE_MODE
+from .settings import denoise_mode
 
 
 class Krea2ComponentKind(StrEnum):
@@ -51,7 +53,7 @@ class Krea2ComponentResource:
     layout: str
     source_fingerprint: str
     graph_fingerprint: str
-    dtype_policy: str
+    dtype_policy: DTypePolicy
     tensor_count: int
     bindings: tuple[Krea2TensorBinding, ...] = ()
     tokenizer_json: Path | None = None
@@ -126,30 +128,51 @@ class Krea2Resources:
     def components(self) -> tuple[Krea2ComponentResource, ...]:
         return (self.tokenizer, self.text_encoder, self.transformer, self.vae)
 
-    def to_dict(self) -> dict[str, object]:
-        """Return the compact CLI preparation receipt."""
+    @property
+    def denoise_mode(self) -> str:
+        return denoise_mode(self.reference_denoise)
+
+    def describe(self) -> JsonObject:
+        """Report every resolved source a generation would consume.
+
+        This is the one Krea resource report: a dry run prints it, and a
+        preparation run records it. The steps and guidance below are the
+        variant's recipe defaults, which a request may override; the
+        identities are what this invocation would actually bind, so two runs
+        can be compared without loading tensors.
+        """
+        spec = variant_spec(self.variant)
         return {
+            "model": "krea2",
             "variant": self.variant.value,
             "revision": self.revision,
             "source_root": None if self.source_root is None else str(self.source_root),
             "recipe_identity": self.recipe_identity,
-            "denoise_mode": "reference" if self.reference_denoise else OPTIMIZED_DENOISE_MODE,
+            "steps": spec.default_steps,
+            "guidance": spec.default_guidance,
+            "is_distilled": self.capabilities.is_distilled,
+            "denoise_mode": self.denoise_mode,
             "vae_decoder": {
                 "name": self.vae_decoder.value,
                 "output_scale": self.vae_decoder.output_scale,
             },
-            "is_distilled": self.capabilities.is_distilled,
-            "components": {
-                component.kind.value: {
-                    "source": str(component.source_path),
-                    "source_fingerprint": component.source_fingerprint,
-                    "layout": component.layout,
-                    "source_tensors": component.tensor_count,
-                    "consumed_tensors": component.consumed_tensor_count,
-                }
-                for component in self.components
-            },
+            "check_adapter_weights": self.check_adapter_weights,
+            "components": [_describe_component(component) for component in self.components],
         }
+
+
+def _describe_component(component: Krea2ComponentResource) -> JsonObject:
+    return {
+        "kind": component.kind.value,
+        "dtype": component.dtype_policy,
+        "source": str(component.source_path),
+        "source_identity": component.source_fingerprint,
+        "graph_identity": component.graph_fingerprint,
+        "layout": component.layout,
+        "source_tensors": component.tensor_count,
+        "runtime_tensors": component.consumed_tensor_count,
+        "excluded_tensors": component.tensor_count - component.consumed_tensor_count,
+    }
 
 
 __all__ = [

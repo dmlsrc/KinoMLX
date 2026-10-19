@@ -25,16 +25,16 @@ from kinomlx.io.safetensors import load_weights
 from kinomlx.models.ltx2.adapters.inputs import LTX2AdapterConfig
 from kinomlx.models.ltx2.arguments import build_parser
 from kinomlx.models.ltx2.artifacts import FINAL_LATENTS, TEXT_CONDITIONING
-from kinomlx.models.ltx2.components import NativeLTX2Components
+from kinomlx.models.ltx2.components import LTX2Components
 from kinomlx.models.ltx2.config import assemble
 from kinomlx.models.ltx2.pipelines.distilled import (
-    generate_distilled,
+    generate_ltx2,
     prepare_text_conditioning,
 )
 from kinomlx.models.ltx2.resources import ComponentKind, LTX2Resources, prepare_resources
 from kinomlx.models.ltx2.runner import LTX2Runner
-from kinomlx.models.ltx2.text_conditioning import EncodedTextConditioning
-from kinomlx.models.ltx2.types import DistilledRequest
+from kinomlx.models.ltx2.text_conditioning import LTX2EncodedTextConditioning
+from kinomlx.models.ltx2.types import LTX2Request
 from kinomlx.models.ltx2.upscaler.temporal import temporal_upsample_video
 from kinomlx.reporting import TimingReporter
 
@@ -48,7 +48,6 @@ _OFFICIAL_LORA = "ltx-2.5-22b-distilled-lora-450-bf16.safetensors"
 _DEV_TRANSFORMER = "ltx-2.5-22b-dev-transformer-bf16.safetensors"
 _MODEL_SOURCE_FIELDS = (
     "weights_path",
-    "gemma_path",
     "spatial_upscaler_path",
     "transformer_path",
     "text_encoder_path",
@@ -169,7 +168,7 @@ def _split_dev_resources(invocation: Any, base: LTX2Resources) -> LTX2Resources:
 
 @dataclass(frozen=True)
 class _InjectedTextConditioner:
-    text: EncodedTextConditioning
+    text: LTX2EncodedTextConditioning
 
     def __call__(self, request, resources, *, reporter=None):
         del request, resources, reporter
@@ -179,7 +178,7 @@ class _InjectedTextConditioner:
 def _prepare_injected_text(
     resources: LTX2Resources,
     path: Path,
-) -> tuple[EncodedTextConditioning, dict[str, Any]]:
+) -> tuple[LTX2EncodedTextConditioning, dict[str, Any]]:
     events = RecordingReporter()
     timing = TimingReporter(events)
     sink = SidecarArtifactSink(
@@ -189,7 +188,7 @@ def _prepare_injected_text(
     )
     started = time.perf_counter()
     text = prepare_text_conditioning(
-        DistilledRequest(
+        LTX2Request(
             prompt=_PROMPT,
             width=_WIDTH,
             height=_HEIGHT,
@@ -219,7 +218,7 @@ def _prepare_injected_text(
 
 def _component_canaries(resources: LTX2Resources) -> dict[str, Any]:
     fixture = json.loads(_COMPONENT_ORACLE.read_text(encoding="utf-8"))
-    components = NativeLTX2Components()
+    components = LTX2Components()
     duration_fixture = fixture["duration"]
     if _sha256(resources.duration_head_path) != duration_fixture["artifact_sha256"]:
         raise AssertionError("duration-head artifact differs from the pinned oracle")
@@ -266,11 +265,11 @@ def _component_canaries(resources: LTX2Resources) -> dict[str, Any]:
     ).reshape(temporal_fixture["input_shape"])
     with components.temporal_upscaler(resources) as upscaler:
         raw = upscaler(mx.array(latent).astype(mx.bfloat16)).astype(mx.float32)
-        station = temporal_upsample_video(
+        stage = temporal_upsample_video(
             mx.array(latent).astype(mx.bfloat16),
             upscaler,
         ).astype(mx.float32)
-        mx.eval(raw, station)
+        mx.eval(raw, stage)
     if list(raw.shape) != temporal_fixture["output_shape"]:
         raise AssertionError(f"unexpected temporal output shape {tuple(raw.shape)}")
     raw_values = np.asarray(raw).reshape(-1)
@@ -281,18 +280,18 @@ def _component_canaries(resources: LTX2Resources) -> dict[str, Any]:
         rtol=0.0,
         atol=temporal_fixture["anchor_atol"],
     )
-    if not bool(mx.all(mx.isfinite(station)).item()):
-        raise AssertionError("temporal public station returned nonfinite values")
+    if not bool(mx.all(mx.isfinite(stage)).item()):
+        raise AssertionError("temporal public stage returned nonfinite values")
     temporal_receipt = {
         "artifact_sha256": temporal_fixture["artifact_sha256"],
         "raw_shape": list(raw.shape),
         "raw_mean": float(np.mean(raw_values)),
         "raw_peak": float(np.max(np.abs(raw_values))),
         "raw_rms": float(np.sqrt(np.mean(np.square(raw_values)))),
-        "station_shape": list(station.shape),
-        "station_finite": True,
+        "stage_shape": list(stage.shape),
+        "stage_finite": True,
     }
-    del raw, station
+    del raw, stage
     _release_mlx()
     return {"duration": duration_receipt, "temporal_upscaler": temporal_receipt}
 
@@ -339,7 +338,7 @@ def _latent_summary(path: Path, *, frame_count: int) -> dict[str, Any]:
 def _run_case(
     name: str,
     resources: LTX2Resources,
-    text: EncodedTextConditioning,
+    text: LTX2EncodedTextConditioning,
     output_dir: Path,
     *,
     frames: int | None,
@@ -354,7 +353,7 @@ def _run_case(
         enabled={FINAL_LATENTS},
         reporter=timing,
     )
-    request = DistilledRequest(
+    request = LTX2Request(
         prompt=_PROMPT,
         width=_WIDTH,
         height=_HEIGHT,
@@ -374,7 +373,7 @@ def _run_case(
     peak_reset = _reset_peak_memory()
     memory_before = _memory_snapshot()
     started = time.perf_counter()
-    output = runner.run(generate_distilled, request)
+    output = runner.run(generate_ltx2, request)
     elapsed = time.perf_counter() - started
     frame_count = output.frame_count
     metadata = _json_value(output.metadata)

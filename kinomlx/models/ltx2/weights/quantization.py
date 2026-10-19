@@ -5,10 +5,7 @@ from typing import cast
 import mlx.core as mx
 
 import kinomlx._mlx_nn as nn
-from kinomlx.models.ltx2.weights.schema import (
-    TRANSFORMER_QUANTIZE_MXFP8_BLOCKS,
-    TRANSFORMER_QUANTIZE_MXFP8_BLOCKS_PRETRANSPOSE,
-)
+from kinomlx.models.ltx2.weights.schema import TransformerQuantize
 from kinomlx.models.ltx2.weights.tensors import (
     QUANTIZED_BLOCK_LINEAR_BASES,
     quant_defaults,
@@ -208,8 +205,8 @@ def _quant_mode_for_base(
     if (
         transformer_quantize
         in {
-            TRANSFORMER_QUANTIZE_MXFP8_BLOCKS,
-            TRANSFORMER_QUANTIZE_MXFP8_BLOCKS_PRETRANSPOSE,
+            TransformerQuantize.MXFP8_BLOCKS,
+            TransformerQuantize.MXFP8_BLOCKS_PRETRANSPOSE,
         }
         and base in QUANTIZED_BLOCK_LINEAR_BASES
     ):

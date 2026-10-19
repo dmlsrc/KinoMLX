@@ -9,7 +9,7 @@ import pytest
 
 from kinomlx.config import dataclass_from_mapping, dataclass_to_mapping
 from kinomlx.config_records import config_record, record_intent, replace_config, supplied_fields
-from kinomlx.models.ltx2.types import ImageConditioningConfig, VideoVAETilingConfig
+from kinomlx.models.ltx2.types import LTX2ImageConditioningConfig, LTX2VideoVAETilingConfig
 
 
 @config_record
@@ -119,11 +119,11 @@ def test_collection_replacement_does_not_retain_prior_item_presence():
 
 
 def test_existing_ltx_records_preserve_public_constructor_and_track_geometry():
-    image = ImageConditioningConfig(Path("image.png"))
+    image = LTX2ImageConditioningConfig(Path("image.png"))
     assert record_intent(image) == {"path": Path("image.png")}
     changed = replace_config(image, strength=0.95)
     assert record_intent(changed) == {"path": Path("image.png"), "strength": 0.95}
-    tiling = dataclass_from_mapping(VideoVAETilingConfig, {"mode": "custom"}, table="tiling")
+    tiling = dataclass_from_mapping(LTX2VideoVAETilingConfig, {"mode": "custom"}, table="tiling")
     assert record_intent(tiling) == {"mode": "custom"}
     assert tiling.temporal_overlap_frames == 24
     with pytest.raises(ValueError, match="strength"):
@@ -145,7 +145,7 @@ def test_inspection_reports_actual_constructor_presence_registration():
     from kinomlx.model_registry import config_registry
 
     schema = config_registry().model("ltx2")
-    item = configuration_inventory(schema, field="generate.image.strength")["fields"][0]
+    item = configuration_inventory(schema, field="generate.hdr_reference.strength")["fields"][0]
     assert item["constructor_presence"] == "tracked"
     root = configuration_inventory(schema, field="generate.width")["fields"][0]
     assert root["constructor_presence"] == "tracked"

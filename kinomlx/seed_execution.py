@@ -1,4 +1,4 @@
-"""Request-scoped model ownership and sequential execution at image stations."""
+"""Request-scoped model ownership and sequential execution at image stages."""
 
 from collections.abc import Callable, Generator, Iterator, Sequence
 from typing import cast
@@ -8,7 +8,7 @@ from kinomlx.seeds import SeedMode
 
 
 class SeedModels:
-    """Own loaded models, lending short leases to existing single-seed stations."""
+    """Own loaded models, lending short leases to existing single-seed stages."""
 
     def __init__(self) -> None:
         self._leases: dict[str, ComponentLease[object]] = {}
@@ -29,7 +29,7 @@ class SeedModels:
                 lease.close()
 
 
-def execute_seed_stations[C, R](
+def execute_seed_stages[C, R](
     jobs: Sequence[Generator[C | None, None, R]],
     models: SeedModels,
     mode: SeedMode,
@@ -40,12 +40,12 @@ def execute_seed_stations[C, R](
     scheduler. Each model call remains batch one in every execution mode.
     """
     try:
-        if mode == "station":
+        if mode == "stage":
             for job in jobs:
                 next(job)
             models.close()
         for job in jobs:
-            if mode != "station":
+            if mode != "stage":
                 next(job)
                 if mode == "sequential":
                     models.close()
@@ -54,7 +54,7 @@ def execute_seed_stations[C, R](
             except StopIteration as finished:
                 result = cast(R, finished.value)
             else:
-                raise RuntimeError("Image recipe yielded an unexpected station")
+                raise RuntimeError("Image recipe yielded an unexpected stage")
             if mode == "sequential":
                 models.close()
             yield result

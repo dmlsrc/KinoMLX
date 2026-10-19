@@ -99,7 +99,6 @@ def test_real_ltx25_one_token_joint_transformer_matches_frozen_reference() -> No
         model = LTXAVModel.from_config(
             config,
             compute_dtype=mx.bfloat16,
-            use_steel_attention=False,
             compile_attention=False,
             fast_mode=False,
         )

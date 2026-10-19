@@ -8,7 +8,6 @@ from collections.abc import Mapping
 from dataclasses import MISSING, dataclass
 from enum import StrEnum
 from functools import cached_property
-from types import MappingProxyType
 from typing import Literal, cast, get_args, get_origin, get_type_hints
 
 from kinomlx.api_boundaries import APIBoundary, ConfigurationOwner
@@ -43,7 +42,7 @@ from .dump import dump_config as render_config
 from .overrides import SetOverrides
 from .paths import TargetPath, field_path, format_target_path
 from .provenance import FieldOrigin, PreparedConfig, SourceLocation
-from .stations import OutputPolicy, StationPolicy
+from .stages import OutputPolicy, StagePolicy
 from .transforms import DELETE_FIELD, TRANSFORM_PHASES, LayerPhase, LayerTransform
 
 ConfigPath = tuple[str, ...]
@@ -56,7 +55,7 @@ class ConfigGroup(StrEnum):
     SOURCE_SELECTOR = "source_selector"
 
 
-_NO_VALUE = object()
+_NO_VALUE = sentinel("_NO_VALUE")
 _SHARED_ENVIRONMENT_FALLBACKS = {"output_dir": ("KINO_OUTPUT_DIR",)}
 _ENVIRONMENT_VARIABLE = re.compile(r"\{\{([A-Za-z_][A-Za-z0-9_]*)\}\}")
 _CONFIG_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -70,10 +69,10 @@ def as_sentence(text: str) -> str:
     return value if value.endswith((".", "!", "?")) else value + "."
 
 
-def station_field_changed(current: object, parent: object, names: ConfigPath) -> bool:
-    """Compare one owned field across two station records, through any nested records.
+def stage_field_changed(current: object, parent: object, names: ConfigPath) -> bool:
+    """Compare one owned field across two stage records, through any nested records.
 
-    Every station comparison reads a field this way, so nested records and
+    Every stage comparison reads a field this way, so nested records and
     collections are compared identically wherever a policy consults a value.
     An absent member on either side reads as one shared sentinel rather than as
     a difference against ``None``.
@@ -190,7 +189,7 @@ class ConfigFieldSpec:
     cli: CliBinding | None = None
     layer_transforms: tuple[LayerTransform, ...] = ()
     input_annotation: object = None
-    station_policies: tuple[StationPolicy, ...] = ()
+    stage_policies: tuple[StagePolicy, ...] = ()
     output_policy: OutputPolicy | None = None
     item_schema: ConfigRecordSpec | None = None
     cli_item: str | None = None
@@ -298,7 +297,7 @@ class ConfigFieldSpec:
     def intent_contract(self) -> tuple[object, ...]:
         """Meaning shared by every contribution of the same typed field identity.
 
-        Binding spellings, presentation and explicit surface/output/station policies
+        Binding spellings, presentation and explicit surface/output/stage policies
         may specialize per model. Typed values, constraints and input transforms
         retain one meaning for a reused record member.
         """
@@ -399,7 +398,7 @@ class ConfigRecordSpec:
             if (
                 field.cli_item is not None
                 or field.layer_transforms
-                or field.station_policies
+                or field.stage_policies
                 or field.groups
                 or field.strip
                 or field.multiline
@@ -481,8 +480,8 @@ class ConfigTableSpec:
     introduction: str | None = None
     cli_generated: bool = False
     cli_group: str | None = None
-    stations: tuple[str, ...] = ()
-    station_record: type[object] | None = None
+    stages: tuple[str, ...] = ()
+    stage_record: type[object] | None = None
 
     def __post_init__(self) -> None:
         record_name = getattr(self.record, "__name__", type(self.record).__name__)
@@ -514,37 +513,37 @@ class ConfigTableSpec:
             if stale:
                 details.append("stale " + ", ".join(stale))
             raise ValueError(f"{location} schema drift: {'; '.join(details)}")
-        if len(self.stations) != len(set(self.stations)) or any(not name for name in self.stations):
-            raise ValueError(f"{location}: stations must be unique nonempty names")
-        if bool(self.stations) != (self.station_record is not None):
-            raise ValueError(f"{location}: station policies require a comparison record")
-        if self.station_record is not None:
+        if len(self.stages) != len(set(self.stages)) or any(not name for name in self.stages):
+            raise ValueError(f"{location}: stages must be unique nonempty names")
+        if bool(self.stages) != (self.stage_record is not None):
+            raise ValueError(f"{location}: stage policies require a comparison record")
+        if self.stage_record is not None:
             projected = {
-                name for name, item in _record_fields(self.station_record).items() if item.init
+                name for name, item in _record_fields(self.stage_record).items() if item.init
             }
             if projected != (
                 {field.name for field in self.fields if not field.virtual} | set(self.nested)
             ):
-                raise ValueError(f"{location}: station record field coverage drift")
+                raise ValueError(f"{location}: stage record field coverage drift")
         for field in self.fields:
             if field.output_policy is not None and (
                 field.virtual or not _is_boolean_annotation(self.field_annotation(field))
             ):
                 raise ValueError(f"{location}.{field.name}: output policy requires a boolean field")
-            policies = {policy.station: policy for policy in field.station_policies}
-            if len(policies) != len(field.station_policies):
-                raise ValueError(f"{location}.{field.name}: duplicate station policy")
-            expected = set() if field.virtual else set(self.stations)
+            policies = {policy.stage: policy for policy in field.stage_policies}
+            if len(policies) != len(field.stage_policies):
+                raise ValueError(f"{location}.{field.name}: duplicate stage policy")
+            expected = set() if field.virtual else set(self.stages)
             if set(policies) != expected:
-                raise ValueError(f"{location}.{field.name}: station policy coverage drift")
+                raise ValueError(f"{location}.{field.name}: stage policy coverage drift")
             for policy in policies.values():
                 attribute = policy.attribute or field.name
-                if self.station_record is not None and not (
-                    attribute in _record_fields(self.station_record)
-                    or hasattr(self.station_record, attribute)
+                if self.stage_record is not None and not (
+                    attribute in _record_fields(self.stage_record)
+                    or hasattr(self.stage_record, attribute)
                 ):
                     raise ValueError(
-                        f"{location}.{field.name}: unknown station projection {attribute}"
+                        f"{location}.{field.name}: unknown stage projection {attribute}"
                     )
         if issubclass(self.record, EnvironmentSettings):
             for field in self.fields:
@@ -740,21 +739,21 @@ class ConfigTableSpec:
             raise ValueError(f"CLI record binding drift for {field.cli_dest}")
 
     def locked_changes(
-        self, current: object, parent: object, *, station: str
+        self, current: object, parent: object, *, stage: str
     ) -> tuple[ConfigPath, ...]:
-        """Compare every registered locked semantic field at a supported station."""
-        if station not in self.stations or self.station_record is None:
-            raise ValueError(f"{'.'.join(self.path)}: unsupported station {station!r}")
-        if (current is not None and not isinstance(current, self.station_record)) or (
-            parent is not None and not isinstance(parent, self.station_record)
+        """Compare every registered locked semantic field at a supported stage."""
+        if stage not in self.stages or self.stage_record is None:
+            raise ValueError(f"{'.'.join(self.path)}: unsupported stage {stage!r}")
+        if (current is not None and not isinstance(current, self.stage_record)) or (
+            parent is not None and not isinstance(parent, self.stage_record)
         ):
-            raise TypeError("station comparison requires its registered typed records")
+            raise TypeError("stage comparison requires its registered typed records")
         changed = []
         for field in self.fields:
-            for policy in field.station_policies:
-                if policy.station == station and policy.mode == "locked":
+            for policy in field.stage_policies:
+                if policy.stage == stage and policy.mode == "locked":
                     attribute = policy.attribute or field.name
-                    if station_field_changed(current, parent, (attribute,)):
+                    if stage_field_changed(current, parent, (attribute,)):
                         changed.append((*self.path, field.name))
         return tuple(sorted(changed))
 
@@ -903,9 +902,12 @@ class ModelConfigSpec:
     introduction: tuple[str, ...]
     root_fields: tuple[ConfigFieldSpec, ...]
     tables: tuple[ConfigTableSpec, ...]
-    # Every contribution states its restart applicability. An empty station set
-    # means the model has no saved restart operation and requires a reason.
-    restart_stations: tuple[str, ...]
+    # The recipe's stages in execution order; a run starts at the first. A
+    # restart starts at one of the restart stages, which a saved run's products
+    # let it resume from. An empty restart set means the model has no saved
+    # restart operation and requires a reason.
+    stages: tuple[str, ...]
+    restart_stages: tuple[str, ...]
     implications: tuple[ConfigImplication, ...] = ()
     semantic_groups: frozenset[str] = frozenset()
     layer_transforms: tuple[LayerTransform, ...] = ()
@@ -926,27 +928,32 @@ class ModelConfigSpec:
             raise ValueError(
                 f"{self.model}: invalid declared semantic groups: {', '.join(invalid_groups)}"
             )
-        stations = {"generate", *(station for table in self.tables for station in table.stations)}
+        if (
+            not self.stages
+            or len(self.stages) != len(set(self.stages))
+            or any(not name for name in self.stages)
+        ):
+            raise ValueError(f"{self.model}: stages must be unique nonempty names in order")
         for path, declaration in self.field_items():
             if declaration.output_policy is None:
                 continue
             produced = declaration.output_policy.produced_at
-            unknown_stations = produced - stations
-            if unknown_stations:
+            unknown_stages = produced - self.start_stages
+            if unknown_stages:
                 raise ValueError(
-                    f"{'.'.join(path)}: unknown output stations {sorted(unknown_stations)}"
+                    f"{'.'.join(path)}: unknown output stages {sorted(unknown_stages)}"
                 )
-            # Availability is the authority: a station that produces the group
+            # Availability is the authority: a stage that produces the group
             # may be asked for it, and one that does not cannot. A hand-written
             # mode beside the same field's OutputPolicy is a second answer to
             # the same question, and the two have drifted before.
-            for policy in declaration.station_policies:
-                expected = "mutable" if policy.station in produced else "irrelevant"
+            for policy in declaration.stage_policies:
+                expected = "mutable" if policy.stage in produced else "irrelevant"
                 if policy.mode != expected:
                     raise ValueError(
-                        f"{'.'.join(path)}: station {policy.station} declares {policy.mode!r} "
+                        f"{'.'.join(path)}: stage {policy.stage} declares {policy.mode!r} "
                         f"but this artifact is "
-                        f"{'produced' if policy.station in produced else 'not produced'} there"
+                        f"{'produced' if policy.stage in produced else 'not produced'} there"
                     )
         for declaration in self.root_fields:
             if declaration.surfaces.supports("cli") and declaration.cli is None:
@@ -999,26 +1006,28 @@ class ModelConfigSpec:
                         f"{self.model}.{name}: API runtime parameter names the registered "
                         f"table record for {'.'.join(table_path)}"
                     )
-        if len(self.restart_stations) != len(set(self.restart_stations)) or any(
-            not name for name in self.restart_stations
+        if len(self.restart_stages) != len(set(self.restart_stages)) or any(
+            not name for name in self.restart_stages
         ):
-            raise ValueError(f"{self.model}: restart stations must be unique nonempty names")
-        if self.restart_stations:
+            raise ValueError(f"{self.model}: restart stages must be unique nonempty names")
+        if not set(self.restart_stages) <= set(self.stages[1:]):
+            raise ValueError(f"{self.model}: restart stages must be stages after the first")
+        if self.restart_stages:
             if self.no_restart_reason is not None:
                 raise ValueError(f"{self.model}: restart-enabled model cannot claim no restart")
         elif not isinstance(self.no_restart_reason, str) or not self.no_restart_reason.strip():
             raise ValueError(f"{self.model}: no-restart model requires a reason")
-        expected_stations = set(self.restart_stations)
+        expected_stages = set(self.restart_stages)
         for table in self.tables:
-            if set(table.stations) != expected_stations:
-                raise ValueError(f"{self.model}.{'.'.join(table.path)}: station coverage drift")
+            if set(table.stages) != expected_stages:
+                raise ValueError(f"{self.model}.{'.'.join(table.path)}: stage coverage drift")
             for declaration in table.fields:
                 if not declaration.virtual and any(
-                    not policy.reason.strip() for policy in declaration.station_policies
+                    not policy.reason.strip() for policy in declaration.stage_policies
                 ):
                     raise ValueError(
                         f"{self.model}.{'.'.join((*table.path, declaration.name))}: "
-                        "station policy needs a reason"
+                        "stage policy needs a reason"
                     )
         table_roots = {table.path[0] for table in self.tables}
         root_collisions = set(root_names) & table_roots
@@ -1043,7 +1052,7 @@ class ModelConfigSpec:
             field.cli_dest
             for field in (
                 *self.root_fields,
-                *(item for table in self.tables for item in table.fields),
+                *(*table.fields for table in self.tables),
             )
         ]
         if len(destinations) != len(set(destinations)):
@@ -1065,7 +1074,7 @@ class ModelConfigSpec:
         # authors must not separately remember to install a seed/output rule.
         contributed: dict[str, LayerTransform] = {}
         for transform in (
-            *(rule for _path, field in self.field_items() for rule in field.layer_transforms),
+            *(*field.layer_transforms for _path, field in self.field_items()),
             *self.layer_transforms,
         ):
             existing = contributed.get(transform.name)
@@ -1120,12 +1129,11 @@ class ModelConfigSpec:
 
         common_groups = frozenset(group.value for group in ConfigGroup)
         used_groups = frozenset(
-            group
+            *field.groups
             for field in (
                 *self.root_fields,
-                *(item for table in self.tables for item in table.fields),
+                *(*table.fields for table in self.tables),
             )
-            for group in field.groups
         )
         unknown_groups = sorted(used_groups - common_groups - self.semantic_groups)
         if unknown_groups:
@@ -1251,14 +1259,14 @@ class ModelConfigSpec:
                     )
 
     def locked_changes(
-        self, table_path: ConfigPath, current: object, parent: object, *, station: str
+        self, table_path: ConfigPath, current: object, parent: object, *, stage: str
     ) -> tuple[ConfigPath, ...]:
-        """Compare a registered typed table and all its nested station projections."""
+        """Compare a registered typed table and all its nested stage projections."""
         tables = {table.path: table for table in self.tables}
         if table_path not in tables:
-            raise ValueError(f"unknown station table {'.'.join(table_path)}")
+            raise ValueError(f"unknown stage table {'.'.join(table_path)}")
         root = tables[table_path]
-        changed = list(root.locked_changes(current, parent, station=station))
+        changed = list(root.locked_changes(current, parent, stage=stage))
         for table in self.tables:
             if len(table.path) <= len(table_path) or table.path[: len(table_path)] != table_path:
                 continue
@@ -1266,35 +1274,35 @@ class ModelConfigSpec:
             for name in table.path[len(table_path) :]:
                 left = None if left is None else getattr(left, name)
                 right = None if right is None else getattr(right, name)
-            changed.extend(table.locked_changes(left, right, station=station))
+            changed.extend(table.locked_changes(left, right, stage=stage))
         return tuple(sorted(changed))
 
-    def station_changes(
+    def stage_changes(
         self,
         current: Mapping[str, object],
         parent: Mapping[str, object],
         *,
-        station: str,
+        stage: str,
         active_explicit: frozenset[TargetPath],
     ) -> tuple[ConfigPath, ...]:
         """Admit one typed restart invocation through every registered table."""
-        if station not in self.restart_stations:
-            raise ValueError(f"{self.model}: unsupported restart station {station!r}")
+        if stage not in self.restart_stages:
+            raise ValueError(f"{self.model}: unsupported restart stage {stage!r}")
         roots = {table.path[0] for table in self.tables if len(table.path) == 1}
         for label, records in (("current", current), ("parent", parent)):
             if set(records) != roots:
                 missing = sorted(roots - set(records))
                 stale = sorted(set(records) - roots)
                 raise ValueError(
-                    f"{self.model}: {label} station records drift; missing={missing}, stale={stale}"
+                    f"{self.model}: {label} stage records drift; missing={missing}, stale={stale}"
                 )
             for table in self.tables:
                 if len(table.path) != 1:
                     continue
-                record_type = table.station_record
+                record_type = table.stage_record
                 if record_type is None or not isinstance(records[table.path[0]], record_type):
                     raise TypeError(
-                        f"{self.model}.{table.path[0]}: {label} station record must be "
+                        f"{self.model}.{table.path[0]}: {label} stage record must be "
                         f"{table.record.__name__}"
                     )
         changed: set[ConfigPath] = set()
@@ -1302,18 +1310,18 @@ class ModelConfigSpec:
             if len(table.path) == 1:
                 changed.update(
                     self.locked_changes(
-                        table.path, current[table.path[0]], parent[table.path[0]], station=station
+                        table.path, current[table.path[0]], parent[table.path[0]], stage=stage
                     )
                 )
         for path, declaration in self.field_items():
             if declaration.virtual:
                 continue
             policy = next(
-                (policy for policy in declaration.station_policies if policy.station == station),
+                (policy for policy in declaration.stage_policies if policy.stage == stage),
                 None,
             )
             if policy is None:
-                raise ValueError(f"{self.model}.{'.'.join(path)}: missing station policy")
+                raise ValueError(f"{self.model}.{'.'.join(path)}: missing stage policy")
             if (
                 policy.mode != "irrelevant"
                 or policy.irrelevant_action != "reject"
@@ -1325,7 +1333,7 @@ class ModelConfigSpec:
             # it describes this invocation rather than completed parent work, so
             # supplying such a field there remains a change on presence alone.
             root = path[0]
-            if current[root] is parent[root] or station_field_changed(
+            if current[root] is parent[root] or stage_field_changed(
                 current[root], parent[root], path[1:]
             ):
                 changed.add(path)
@@ -1352,12 +1360,12 @@ class ModelConfigSpec:
     @cached_property
     def _fields_by_path(self) -> Mapping[ConfigPath, ConfigFieldSpec]:
         """Address every contributed field by its exact path."""
-        return MappingProxyType(dict(self._field_items))
+        return frozendict(self._field_items)
 
     @cached_property
     def _tables_by_path(self) -> Mapping[ConfigPath, ConfigTableSpec]:
         """Address every contributed table by its exact path."""
-        return MappingProxyType({table.path: table for table in self.tables})
+        return frozendict({table.path: table for table in self.tables})
 
     def paths_in_group(self, group: str) -> tuple[ConfigPath, ...]:
         """Return schema-ordered field paths carrying one semantic group."""
@@ -1428,7 +1436,7 @@ class ModelConfigSpec:
 
     def cli_fields(self) -> dict[str, ConfigFieldSpec]:
         """Return contributed fields keyed by their unique argparse destination."""
-        fields = (*self.root_fields, *(item for table in self.tables for item in table.fields))
+        fields = (*self.root_fields, *(*table.fields for table in self.tables))
         return {field.cli_dest: field for field in fields if field.surfaces.supports("cli")}
 
     def cli_layer(self, options: object) -> dict[str, object]:
@@ -1483,7 +1491,7 @@ class ModelConfigSpec:
                 else ()
             )
             try:
-                patch = transform.run(MappingProxyType(inputs))
+                patch = transform.run(frozendict(inputs))
             except ConfigError as exc:
                 # A layer transform states a relationship between keys it read,
                 # so the remedy is neutral and the layer that holds them is what
@@ -1762,9 +1770,7 @@ class ModelConfigSpec:
                 copy.deepcopy(dict(config)), "source", explicit, origins, source=source
             )
             prepared.append(
-                PreparedConfig(
-                    values, MappingProxyType(origins), layer_explicit=frozenset(explicit)
-                )
+                PreparedConfig(values, frozendict(origins), layer_explicit=frozenset(explicit))
             )
         return tuple(prepared)
 
@@ -1773,9 +1779,7 @@ class ModelConfigSpec:
         origins = dict(state.origins)
         explicit = set(state.active_explicit)
         values = self.normalize_layer(state.values, _explicit=explicit, _origins=origins)
-        return PreparedConfig(
-            values, MappingProxyType(origins), state.replacements, frozenset(explicit)
-        )
+        return PreparedConfig(values, frozendict(origins), state.replacements, frozenset(explicit))
 
     def prepare_layers_with_provenance(
         self,
@@ -1862,14 +1866,18 @@ class ModelConfigSpec:
                 _set_path(normalized, path, int(value))
         return normalized
 
-    def _require_station(self, station: str) -> None:
-        known = {"generate", *(name for table in self.tables for name in table.stations)}
-        if station not in known:
-            raise ValueError(f"{self.model}: unsupported station {station!r}")
+    @cached_property
+    def start_stages(self) -> frozenset[str]:
+        """The stages a run can start at: the first stage and the restart stages."""
+        return frozenset((self.stages[0], *self.restart_stages))
 
-    def prepare_station_layer(self, state: PreparedConfig, *, station: str) -> PreparedConfig:
-        """Limit implicit artifact selection to outputs produced by the selected station."""
-        self._require_station(station)
+    def _require_stage(self, stage: str) -> None:
+        if stage not in self.start_stages:
+            raise ValueError(f"{self.model}: unsupported stage {stage!r}")
+
+    def prepare_stage_layer(self, state: PreparedConfig, *, stage: str) -> PreparedConfig:
+        """Limit implicit artifact selection to outputs produced by the selected stage."""
+        self._require_stage(stage)
         values = copy.deepcopy(state.values)
         origins = dict(state.origins)
         for path, declaration in self.field_items():
@@ -1877,7 +1885,7 @@ class ModelConfigSpec:
             origin = origins.get(path)
             if (
                 policy is not None
-                and station not in policy.produced_at
+                and stage not in policy.produced_at
                 and origin is not None
                 and origin.kind == "implied"
                 and path not in state.active_explicit
@@ -1887,14 +1895,14 @@ class ModelConfigSpec:
         surviving = self.target_paths(values)
         return PreparedConfig(
             values,
-            MappingProxyType(origins),
+            frozendict(origins),
             state.replacements & surviving,
             state.active_explicit & surviving,
         )
 
-    def validate_station_outputs(self, values: Mapping[str, object], *, station: str) -> None:
-        """Reject explicit requests for artifacts unavailable at the selected station."""
-        self._require_station(station)
+    def validate_stage_outputs(self, values: Mapping[str, object], *, stage: str) -> None:
+        """Reject explicit requests for artifacts unavailable at the selected stage."""
+        self._require_stage(stage)
         for path, declaration in self.field_items():
             if declaration.output_policy is None:
                 continue
@@ -1902,7 +1910,7 @@ class ModelConfigSpec:
             if present and value is True:
                 try:
                     declaration.output_policy.selected(
-                        True, save_all=False, station=station, field=".".join(path)
+                        True, save_all=False, stage=stage, field=".".join(path)
                     )
                 except ValueError as exc:
                     raise ConfigError(str(exc)) from exc
@@ -2061,7 +2069,7 @@ class ModelConfigSpec:
 
     def environment_state(self, *, exclude_tables: tuple[str, ...] = ()) -> PreparedConfig:
         """Resolve values and exact selected ENV/default origins in a single pass."""
-        known = {name for variables in self.environment_variables().values() for name in variables}
+        known = {*variables for variables in self.environment_variables().values()}
         unknown = environment_names(f"KINO_{self.model.upper()}_") - known
         if unknown:
             raise unknown_field_error(min(unknown), known, f"environment for {self.model}")
@@ -2088,7 +2096,7 @@ class ModelConfigSpec:
                             "environment" if entry.explicit else "default", entry.source
                         ),
                     )
-        return PreparedConfig(result, MappingProxyType(origins))
+        return PreparedConfig(result, frozendict(origins))
 
 
 class ConfigRegistry:

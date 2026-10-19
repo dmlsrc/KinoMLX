@@ -4,9 +4,9 @@ from .item import EncodedCondition
 from .keyframe import VideoConditionByKeyframeIndex
 from .latent import ConditioningError, VideoConditionByLatentIndex
 from .preparation import (
-    ConditionEncoderPort,
     HDRReferenceConditionSource,
     ImageConditionSource,
+    LTX2ConditionEncoderPort,
     RawConditionSource,
     prepare_conditions,
 )
@@ -15,11 +15,11 @@ from .tools import AudioLatentTools, VideoLatentTools
 
 __all__ = [
     "AudioLatentTools",
-    "ConditionEncoderPort",
     "ConditioningError",
     "EncodedCondition",
     "HDRReferenceConditionSource",
     "ImageConditionSource",
+    "LTX2ConditionEncoderPort",
     "RawConditionSource",
     "VideoConditionByKeyframeIndex",
     "VideoConditionByLatentIndex",

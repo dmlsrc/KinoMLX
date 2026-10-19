@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from kinomlx.cli._registry import CONFIG_CONTROL_DESTINATIONS
+from kinomlx.cli.parser_contract import CONFIG_CONTROL_DESTINATIONS
 from kinomlx.config import (
     ConfigError,
     dump_config,
@@ -181,8 +181,6 @@ def test_registry_semantic_groups_point_only_at_typed_ltx2_fields() -> None:
         LTX2ConfigGroup.MODEL_SOURCE,
         LTX2ConfigGroup.MODEL_MONOLITHIC_SOURCE,
         LTX2ConfigGroup.MODEL_SPLIT_SOURCE,
-        LTX2ConfigGroup.MODEL_GEMMA_SOURCE,
-        LTX2ConfigGroup.MODEL_TEXT_ENCODER_SOURCE,
         LTX2ConfigGroup.MODEL_GENERATION_SELECTOR,
         LTX2ConfigGroup.MODEL_VIDEO_VAE_SELECTOR,
         LTX2ConfigGroup.MODEL_VIDEO_VAE_SOURCE,
@@ -312,12 +310,11 @@ spatial_upscaler_path = "from-toml-spatial.safetensors"
         base_settings=Settings(),
         base_model_settings=LTX2Settings(
             weights_path=Path("from-environment-monolith.safetensors"),
-            gemma_path=Path("from-environment-gemma"),
+            text_encoder_path=Path("from-environment-text"),
         ),
     )
 
     assert invocation.model_settings.weights_path is None
-    assert invocation.model_settings.gemma_path is None
     assert invocation.model_settings.transformer_path == Path("from-toml-transformer.safetensors")
     assert invocation.model_settings.text_encoder_path == Path("from-cli-text.safetensors")
     assert invocation.model_settings.video_vae_path == Path("from-toml-video-vae.safetensors")
@@ -414,7 +411,7 @@ def test_generation_selector_clears_lower_precedence_checkpoint_paths() -> None:
         base_settings=Settings(),
         base_model_settings=LTX2Settings(
             weights_path=Path("from-environment-monolith.safetensors"),
-            gemma_path=Path("from-environment-gemma"),
+            text_encoder_path=Path("from-environment-text"),
             video_vae_path=Path("from-environment-video-vae.safetensors"),
             audio_vae_path=Path("from-environment-audio-vae.safetensors"),
             spatial_upscaler_path=Path("from-environment-spatial-upscaler.safetensors"),
@@ -426,7 +423,6 @@ def test_generation_selector_clears_lower_precedence_checkpoint_paths() -> None:
     assert invocation.model_settings.model_generation == "2.5"
     for field_name in (
         "weights_path",
-        "gemma_path",
         "spatial_upscaler_path",
         "transformer_path",
         "text_encoder_path",
@@ -483,23 +479,31 @@ def test_video_vae_flag_selects_cached_diffusion_variant() -> None:
     assert invocation.model_settings.video_vae_path is None
 
 
-def test_sampler_flag_resolves_on_the_public_request() -> None:
-    invocation = assemble(
-        build_parser().parse_args(
-            [
-                "--ltx-generation",
-                "2.5",
-                "--sampler",
-                "deterministic",
-                "--print-config",
-            ]
+@pytest.mark.parametrize(
+    ("flags", "stage_1", "stage_2"),
+    [
+        (("--stage1-sampler", "deterministic"), "deterministic", "auto"),
+        (("--sampler-stage-2", "deterministic"), "auto", "deterministic"),
+        (
+            ("--stage1-sampler", "ancestral", "--stage2-sampler", "deterministic"),
+            "ancestral",
+            "deterministic",
         ),
+    ],
+)
+def test_stage_sampler_flags_resolve_on_the_public_request(
+    flags: tuple[str, ...], stage_1: str, stage_2: str
+) -> None:
+    invocation = assemble(
+        build_parser().parse_args(["--ltx-generation", "2.5", *flags, "--print-config"]),
         base_settings=Settings(),
         base_model_settings=LTX2Settings(),
     )
 
-    assert invocation.request.sampler == "deterministic"
-    assert invocation.resolved_config["generate"]["sampler"] == "deterministic"
+    assert invocation.request.stage_1_sampler == stage_1
+    assert invocation.request.stage_2_sampler == stage_2
+    assert invocation.resolved_config["generate"]["stage_1_sampler"] == stage_1
+    assert invocation.resolved_config["generate"]["stage_2_sampler"] == stage_2
 
 
 def test_noise_backend_flag_resolves_on_the_public_request() -> None:
@@ -535,27 +539,23 @@ def test_config_settings_override_environment_derived_base(tmp_path: Path) -> No
     assert invocation.settings.app_cache_dir == Path("from-config")
 
 
-def test_nested_image_config_can_be_partly_overridden_from_cli(tmp_path: Path) -> None:
+def test_image_records_can_be_partly_overridden_from_cli(tmp_path: Path) -> None:
     config = tmp_path / "run.toml"
     config.write_text(
         """
 [generate]
 prompt = "test"
-
-[generate.image]
-path = "first.png"
-frame_index = 0
-strength = 0.5
+images = [{path = "first.png", frame_index = 0, strength = 0.5}]
 """.strip(),
         encoding="utf-8",
     )
     options = build_parser().parse_args(
-        ["--config", str(config), "--image-strength", "0.8", "--print-config"]
+        ["--config", str(config), "--set", "generate.images[0].strength=0.8", "--print-config"]
     )
     invocation = assemble(options, base_settings=Settings())
-    assert invocation.request.image is not None
-    assert invocation.request.image.path == Path("first.png")
-    assert invocation.request.image.strength == pytest.approx(0.8)
+    assert len(invocation.request.images) == 1
+    assert invocation.request.images[0].path == Path("first.png")
+    assert invocation.request.images[0].strength == pytest.approx(0.8)
 
 
 def test_duration_and_frames_obey_cross_surface_precedence(tmp_path: Path) -> None:
@@ -666,6 +666,12 @@ def test_text_conditioning_and_vae_tiling_cli_land_in_request(tmp_path: Path) ->
                 str(sidecar),
                 "--vae-decode-dtype",
                 "bfloat16",
+                "--vae-cache-limit-gb",
+                "8",
+                "--vae-sharpen",
+                "2.5",
+                "--vae-sharpen-radius",
+                "3",
                 "--vae-tiling",
                 "custom",
                 "--vae-temporal-tile-frames",
@@ -683,6 +689,9 @@ def test_text_conditioning_and_vae_tiling_cli_land_in_request(tmp_path: Path) ->
     )
     assert invocation.request.text_conditioning == sidecar
     assert invocation.request.vae_decode_dtype == "bfloat16"
+    assert invocation.request.vae_cache_limit_gb == 8.0
+    assert invocation.request.vae_sharpen == 2.5
+    assert invocation.request.vae_sharpen_radius == 3.0
     assert invocation.request.vae_tiling.mode == "custom"
     assert invocation.request.vae_tiling.temporal_tile_frames == 64
     assert invocation.request.vae_tiling.spatial_tile_pixels == 512
@@ -827,15 +836,15 @@ def test_settings_table_rejects_string_for_boolean(tmp_path: Path) -> None:
         assemble(options, base_settings=Settings())
 
 
-def test_nested_image_schema_preserves_specific_validation_error(tmp_path: Path) -> None:
+def test_image_record_schema_preserves_specific_validation_error(tmp_path: Path) -> None:
     config = tmp_path / "run.toml"
     config.write_text(
-        '[generate.image]\npath = "frame.png"\nstrength = 2.0\n',
+        '[generate]\nimages = [{path = "frame.png", strength = 2.0}]\n',
         encoding="utf-8",
     )
     options = build_parser().parse_args(["--config", str(config)])
     with pytest.raises(
-        ConfigError, match=r"\[generate\.image\]\.strength: must be between 0 and 1"
+        ConfigError, match=r"\[generate\]\.images\[0\]\.strength: must be between 0 and 1"
     ):
         assemble(options, base_settings=Settings())
 
@@ -1575,3 +1584,18 @@ def test_experimental_fp16_vae_dtype_resolves_through_request_surfaces(tmp_path,
         args += ["--set", "generate.vae_decode_dtype=float16"]
     invocation = assemble(build_parser().parse_args(args), base_settings=Settings())
     assert invocation.request.vae_decode_dtype == "float16"
+
+
+@pytest.mark.parametrize("source", ["cli", "toml", "set"])
+def test_vae_cache_override_resolves_through_request_surfaces(tmp_path, source):
+    args = ["--print-config"]
+    if source == "cli":
+        args += ["--vae-cache-limit-gb", "12"]
+    elif source == "toml":
+        path = tmp_path / "decode.toml"
+        path.write_text("[generate]\nvae_cache_limit_gb = 12.0\n")
+        args += ["--config", str(path)]
+    else:
+        args += ["--set", "generate.vae_cache_limit_gb=12"]
+    invocation = assemble(build_parser().parse_args(args), base_settings=Settings())
+    assert invocation.request.vae_cache_limit_gb == 12.0

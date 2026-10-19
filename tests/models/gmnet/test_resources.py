@@ -54,3 +54,27 @@ def test_explicit_weights_override_still_wins(tmp_path):
     )
 
     assert resources.weights_path == override.absolute()
+
+
+def test_dry_run_report_names_the_resolved_checkpoint_and_its_contract(tmp_path):
+    override = tmp_path / "custom.safetensors"
+    override.write_bytes(b"converted")
+
+    report = prepare_resources(
+        GMNetSettings(variant=GMNetVariant.SYNTHETIC.value, weights_path=override),
+        infrastructure=Settings(app_cache_dir=tmp_path / "unused-cache"),
+    ).describe()
+
+    # One checkpoint with no per-component records has no bindings, graph
+    # identities or tensor accounting to report, so the keys are stated here
+    # rather than compared against another generated structure.
+    assert report == {
+        "model": "gmnet",
+        "variant": "synthetic",
+        "weights": str(override.absolute()),
+        "network_scale": 1,
+        "peak_over_sdr_white": 8.0,
+        "gain_stops": 3.0,
+        "sdr_reference_white_nits": 100.0,
+        "memory_policy": {"cache_limit_gb": 1.0, "wired_limit_gb": None},
+    }

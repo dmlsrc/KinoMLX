@@ -39,7 +39,7 @@ class WeightSource:
 
     @property
     def tensor_keys(self) -> tuple[str, ...]:
-        return tuple(key for source in self.tensor_files for key in source.keys)
+        return tuple(*source.keys for source in self.tensor_files)
 
     @property
     def tensor_count(self) -> int:

@@ -44,7 +44,7 @@ def parse_reference_region(value: str) -> ReferenceRegion:
         points = list(zip(coordinates[::2], coordinates[1::2], strict=True))
         if points[-1] == points[0]:
             points.pop()
-            coordinates = tuple(coordinate for point in points for coordinate in point)
+            coordinates = tuple(*point for point in points)
         if len(set(points)) != len(points):
             raise ValueError(
                 "polygon vertices must be distinct, except for an optional closing vertex"

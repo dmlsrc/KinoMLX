@@ -1,5 +1,6 @@
 """Installed ``--model gmnet`` inference command over the public API."""
 
+import functools
 import logging
 import time
 from contextlib import ExitStack
@@ -15,6 +16,7 @@ from kinomlx.cli.presentation import (
     render_model_error,
     render_run_success,
 )
+from kinomlx.cli.resource_operation import report_resources
 from kinomlx.config import ConfigError
 from kinomlx.debug import (
     RunRecord,
@@ -31,12 +33,16 @@ from kinomlx.models.gmnet.runner import GMNetRunner
 from kinomlx.reporter_stack import command_reporter
 from kinomlx.reporting import ScopedReporter, TimingReporter
 from kinomlx.settings import Settings
-from kinomlx.ui import configure_logging, configure_logging_from_settings
+from kinomlx.ui import (
+    configure_logging,
+    configure_logging_from_settings,
+)
 from kinomlx.videotoolbox.heic import PQ_REFERENCE_WHITE_NITS
 
 from .arguments import build_parser
 from .config import GMNetInvocation, assemble, validate_for_execution
 from .output import GMNetOutputPlan, GMNetOutputReservation
+from .resources import GMNetResources, prepare_resources
 
 _log = logging.getLogger(__name__)
 
@@ -60,6 +66,20 @@ def _log_request(invocation: GMNetInvocation, plan: GMNetOutputPlan) -> None:
     )
 
 
+def _log_resources(resources: GMNetResources) -> None:
+    log_section(
+        _log,
+        "Resources",
+        (
+            ("Variant", resources.spec.variant.value),
+            ("Weights", resources.weights_path),
+            ("Network scale", resources.spec.network_scale),
+            ("Model peak over SDR white", f"{resources.spec.peak_over_sdr_white:g}x"),
+            ("Model SDR reference white", f"{resources.spec.sdr_reference_white_nits:g} nits"),
+        ),
+    )
+
+
 def _run_expand(
     invocation: GMNetInvocation,
     reporter: TimingReporter,
@@ -78,20 +98,7 @@ def _run_expand(
             infrastructure=invocation.settings,
             reporter=model_reporter,
         )
-        log_section(
-            _log,
-            "Resources",
-            (
-                ("Variant", runner.resources.spec.variant.value),
-                ("Weights", runner.resources.weights_path),
-                ("Network scale", runner.resources.spec.network_scale),
-                ("Model peak over SDR white", f"{runner.resources.spec.peak_over_sdr_white:g}x"),
-                (
-                    "Model SDR reference white",
-                    f"{runner.resources.spec.sdr_reference_white_nits:g} nits",
-                ),
-            ),
-        )
+        _log_resources(runner.resources)
         result = runner.expand(request)
         reporter.memory_checkpoint("expansion_ready")
         artifacts = GMNetOutputSink(selected_plan, reporter=model_reporter).write(
@@ -162,6 +169,15 @@ def run_gmnet_command(argv: list[str]) -> int:
     )
     if config_exit is not None:
         return config_exit
+    if invocation.operation.dry_run:
+        return report_resources(
+            "gmnet",
+            functools.partial(
+                prepare_resources, invocation.model_settings, infrastructure=invocation.settings
+            ),
+            log=_log_resources,
+            json_output=invocation.settings.json_output,
+        )
     started = time.perf_counter()
     try:
         validate_for_execution(invocation)
@@ -248,7 +264,7 @@ def run_gmnet_command(argv: list[str]) -> int:
                     try:
                         run_record = RunRecord(
                             run_log,
-                            model="gmnet",
+                            schema=config_registry().model("gmnet"),
                             effective_config=invocation.resolved_config,
                             config_intent=invocation.config_intent,
                             argv=command_argv,

@@ -183,6 +183,7 @@ class ModalityPreprocessor:
             positional_embeddings=positional,
             prompt_timestep=prompt_timestep,
             enabled=modality.enabled,
+            sparse_attention=modality.sparse_attention,
         )
         if cross_modality is None:
             return args

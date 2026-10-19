@@ -2,14 +2,14 @@
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import ClassVar, Literal
+from typing import ClassVar
 
 from kinomlx.adapters.selection import AdapterSelection
 from kinomlx.config_constraints import ChoiceConstraint, IntegerConstraint, NumberSequenceConstraint
 from kinomlx.config_records import config_record
 from kinomlx.config_rules import validate_capabilities
 from kinomlx.image_restart_config import ImageRestartSelectionFields
-from kinomlx.io.geometry import MATCH_SOURCE_ASPECT_CHOICES
+from kinomlx.io.geometry import MATCH_SOURCE_ASPECT_CHOICES, REFERENCE_FIT_CHOICES
 from kinomlx.prompts import PromptInputConstraint, normalize_prompts
 from kinomlx.request_rules import IMAGE_PROMPT, IMAGE_SEEDS, SAVED_IMAGE_CONDITIONING
 from kinomlx.samplers.config import SigmaScheduleConstraint
@@ -19,7 +19,7 @@ from kinomlx.types import DEFAULT_NOISE_BACKEND, NOISE_BACKEND_CHOICES, NoiseBac
 from .adapters.inputs import Flux2AdapterConfig
 from .catalog import Flux2Variant
 from .geometry_rules import REFERENCE_GEOMETRY
-from .request_constraints import CFG_MODE, DENOISE_STEPS, GUIDANCE, OUTPUT_DIMENSION
+from .request_constraints import CFG_MODE, DENOISE_STEPS, GUIDANCE, OUTPUT_DIMENSION, Flux2CFGMode
 from .request_rules import NEGATIVE_ROWS, RECIPE_CAPABILITIES, negative_rows
 from .sampling import SamplingRecipe
 
@@ -58,7 +58,8 @@ class Flux2Request:
         },
     )
     seed_mode: SeedMode = field(
-        default="sequential", metadata={"config_constraints": (ChoiceConstraint(SEED_MODES),)}
+        default=SeedMode.SEQUENTIAL,
+        metadata={"config_constraints": (ChoiceConstraint(SEED_MODES),)},
     )
     steps: int | None = field(default=None, metadata={"config_constraints": (DENOISE_STEPS,)})
     guidance: float | None = field(default=None, metadata={"config_constraints": (GUIDANCE,)})
@@ -84,14 +85,14 @@ class Flux2Request:
         default=(), metadata={"config_rules": (REFERENCE_GEOMETRY,)}
     )
     reference_fit: str | None = field(
-        default=None, metadata={"config_constraints": (ChoiceConstraint(("fit", "crop")),)}
+        default=None, metadata={"config_constraints": (ChoiceConstraint(REFERENCE_FIT_CHOICES),)}
     )
     match_source_aspect: str | None = field(
         default=None,
         metadata={"config_constraints": (ChoiceConstraint(MATCH_SOURCE_ASPECT_CHOICES),)},
     )
-    cfg_mode: Literal["sequential", "batched"] = field(
-        default="sequential",
+    cfg_mode: Flux2CFGMode = field(
+        default=Flux2CFGMode.SEQUENTIAL,
         metadata={"config_constraints": (CFG_MODE,), "config_rules": (RECIPE_CAPABILITIES,)},
     )
 
@@ -138,4 +139,4 @@ class Flux2Request:
 @config_record
 @dataclass(frozen=True)
 class Flux2RestartConfig(ImageRestartSelectionFields):
-    """Select a prior Klein run and its first repeated station."""
+    """Select a prior Klein run and its first repeated stage."""

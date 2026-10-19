@@ -1,4 +1,4 @@
-"""Klein run-record selection and saved-station resource admission."""
+"""Klein run-record selection and saved-stage resource admission."""
 
 from dataclasses import dataclass
 from pathlib import Path
@@ -7,16 +7,18 @@ from typing import cast
 import mlx.core as mx
 
 from kinomlx._json import JsonObject, load_json_object
+from kinomlx.config import ModelConfigSpec
 from kinomlx.config.persistence import read_configuration, rebase_configuration
 from kinomlx.config.provenance import PreparedConfig
-from kinomlx.config.stations import station_output_defaults
+from kinomlx.config.stages import stage_output_defaults
 from kinomlx.config_records import config_record
 from kinomlx.config_rules import validate_record
-from kinomlx.image_restart_config import ImageRestartArtifactFields
+from kinomlx.image_restart_config import IMAGE_CONSUMES, ImageRestartArtifactFields, ImageStage
 from kinomlx.io.fingerprints import file_sha256
 from kinomlx.io.safetensors import inspect_safetensors, load_weights_with_metadata
 from kinomlx.memory_policy import MLXMemoryPolicy
 from kinomlx.modeling.artifacts import WeightSource
+from kinomlx.modeling.dtypes import FloatDType
 from kinomlx.restart_selection import (
     CANCELED_RUN_STATUS,
     PLANNED_IMAGE_COUNT,
@@ -30,19 +32,24 @@ from kinomlx.restart_selection import (
 
 from .catalog import Flux2Profile, profile
 from .output_policies import OUTPUT_POLICIES
-from .resources import Flux2Component, inspect_component_source, weight_component
+from .resources import (
+    Flux2Component,
+    inspect_component_source,
+    restart_components,
+    weight_component,
+)
 from .types import Flux2RestartConfig
 
 
 @config_record
 @dataclass(frozen=True)
 class Flux2Restart(ImageRestartArtifactFields):
-    """Public selection of a saved conditioning or final-latent station."""
+    """Public selection of a saved conditioning or final-latent stage."""
 
 
 @dataclass(frozen=True)
 class PreparedResources:
-    """Only the validated components needed after a saved station."""
+    """Only the validated components needed after a saved stage."""
 
     profile: Flux2Profile
     components: tuple[Flux2Component, ...]
@@ -59,10 +66,10 @@ class RestartManifest:
     payload: JsonObject
 
     @classmethod
-    def load(cls, selection: Flux2RestartConfig) -> RestartManifest:
+    def load(cls, selection: Flux2RestartConfig, *, schema: ModelConfigSpec) -> RestartManifest:
         validate_record(selection, location="[restart]")
         payload = load_json_object(selection.run)
-        read_configuration(payload, model="flux2", source=str(selection.run))
+        read_configuration(payload, schema=schema, source=str(selection.run))
         if payload.get("model") != "flux2" or payload.get("status") not in RESTARTABLE_RUN_STATUSES:
             raise ValueError("restart requires a completed or canceled KinoMLX Klein run record")
         if not isinstance(payload.get("generation"), dict):
@@ -79,15 +86,15 @@ class RestartManifest:
         exactly the ones it finished; anything past them was planned and never
         written. A run that published nothing is refused the same way.
         """
-        name = "final_latents" if self.selection.phase == "decode" else "text_conditioning"
+        (name,) = IMAGE_CONSUMES[self.selection.stage]
         outputs = self.payload.get("outputs")
         entries = outputs.get(name) if isinstance(outputs, dict) else None
         published = len(entries) if isinstance(entries, list) else 0
         if self.source_index >= published:
             raise ValueError(unpublished_image(self.source_index, self.source_image_count))
 
-    def base_config(self) -> PreparedConfig:
-        intent = read_configuration(self.payload, model="flux2", source=str(self.selection.run))
+    def base_config(self, *, schema: ModelConfigSpec) -> PreparedConfig:
+        intent = read_configuration(self.payload, schema=schema, source=str(self.selection.run))
         config = dict(intent.values)
         config.pop("restart", None)
         config["operation"] = {"dry_run": False}
@@ -100,13 +107,13 @@ class RestartManifest:
             directory=self.selection.run.parent,
             prefix=(
                 f"{source_stem}_final_decode"
-                if self.selection.phase == "decode"
+                if self.selection.stage == ImageStage.DECODE
                 else f"{source_stem}_denoise"
             ),
             force=False,
         )
-        config["output"] = station_output_defaults(
-            output, OUTPUT_POLICIES, station=self.selection.phase
+        config["output"] = stage_output_defaults(
+            output, OUTPUT_POLICIES, stage=self.selection.stage
         )
         generate = dict(cast(dict[str, object], config.get("generate", {})))
         generate.update(self._selected_image())
@@ -173,7 +180,7 @@ class RestartManifest:
             else None
         )
         if not isinstance(value, str) or not isinstance(digest, str):
-            raise ValueError(f"Klein run has no fingerprinted {name} station")
+            raise ValueError(f"Klein run has no fingerprinted {name} stage")
         path = Path(value)
         if not path.is_absolute():
             path = self.selection.run.parent / path
@@ -185,10 +192,10 @@ class RestartManifest:
         self,
         variant: str,
         *,
-        phase: str,
+        stage: str,
         check_adapter_weights: bool = True,
     ) -> PreparedResources:
-        """Reopen and validate the recorded sources needed by the saved station."""
+        """Reopen and validate the recorded sources needed by the saved stage."""
         generation = cast(JsonObject, self.payload["generation"])
         resource = generation.get("resources")
         if not isinstance(resource, dict) or resource.get("variant") != variant:
@@ -196,25 +203,26 @@ class RestartManifest:
         entries = resource.get("components")
         if not isinstance(entries, list):
             raise ValueError("Klein run lacks prepared component receipts")
-        required = {"vae"} if phase == "decode" else {"transformer", "vae"}
+        required = restart_components(stage)
         components: list[Flux2Component] = []
         for item in entries:
             if not isinstance(item, dict) or item.get("kind") not in required:
                 continue
             kind = cast(str, item["kind"])
             source_path, dtype = item.get("source"), item.get("dtype")
-            if (
-                not isinstance(source_path, str)
-                or dtype not in {"float16", "bfloat16"}
-                or (kind == "vae" and dtype != "bfloat16")
-            ):
+            bound = (
+                frozenset({FloatDType.BFLOAT16})
+                if kind == "vae"
+                else frozenset({FloatDType.BFLOAT16, FloatDType.FLOAT16})
+            )
+            if not isinstance(source_path, str) or dtype not in bound:
                 raise ValueError("Invalid Klein component receipt")
             source = inspect_component_source(kind, Path(source_path))
             assert isinstance(source, WeightSource)
             component = weight_component(
                 kind,
                 source,
-                dtype=cast(str, dtype),
+                dtype=FloatDType(cast(str, dtype)),
             )
             if any(
                 item.get(key) != expected
@@ -234,7 +242,7 @@ class RestartManifest:
 
 
 def load_final_latents(path: Path) -> tuple[mx.array, int, int]:
-    """Read a model-tagged final station; numerical validation happens before VAE load."""
+    """Read a model-tagged final stage; numerical validation happens before VAE load."""
     inventory = inspect_safetensors(path)
     metadata = dict(inventory.metadata)
     if (

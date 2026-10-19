@@ -44,7 +44,7 @@ def test_native_png_publication_preserves_dimensions_channel_order_and_byte_conv
     assert mx.array_equal(encoded[0, 0], mx.array([0, 127, 255], dtype=mx.uint8)).item()
 
 
-def test_output_station_applies_the_only_display_transfer_and_clamp(tmp_path: Path) -> None:
+def test_output_stage_applies_the_only_display_transfer_and_clamp(tmp_path: Path) -> None:
     captured: list[mx.array] = []
 
     def writer(path: Path, image: mx.array) -> None:
@@ -371,7 +371,7 @@ def test_decode_restart_bundle_carries_the_latent_it_re_emits(tmp_path: Path) ->
         Krea2Request("test"),
         "turbo",
         ImageOutputConfig(directory=tmp_path, prefix="replay", save_all_sidecars=True),
-        station="decode",
+        stage="decode",
     )
 
     assert plan.artifacts.initial_noise == ()

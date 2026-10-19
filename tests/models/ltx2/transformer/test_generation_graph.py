@@ -49,7 +49,6 @@ def _model(config: TransformerConstructorConfig, *, shaped: bool) -> LTXAVModel:
         return LTXAVModel.from_config(
             config,
             compute_dtype=mx.float32,
-            use_steel_attention=False,
             compile_attention=False,
         )
 

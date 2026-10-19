@@ -20,7 +20,8 @@ from .components import _VideoEncoderCallablePort
 from .text_encoder.encoder import AudioVideoGemmaEncoderOutput
 from .text_encoder.prompt import encode_prompt
 from .text_encoder.tokenizer_derivation import TokenizerDerivation
-from .types import HDRAuthoring
+from .types import LTX2HDRAuthoring
+from .vocabularies import LTX2ModelGeneration
 
 _CONTEXT_DTYPES = frozenset({mx.bfloat16, mx.float16, mx.float32})
 _LOG = logging.getLogger(__name__)
@@ -36,10 +37,10 @@ def _require_finite(name: str, value: mx.array, source: Path) -> None:
 def encode_text(
     prompt: str,
     *,
-    gemma_path: Path | str,
+    text_encoder_path: Path | str,
     connector_path: Path | str,
     config_path: Path | str,
-    model_generation: str = "2.3",
+    model_generation: LTX2ModelGeneration = LTX2ModelGeneration.LTX23,
     projection_path: Path | str | None = None,
     tokenizer: TokenizerDerivation | None = None,
     pad_prompt_to_max: bool = True,
@@ -48,7 +49,7 @@ def encode_text(
     """Encode one prompt through Gemma and the LTX A/V connectors."""
     return encode_prompt(
         prompt,
-        gemma_path=gemma_path,
+        text_encoder_path=text_encoder_path,
         connector_path=connector_path,
         config_path=config_path,
         model_generation=model_generation,
@@ -158,7 +159,7 @@ def encode_image(
     width: int,
     height: int,
     compute_dtype: mx.Dtype,
-    hdr_authoring: HDRAuthoring | None = None,
+    hdr_authoring: LTX2HDRAuthoring | None = None,
     reporter: Reporter | None = None,
 ) -> mx.array:
     """Cover-crop one typed image and encode it as a one-frame video latent."""
@@ -177,7 +178,7 @@ def encode_image(
         else:
             source_linear = image
             linear = source_linear
-            if hdr_authoring == "SRGB_LINEAR":
+            if hdr_authoring == LTX2HDRAuthoring.SRGB_LINEAR:
                 linear = convert_scene_linear_primaries(
                     linear,
                     source=ColorPrimaries.REC709,

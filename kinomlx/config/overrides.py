@@ -3,7 +3,6 @@
 import dataclasses
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from types import MappingProxyType
 from typing import cast
 
 from kinomlx.config_records import record_intent
@@ -86,9 +85,8 @@ def _apply(
 def _leaf_values(path: TargetPath, value: object) -> tuple[tuple[TargetPath, object], ...]:
     if isinstance(value, dict) and value:
         return tuple(
-            leaf
+            *_leaf_values((*path, key), child)
             for key, child in cast(dict[str, object], value).items()
-            for leaf in _leaf_values((*path, key), child)
         )
     return ((path, value),)
 
@@ -201,7 +199,7 @@ class SetOverrides:
                     replacements.add(path)
             origins = {path: origin for path, origin in origins.items() if path in surviving}
             replacements.intersection_update(surviving)
-        return PreparedConfig(values, MappingProxyType(origins), frozenset(replacements))
+        return PreparedConfig(values, frozendict(origins), frozenset(replacements))
 
     def merge(
         self,

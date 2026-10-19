@@ -1,0 +1,17 @@
+# Package-only lint additions. Every package module is imported statically, so the import
+# graph stays visible to Ruff, mypy, and readers. Tests may still import modules by name to
+# parametrize over models, so these bans live here rather than in pyproject.toml.
+extend = "../pyproject.toml"
+# A config in this directory would otherwise resolve isort's first-party roots here, where the
+# case-insensitive filesystem makes `VideoToolbox` look like the local `videotoolbox` package.
+src = ["..", "../src"]
+# Share the repository cache instead of starting a second one inside the package.
+cache-dir = "../.ruff_cache"
+
+[lint.flake8-tidy-imports.extend-banned-api]
+"importlib.import_module".msg = "Import the module statically and keep one visible import graph."
+"importlib.__import__".msg = "Import the module statically and keep one visible import graph."
+"importlib.util.spec_from_file_location".msg = "Load package modules through ordinary imports, not file paths."
+"importlib.util.module_from_spec".msg = "Load package modules through ordinary imports, not file paths."
+"runpy.run_module".msg = "Call package code through an ordinary import."
+"runpy.run_path".msg = "Call package code through an ordinary import."

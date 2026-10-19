@@ -7,11 +7,11 @@ import pytest
 
 import kinomlx.models.ltx2.runner as runner_module
 from kinomlx.memory_policy import MLXMemoryPolicy
-from kinomlx.models.ltx2.generation import GenerationOutput
-from kinomlx.models.ltx2.restart import DistilledRestart
+from kinomlx.models.ltx2.generation import LTX2GenerationOutput
+from kinomlx.models.ltx2.restart import LTX2Restart
 from kinomlx.models.ltx2.runner import LTX2Error, LTX2Runner
 from kinomlx.models.ltx2.settings import LTX2Settings
-from kinomlx.models.ltx2.types import DistilledRequest
+from kinomlx.models.ltx2.types import LTX2Request
 from kinomlx.settings import Settings
 from tests._reporting import RecordingReporter
 
@@ -41,9 +41,9 @@ def test_runner_supplies_one_prepared_plan_and_the_same_stateless_ports() -> Non
 
     def recipe(request, received_resources, **ports):
         calls.append((request, received_resources, ports))
-        return GenerationOutput(frames=_Frames())
+        return LTX2GenerationOutput(frames=_Frames())
 
-    request = DistilledRequest(prompt="first")
+    request = LTX2Request(prompt="first")
     runner = LTX2Runner(
         resources=resources,
         components=components,
@@ -82,13 +82,13 @@ def test_runner_core_runs_distinct_recipe_request_types_without_branching() -> N
 
     def first(request, _resources, **_ports):
         events.append(("first", request.prompt))
-        return GenerationOutput(frames=_Frames())
+        return LTX2GenerationOutput(frames=_Frames())
 
     def second(request, _resources, **_ports):
         events.append(("second", request.value))
-        return GenerationOutput(frames=_Frames())
+        return LTX2GenerationOutput(frames=_Frames())
 
-    runner.run(first, DistilledRequest(prompt="hello"))
+    runner.run(first, LTX2Request(prompt="hello"))
     runner.run(second, OtherRequest(7))
 
     assert events == [("first", "hello"), ("second", 7)]
@@ -106,11 +106,11 @@ def test_runner_restart_uses_the_same_public_recipe_ports(monkeypatch, tmp_path)
 
     def fake_restart(request, received_resources, *, restart, **ports):
         calls.append((request, received_resources, restart, ports))
-        return GenerationOutput(frames=_Frames())
+        return LTX2GenerationOutput(frames=_Frames())
 
-    monkeypatch.setattr(restart_module, "restart_distilled", fake_restart)
-    request = DistilledRequest(prompt="", width=64, height=64, frames=9)
-    restart = DistilledRestart.decode(tmp_path / "final.safetensors")
+    monkeypatch.setattr(restart_module, "restart_ltx2", fake_restart)
+    request = LTX2Request(prompt="", width=64, height=64, frames=9)
+    restart = LTX2Restart.decode(tmp_path / "final.safetensors")
     runner = LTX2Runner(
         resources=resources,
         components=components,
@@ -189,13 +189,13 @@ def test_recipe_must_return_generation_output() -> None:
         resources=SimpleNamespace(memory_policy=MLXMemoryPolicy()), components=object()
     )
 
-    with pytest.raises(TypeError, match="must return GenerationOutput"):
+    with pytest.raises(TypeError, match="must return LTX2GenerationOutput"):
         runner.run(lambda *_args, **_kwargs: object(), object())
 
 
 def test_generation_output_context_closes_an_unconsumed_stream() -> None:
     frames = _Frames()
-    with GenerationOutput(frames=frames) as output:
+    with LTX2GenerationOutput(frames=frames) as output:
         assert output.frames is frames
         assert not frames.closed
     assert frames.closed
@@ -204,10 +204,10 @@ def test_generation_output_context_closes_an_unconsumed_stream() -> None:
 def test_generation_output_collects_lazy_runtime_diagnostics() -> None:
     frames = _Frames()
     payload = {"vae_decode": {"tiling": {"total_tiles": 1}}}
-    output = GenerationOutput(
+    output = LTX2GenerationOutput(
         frames=frames,
         diagnostics_provider=lambda: payload,
     )
 
     assert output.runtime_diagnostics() is payload
-    assert GenerationOutput(frames=frames).runtime_diagnostics() == {}
+    assert LTX2GenerationOutput(frames=frames).runtime_diagnostics() == {}

@@ -9,12 +9,13 @@ import mlx.core as mx
 
 from kinomlx.io.safetensors import inspect_bindings, inspect_safetensors, load_weights, read_dtypes
 from kinomlx.modeling.conversion import Conversion, SourceTensor, plan_sources
+from kinomlx.modeling.dtypes import FloatDType
 from kinomlx.models.ltx2.weights.dtypes import normalize_transformer_dtypes
 from kinomlx.models.ltx2.weights.layout import bake_conv_layout, layout_weight_key
 from kinomlx.models.ltx2.weights.schema import (
     LAYOUT_KEY_PREFIX,
     QUANT_KEY_PREFIX,
-    TRANSFORMER_QUANTIZE_OFF,
+    TransformerQuantize,
     dtype_payload_name,
 )
 from kinomlx.models.ltx2.weights.tensors import (
@@ -45,7 +46,7 @@ class TransformerPreparation:
 def prepare_transformer_source(
     weights_path: Path | str,
     *,
-    transformer_dtype: str | mx.Dtype | None = None,
+    transformer_dtype: FloatDType | mx.Dtype | None = None,
     include_audio: bool,
     video_ff_layout_specs: tuple[tuple[str, str], ...],
     video_ff_layout_layers: tuple[int, ...],
@@ -56,7 +57,7 @@ def prepare_transformer_source(
     audio_attn_layout_specs: tuple[tuple[str, str], ...] = (),
     audio_attn_layout_layers: tuple[int, ...] = (),
     adaln_pretranspose: bool = False,
-    transformer_quantize: str = TRANSFORMER_QUANTIZE_OFF,
+    transformer_quantize: TransformerQuantize = TransformerQuantize.OFF,
     transformer_quantize_exclude_layers: tuple[int, ...] = (),
     video_ff_quantize_specs: tuple[tuple[str, str], ...] = (),
     video_ff_quantize_layers: tuple[int, ...] = (),

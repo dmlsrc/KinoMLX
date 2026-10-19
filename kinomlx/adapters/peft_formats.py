@@ -485,7 +485,9 @@ def parse_peft_adapter(
                 raise ValueError(f"PEFT saved parameter {key!r} must be floating point")
             role = "delta" if parameter.part == "bias" else "set_weight"
             operations.append(
-                AdapterOperation(parameter.prefix, "set", parameter.part, {role: value}, (key,))
+                AdapterOperation(
+                    parameter.prefix, AdapterKind.SET, parameter.part, {role: value}, (key,)
+                )
             )
             if parameter.adapter_name is not None:
                 named_adapters.add(parameter.adapter_name)
@@ -545,7 +547,9 @@ def parse_peft_adapter(
                 part: Literal["weight", "bias"] = "weight" if role == "weight" else "bias"
                 factor = "set_weight" if part == "weight" else "delta"
                 operations.append(
-                    AdapterOperation(prefix, "set", part, {factor: value}, (names[prefix][role],))
+                    AdapterOperation(
+                        prefix, AdapterKind.SET, part, {factor: value}, (names[prefix][role],)
+                    )
                 )
             continue
         for role in factors.keys() & shared.keys():
@@ -557,7 +561,7 @@ def parse_peft_adapter(
         options = _options(family, prefix, factors, config)
         operation = AdapterOperation(
             prefix,
-            cast(AdapterKind, family.lower()),
+            AdapterKind(family.lower()),
             "bias" if family == "BEFT" else "weight",
             factors,
             tuple(sorted(names[prefix].values())),

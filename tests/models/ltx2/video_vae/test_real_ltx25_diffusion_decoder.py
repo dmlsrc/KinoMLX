@@ -9,6 +9,7 @@ import pytest
 
 from kinomlx.models.ltx2.components import load_video_decoder
 from kinomlx.models.ltx2.video_vae.config import VideoVAEConfig
+from kinomlx.models.ltx2.video_vae.kinds import VideoVAEKind
 from kinomlx.models.ltx2.video_vae.tiling import TilingConfig, decode_streaming
 from tests._snapshots import pinned_snapshot
 
@@ -42,7 +43,7 @@ def test_real_ltx25_diffusion_decoder_is_seeded_bounded_and_provider_selected() 
     mx.clear_cache()
     try:
         with load_video_decoder(resources) as decoder:
-            assert decoder.decoder_kind == "diffusion-na"
+            assert decoder.decoder_kind == VideoVAEKind.DIFFUSION
             assert decoder.load_receipt is not None
             assert decoder.load_receipt.loaded_tensors == 311
             assert decoder.load_receipt.ignored_decoder_tensors == ("decoder.type_emb",)

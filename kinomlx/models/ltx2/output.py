@@ -12,8 +12,8 @@ from kinomlx.media.signals import (
     ColorTransfer,
     EncodedVideoDeliverySpec,
     ExrDeliverySpec,
-    ExrSampleType,
     OutputColorPlan,
+    SampleDType,
 )
 from kinomlx.output import (
     Generation,
@@ -120,21 +120,21 @@ def _resolved_hdr_exr_delivery(authoring: str) -> ExrDeliverySpec:
         return ExrDeliverySpec(
             primaries=ColorPrimaries.REC709,
             transfer=ColorTransfer.LINEAR,
-            sample_type=ExrSampleType.FLOAT16,
+            sample_type=SampleDType.FLOAT16,
             color_space_tag="Linear sRGB",
         )
     if authoring == "ACESCG":
         return ExrDeliverySpec(
             primaries=ColorPrimaries.ACESCG,
             transfer=ColorTransfer.LINEAR,
-            sample_type=ExrSampleType.FLOAT16,
+            sample_type=SampleDType.FLOAT16,
             color_space_tag="ACEScg",
         )
     if authoring == "ACESCCT":
         return ExrDeliverySpec(
             primaries=ColorPrimaries.ACESCG,
             transfer=ColorTransfer.ACESCCT,
-            sample_type=ExrSampleType.FLOAT16,
+            sample_type=SampleDType.FLOAT16,
             color_space_tag="ACEScct",
         )
     raise OutputError(f"unsupported HDR EXR authoring mode {authoring!r}")

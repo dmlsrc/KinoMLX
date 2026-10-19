@@ -6,7 +6,7 @@ import mlx.core as mx
 
 from kinomlx._json import JsonObject
 from kinomlx.io.identity import payload_digest
-from kinomlx.modeling.dtypes import resolve_float_dtype
+from kinomlx.modeling.dtypes import FloatDType, resolve_float_dtype
 from kinomlx.modeling.loading import WeightTarget
 from kinomlx.reporting import Reporter
 
@@ -140,7 +140,7 @@ def _targets(model: Krea2ImageDecoder) -> dict[str, WeightTarget]:
 def load_krea2_vae_weights(
     model: Krea2ImageDecoder,
     *,
-    expected_dtype: str | mx.Dtype | None = None,
+    expected_dtype: FloatDType | mx.Dtype | None = None,
     source_bindings: tuple[Krea2TensorBinding, ...],
     reporter: Reporter | None = None,
 ) -> Krea2VAELoadReceipt:

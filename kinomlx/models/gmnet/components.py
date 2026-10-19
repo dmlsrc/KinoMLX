@@ -23,7 +23,7 @@ class GMNetPort(Protocol):
     ) -> tuple[mx.array, mx.array, mx.array]: ...
 
 
-class GMNetComponents(Protocol):
+class GMNetComponentsProvider(Protocol):
     """Provider surface for bounded GMNet component ownership."""
 
     def generator(self, resources: GMNetResources) -> ComponentLease[GMNetPort]: ...
@@ -59,7 +59,7 @@ def load_generator(
 
 
 @dataclass(frozen=True)
-class NativeGMNetComponents:
+class GMNetComponents:
     """Default provider implementing the public GMNet component surface."""
 
     reporter: Reporter | None = None
@@ -70,7 +70,7 @@ class NativeGMNetComponents:
 
 __all__ = [
     "GMNetComponents",
+    "GMNetComponentsProvider",
     "GMNetPort",
-    "NativeGMNetComponents",
     "load_generator",
 ]

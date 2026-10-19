@@ -8,7 +8,6 @@ from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from functools import cached_property
 from pathlib import Path
-from types import MappingProxyType
 from typing import cast
 
 from kinomlx.config_records import supplied_fields
@@ -36,7 +35,7 @@ def restart_source(run: Path) -> Iterator[None]:
     """Report every failure of a restart source as one located configuration error.
 
     Opening a saved run reads a file, decodes JSON, admits a persisted
-    configuration and resolves the artifacts the selected station consumes.
+    configuration and resolves the artifacts the selected stage consumes.
     Each of those can fail for a reason the user controls through ``[restart]``,
     so the failure is named after that table and rendered as a configuration
     error rather than reaching the console as a traceback. A failure that
@@ -65,29 +64,27 @@ def config_table(config: Mapping[str, object], name: str) -> Mapping[str, object
 
 
 def refuse_restart_changes(
-    schema: ModelConfigSpec, changed: Sequence[ConfigPath], *, station: str
+    schema: ModelConfigSpec, changed: Sequence[ConfigPath], *, stage: str
 ) -> None:
     """Refuse one restart in the declared words of every field it turned away.
 
-    Every station policy is required to carry a nonempty reason, so the refusal
-    quotes it rather than asserting one generic cause for inputs that a station
+    Every stage policy is required to carry a nonempty reason, so the refusal
+    quotes it rather than asserting one generic cause for inputs that a stage
     may have locked or may simply never read.
     """
     if not changed:
         return
     details = []
     for path in changed:
-        policy = next(
-            item for item in schema.field(path).station_policies if item.station == station
-        )
+        policy = next(item for item in schema.field(path).stage_policies if item.stage == stage)
         name = f"[{path[0]}]." + ".".join(path[1:])
         relation = (
             "is not used on replay"
             if policy.mode == "irrelevant"
-            else "belongs to an earlier station"
+            else "belongs to an earlier stage"
         )
         details.append(f"{name} {relation}: {policy.reason}")
-    raise ConfigError(f"[restart]: {station} restart: " + "; ".join(details))
+    raise ConfigError(f"[restart]: {stage} restart: " + "; ".join(details))
 
 
 def _restart_key_surfaces(layers: Sequence[SelectionLayer]) -> dict[str, str]:
@@ -194,7 +191,7 @@ def _compose_states(schema: ModelConfigSpec, states: tuple[PreparedConfig, ...])
         origins.update(state.origins)
         surviving = schema.target_paths(values)
         origins = {path: origin for path, origin in origins.items() if path in surviving}
-    return PreparedConfig(values, MappingProxyType(origins), frozenset(replacements & surviving))
+    return PreparedConfig(values, frozendict(origins), frozenset(replacements & surviving))
 
 
 @dataclass(frozen=True)
@@ -298,9 +295,7 @@ class InvocationLayers:
         surviving = self.schema.target_paths(values)
         return PreparedConfig(
             values,
-            MappingProxyType(
-                {path: origin for path, origin in origins.items() if path in surviving}
-            ),
+            frozendict({path: origin for path, origin in origins.items() if path in surviving}),
             self.override.replacements & surviving,
         )
 
@@ -400,9 +395,14 @@ class InvocationSources:
         return replace(self, layers=tuple(layers), environment_origins=origins)
 
     def prepare(
-        self, saved: PreparedConfig | None = None, *, station: str = "generate"
+        self, saved: PreparedConfig | None = None, *, stage: str | None = None
     ) -> InvocationLayers:
-        """Prepare lower layers, then execute one override stream against their saved context."""
+        """Prepare lower layers, then execute one override stream against their saved context.
+
+        ``stage`` is where the run starts; a fresh run starts at the model's first stage.
+        """
+        if stage is None:
+            stage = self.schema.stages[0]
         origins: tuple[dict[TargetPath, FieldOrigin], ...] = tuple(
             {
                 path: FieldOrigin(path, "explicit", True, SourceLocation(kind, source))
@@ -419,7 +419,7 @@ class InvocationSources:
         if saved is not None and not (saved.explicit | saved.replacements) <= saved_paths:
             raise ConfigError("saved configuration presence does not match its declared fields")
         prepared = tuple(
-            self.schema.prepare_station_layer(state, station=station)
+            self.schema.prepare_stage_layer(state, stage=stage)
             for state in self.schema.prepare_layers_with_provenance(
                 self.layers, initial_origins=origins, admitted=True
             )
@@ -471,7 +471,7 @@ class InvocationSources:
                 decoded.values, decoded.origins, applied.replacements, decoded.active_explicit
             )
         )
-        normalized = self.schema.prepare_station_layer(normalized, station=station)
+        normalized = self.schema.prepare_stage_layer(normalized, stage=stage)
         environment, file, cli = (
             ConfigLayer(
                 source,

@@ -6,14 +6,18 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
-from kinomlx.config import ConfigError
+from kinomlx.config import ConfigError, ModelConfigSpec
 from kinomlx.config.persistence import rebase_configuration
 from kinomlx.config.provenance import PreparedConfig
-from kinomlx.config.stations import station_output_defaults
-from kinomlx.config_constraints import field_choices
+from kinomlx.config.stages import stage_output_defaults
 from kinomlx.config_records import config_record
 from kinomlx.config_rules import validate_record
-from kinomlx.image_restart_config import ImageRestartArtifactFields, ImageRestartSelectionFields
+from kinomlx.image_restart_config import (
+    IMAGE_CONSUMES,
+    ImageRestartArtifactFields,
+    ImageRestartSelectionFields,
+    ImageStage,
+)
 from kinomlx.prompts import is_empty_prompt_batch
 from kinomlx.restart_receipts import input_receipt, read_restart_run, restart_object
 from kinomlx.restart_selection import (
@@ -35,31 +39,28 @@ _LOG = logging.getLogger(__name__)
 @config_record
 @dataclass(frozen=True)
 class RestartConfig(ImageRestartSelectionFields):
-    """Select a prior Krea run and its first repeated station."""
-
-
-RESTART_PHASE_CHOICES = field_choices(RestartConfig, "phase")
+    """Select a prior Krea run and its first repeated stage."""
 
 
 @config_record
 @dataclass(frozen=True)
 class Krea2Restart(ImageRestartArtifactFields):
-    """One public, typed entry point into the Krea station graph."""
+    """One public, typed entry point into the Krea stage graph."""
 
     @classmethod
     def decode(cls, latents: Path | str) -> Krea2Restart:
         """Decode a saved final-latent product."""
-        return cls(latents=Path(latents), phase="decode")
+        return cls(latents=Path(latents), stage=ImageStage.DECODE)
 
     @classmethod
     def denoise(cls, text_conditioning: Path | str) -> Krea2Restart:
         """Resume from saved Qwen output at the single Krea denoising stage."""
-        return cls(phase="denoise", text_conditioning=Path(text_conditioning))
+        return cls(stage=ImageStage.DENOISE, text_conditioning=Path(text_conditioning))
 
 
 @dataclass(frozen=True)
 class RestartManifest:
-    """Validated prior-run configuration and selected station inputs."""
+    """Validated prior-run configuration and selected stage inputs."""
 
     config: RestartConfig
     source_index: int
@@ -129,6 +130,7 @@ class RestartManifest:
         """Return the prior invocation as a safe lower-precedence config layer."""
         base = copy.deepcopy(self.configuration.values)
         base.pop("restart", None)
+        base["operation"] = {"dry_run": False}
 
         raw_model_settings = base.get("model_settings")
         model_settings: dict[str, object] = (
@@ -144,7 +146,7 @@ class RestartManifest:
         generate: dict[str, object] = (
             {} if not isinstance(raw_generate, dict) else dict(raw_generate)
         )
-        if self.config.phase == "denoise":
+        if self.config.stage == "denoise":
             if self.text_conditioning is not None:
                 generate["text_conditioning"] = self.text_conditioning
         else:
@@ -170,18 +172,18 @@ class RestartManifest:
                 "directory": self.source_run.parent,
                 "prefix": (
                     f"{source_stem}_final_decode"
-                    if self.config.phase == "decode"
+                    if self.config.stage == "decode"
                     else f"{source_stem}_denoise"
                 ),
             }
         )
-        if self.config.phase == "decode":
+        if self.config.stage == "decode":
             output.update(
                 {
                     "save_all_sidecars": False,
                 }
             )
-        base["output"] = station_output_defaults(output, OUTPUT_POLICIES, station=self.config.phase)
+        base["output"] = stage_output_defaults(output, OUTPUT_POLICIES, stage=self.config.stage)
         return rebase_configuration(self.configuration, base)
 
     def to_record(
@@ -190,7 +192,7 @@ class RestartManifest:
         text_conditioning: Path | None = None,
     ) -> dict[str, object]:
         """Return parent-run provenance and observational input identity."""
-        if self.config.phase == "decode":
+        if self.config.stage == "decode":
             inputs = {
                 "final_latents": input_receipt(
                     self.selected_latents,
@@ -199,7 +201,6 @@ class RestartManifest:
                     expected_metadata=_expected_metadata("final_latents"),
                 )
             }
-            latent_stage: str | None = "final"
         else:
             selected_text = (
                 self.selected_text_conditioning
@@ -214,7 +215,6 @@ class RestartManifest:
                     expected_metadata=_expected_metadata("text_conditioning"),
                 )
             }
-            latent_stage = None
         return {
             "source_run": str(self.source_run),
             "source_status": self.source_status,
@@ -222,8 +222,7 @@ class RestartManifest:
             "source_model": self.source_model,
             "source_variant": self.source_variant,
             "source_vae_decoder": self.source_vae_decoder,
-            "phase": self.config.phase,
-            "latent_stage": latent_stage,
+            "stage": self.config.stage,
             "inputs": inputs,
             "identity_mismatch": any(
                 receipt.get("matches_parent") is False for receipt in inputs.values()
@@ -302,7 +301,7 @@ def _source_artifacts(
     fingerprints = _source_output_fingerprints(payload, source, index=index, count=count)
     artifacts: dict[str, Path | None] = {}
     input_paths: list[Path] = []
-    selected_name = "final_latents" if config.phase == "decode" else "text_conditioning"
+    (selected_name,) = IMAGE_CONSUMES[config.stage]
     for name in ("final_latents", "text_conditioning"):
         label = f"outputs.{name}"
         try:
@@ -423,10 +422,10 @@ def _source_output_fingerprints(
     return result
 
 
-def load_restart_manifest(config: RestartConfig) -> RestartManifest:
-    """Load one KinoMLX Krea run JSON and resolve its station artifacts."""
+def load_restart_manifest(config: RestartConfig, *, schema: ModelConfigSpec) -> RestartManifest:
+    """Load one KinoMLX Krea run JSON and resolve its stage artifacts."""
     validate_record(config, location="[restart]")
-    run_log = read_restart_run(config.run, model="krea2")
+    run_log = read_restart_run(config.run, schema=schema)
     source = run_log.source
     payload = run_log.payload
     configuration = run_log.configuration
@@ -458,7 +457,7 @@ def load_restart_manifest(config: RestartConfig) -> RestartManifest:
         payload, outputs, config, source, index=index, count=count, published=published
     )
     manifest = RestartManifest(
-        config=RestartConfig(run=source, phase=config.phase, latents=override, index=config.index),
+        config=RestartConfig(run=source, stage=config.stage, latents=override, index=config.index),
         source_index=index,
         source_image_count=count,
         source_run=source,
@@ -474,7 +473,7 @@ def load_restart_manifest(config: RestartConfig) -> RestartManifest:
         configuration=configuration,
         generation=restart_object(payload.get("generation", {}), label="generation", source=source),
     )
-    if config.phase == "decode":
+    if config.stage == "decode":
         selected = manifest.selected_latents
         if not selected.is_file():
             raise ConfigError(f"restart latent artifact does not exist: {selected}")
@@ -482,7 +481,6 @@ def load_restart_manifest(config: RestartConfig) -> RestartManifest:
 
 
 __all__ = [
-    "RESTART_PHASE_CHOICES",
     "Krea2Restart",
     "RestartConfig",
     "RestartManifest",

@@ -1,4 +1,4 @@
-"""CLI contracts for restarting from saved KinoMLX station products."""
+"""CLI contracts for restarting from saved KinoMLX stage products."""
 
 import json
 from datetime import datetime
@@ -17,7 +17,7 @@ from kinomlx.models.ltx2.config import (
     resolve_for_execution,
     validate_for_execution,
 )
-from kinomlx.models.ltx2.restart import DistilledRestart
+from kinomlx.models.ltx2.restart import LTX2Restart
 from kinomlx.models.ltx2.settings import STREAM_TRANSFORMER_RESIDENT_BLOCKS
 from kinomlx.settings import Settings
 from tests.cli.test_main import _generation_output
@@ -108,8 +108,8 @@ def test_restart_defaults_to_final_latent_decode_and_safe_new_output(tmp_path: P
     invocation = _assemble(run)
 
     assert invocation.restart is not None
-    assert invocation.restart.config.phase == "decode"
-    assert invocation.restart.selected_latent_stage == "final"
+    assert invocation.restart.config.stage == "decode"
+    assert invocation.restart.selected_latent_stage == "stage-2"
     assert invocation.restart.selected_latents == paths["final_latents"]
     assert invocation.request.seed == 42
     assert (invocation.request.width, invocation.request.height, invocation.request.frames) == (
@@ -119,13 +119,13 @@ def test_restart_defaults_to_final_latent_decode_and_safe_new_output(tmp_path: P
     )
     assert invocation.output.path is None
     assert invocation.output.directory == tmp_path
-    assert invocation.output.prefix == "parent_final_decode"
+    assert invocation.output.prefix == "parent_stage2_decode"
     # Decode re-emits the final latent it read, so the parent's request survives.
     assert invocation.model_artifacts.save_latents is True
     assert invocation.model_artifacts.save_text_conditioning is False
 
     resolved = resolve_for_execution(invocation, now=datetime(2026, 8, 22, 20, 0, 0))
-    assert resolved.output.path == tmp_path / "parent_final_decode_20260822_200000.mp4"
+    assert resolved.output.path == tmp_path / "parent_stage2_decode_20260822_200000.mp4"
     assert resolved.output.path != paths["video"]
 
 
@@ -169,19 +169,20 @@ def test_restart_decode_allows_seed_and_downstream_overrides(tmp_path: Path) -> 
         ("--prompt", "new prompt"),
         ("--width", "832"),
         ("--lora", "different.safetensors"),
-        ("--sampler", "deterministic"),
+        ("--stage1-sampler", "deterministic"),
+        ("--stage2-sampler", "ancestral"),
     ],
 )
-def test_decode_restart_rejects_changes_to_stations_it_skips(
+def test_decode_restart_rejects_changes_to_stages_it_skips(
     arguments: tuple[str, str],
     tmp_path: Path,
 ) -> None:
     run, _paths = _source_run(tmp_path)
-    with pytest.raises(ConfigError, match="belongs to an earlier station"):
+    with pytest.raises(ConfigError, match="belongs to an earlier stage"):
         _assemble(run, *arguments)
 
 
-def test_restart_refusal_names_the_station_and_quotes_the_declared_reason(
+def test_restart_refusal_names_the_stage_and_quotes_the_declared_reason(
     tmp_path: Path,
 ) -> None:
     run, _paths = _source_run(tmp_path)
@@ -191,7 +192,7 @@ def test_restart_refusal_names_the_station_and_quotes_the_declared_reason(
 
     assert str(refusal.value) == (
         "[restart]: decode restart: [generate].stage_2_sigmas belongs to an earlier "
-        "station: The saved final latent already embodies the stage-2 schedule."
+        "stage: The saved final latent already embodies the stage-2 schedule."
     )
 
 
@@ -278,14 +279,102 @@ def test_stage_2_restart_accepts_a_new_stage_2_schedule_and_decode_refuses_it(
         _assemble(run, "--sigmas-stage-2", schedule)
 
 
+def test_stage_2_restart_accepts_a_new_stage_2_sampler_and_decode_refuses_it(
+    tmp_path: Path,
+) -> None:
+    """Comparing stage-2 samplers on one saved stage-1 latent is a stage-2 restart."""
+    run, _paths = _source_run(tmp_path)
+
+    invocation = _assemble(run, "--restart-from", "stage-2", "--stage2-sampler", "deterministic")
+
+    assert invocation.request.stage_2_sampler == "deterministic"
+    assert invocation.request.stage_1_sampler == "auto"
+    validate_for_execution(invocation)
+
+    with pytest.raises(ConfigError, match=r"\[generate\]\.stage_2_sampler"):
+        _assemble(run, "--stage2-sampler", "deterministic")
+
+
 def test_stage_2_restart_rejects_geometry_and_prompt_changes(tmp_path: Path) -> None:
     run, _paths = _source_run(tmp_path)
     with pytest.raises(ConfigError, match=r"\[generate\]\.frames"):
         _assemble(run, "--restart-from", "stage-2", "--frames", "129")
     with pytest.raises(ConfigError, match=r"\[generate\]\.prompt"):
         _assemble(run, "--restart-from", "stage-2", "--prompt", "new prompt")
-    with pytest.raises(ConfigError, match=r"\[generate\]\.sampler"):
-        _assemble(run, "--restart-from", "stage-2", "--sampler", "deterministic")
+    with pytest.raises(ConfigError, match=r"\[generate\]\.stage_1_sampler"):
+        _assemble(run, "--restart-from", "stage-2", "--stage1-sampler", "deterministic")
+
+
+def _image_run(tmp_path: Path) -> Path:
+    """One parent run whose two image conditions already split by stage."""
+    run, _paths = _source_run(
+        tmp_path,
+        generate={
+            "images": [
+                {"path": str(tmp_path / "first.png"), "strength": 0.8},
+                {
+                    "path": str(tmp_path / "last.png"),
+                    "frame_index": 120,
+                    "stage1_strength": 0.9,
+                    "stage2_strength": 0.5,
+                },
+            ]
+        },
+    )
+    return run
+
+
+def test_stage_2_restart_admits_a_new_stage_2_image_strength(tmp_path: Path) -> None:
+    """Stage 2 reapplies the conditions itself, so only its own strengths may move."""
+    run = _image_run(tmp_path)
+
+    invocation = _assemble(
+        run, "--restart-from", "stage-2", "--set", "generate.images[1].stage2_strength=0.3"
+    )
+
+    assert [image.strength_for_stage(1) for image in invocation.request.images] == [0.8, 0.9]
+    assert [image.strength_for_stage(2) for image in invocation.request.images] == [0.8, 0.3]
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        "generate.images[1].stage1_strength=0.2",
+        "generate.images[0].strength=0.4",
+        "generate.images[1].frame_index=100",
+        "generate.images[0].path=other.png",
+    ],
+)
+def test_stage_2_restart_refuses_every_member_its_stage_1_profile_holds(
+    override: str,
+    tmp_path: Path,
+) -> None:
+    run = _image_run(tmp_path)
+    with pytest.raises(ConfigError) as refusal:
+        _assemble(run, "--restart-from", "stage-2", "--set", override)
+    assert str(refusal.value) == (
+        "[restart]: stage-2 restart: [generate].images belongs to an earlier stage: "
+        "The saved latent already embodies this generation or conditioning value."
+    )
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        "generate.images[1].stage2_strength=0.3",
+        "generate.images[1].stage1_strength=0.2",
+        "generate.images[0].strength=0.4",
+        "generate.images[0].path=other.png",
+    ],
+)
+def test_decode_restart_refuses_any_image_change(override: str, tmp_path: Path) -> None:
+    run = _image_run(tmp_path)
+    with pytest.raises(ConfigError) as refusal:
+        _assemble(run, "--set", override)
+    assert str(refusal.value) == (
+        "[restart]: decode restart: [generate].images belongs to an earlier stage: "
+        "The saved latent already embodies this generation or conditioning value."
+    )
 
 
 def test_restart_print_config_round_trips_as_a_complete_invocation(tmp_path: Path) -> None:
@@ -318,14 +407,14 @@ def test_typed_set_can_select_the_same_restart_contract(tmp_path: Path) -> None:
                 "--set",
                 f'restart.run="{run}"',
                 "--set",
-                'restart.phase="stage-2"',
+                'restart.stage="stage-2"',
             ]
         ),
         base_settings=Settings(),
     )
 
     assert invocation.restart is not None
-    assert invocation.restart.config.phase == "stage-2"
+    assert invocation.restart.config.stage == "stage-2"
     assert invocation.restart.selected_latents == paths["stage_1_latents"]
 
 
@@ -552,8 +641,8 @@ def test_cli_dispatches_the_public_restart_recipe_and_records_inputs(
     )
 
     restart = calls["restart"]
-    assert isinstance(restart, DistilledRestart)
-    assert restart == DistilledRestart.decode(
+    assert isinstance(restart, LTX2Restart)
+    assert restart == LTX2Restart.decode(
         paths["final_latents"],
         source_model_generation="2.5",
     )
@@ -621,3 +710,36 @@ def test_a_decode_restart_may_switch_a_custom_parent_to_single(tmp_path: Path) -
     invocation = _assemble(run, "--vae-tiling", "single")
     assert invocation.request.vae_tiling.mode == "single"
     assert invocation.request.vae_tiling.spatial_tile_pixels is None
+
+
+def test_a_saved_named_frame_position_round_trips_and_respelling_is_no_change(
+    tmp_path: Path,
+) -> None:
+    """The record keeps the spelling; admission compares the frame it resolves to."""
+    run, _paths = _source_run(
+        tmp_path,
+        generate={
+            "images": [
+                {"path": str(tmp_path / "first.png")},
+                {"path": str(tmp_path / "last.png"), "frame_index": "last"},
+            ]
+        },
+    )
+    saved = json.loads(run.read_text())["configuration"]["values"]["generate"]["images"]
+    assert saved[1]["frame_index"] == "last"
+
+    invocation = _assemble(run, "--restart-from", "stage-2")
+    assert [image.frame_index for image in invocation.request.images] == ["first", "last"]
+
+    # The parent run holds 121 frames, so 120 and last are the same frame.
+    respelled = _assemble(
+        run, "--restart-from", "stage-2", "--set", "generate.images[1].frame_index=120"
+    )
+    assert [image.frame_index for image in respelled.request.images] == ["first", "120"]
+
+    with pytest.raises(ConfigError) as refusal:
+        _assemble(run, "--restart-from", "stage-2", "--set", "generate.images[1].frame_index=8")
+    assert str(refusal.value) == (
+        "[restart]: stage-2 restart: [generate].images belongs to an earlier stage: "
+        "The saved latent already embodies this generation or conditioning value."
+    )

@@ -1,4 +1,4 @@
-"""Krea text station lifetime, slicing, and provenance contracts."""
+"""Krea text stage lifetime, slicing, and provenance contracts."""
 
 import weakref
 from dataclasses import replace
@@ -7,7 +7,7 @@ from types import SimpleNamespace
 import mlx.core as mx
 import pytest
 
-import kinomlx.models.krea2.text_conditioning as station_module
+import kinomlx.models.krea2.text_conditioning as stage_module
 from kinomlx.config_rules import validate_record
 from kinomlx.models.krea2.pipelines.text_to_image import _negative_prompts
 from kinomlx.models.krea2.request_sources import resolve_request_sources
@@ -16,8 +16,8 @@ from kinomlx.models.krea2.settings import Krea2Settings
 from kinomlx.models.krea2.source_loading import load_component_tokenizer
 from kinomlx.models.krea2.text_conditioning import (
     Krea2PromptConditioning,
+    Krea2TextConditioner,
     Krea2TextConditioning,
-    NativeKrea2TextConditioner,
     load_text_conditioning,
     read_text_conditioning_prompts,
     text_conditioning_artifact,
@@ -68,7 +68,7 @@ def _token_batch(prompts: tuple[str, ...]) -> Krea2TokenBatch:
     )
 
 
-def test_native_station_encodes_both_branches_then_releases_qwen(
+def test_native_stage_encodes_both_branches_then_releases_qwen(
     tmp_path,
     monkeypatch,
 ) -> None:
@@ -119,7 +119,7 @@ def test_native_station_encodes_both_branches_then_releases_qwen(
     def fake_load(_model, *, source_bindings=(), reporter=None) -> Qwen3VLLoadReceipt:
         del reporter
         events.append("load")
-        count, digest = station_module.qwen3_vl_target_identity(
+        count, digest = stage_module.qwen3_vl_target_identity(
             _model.config,
             _model.selected_layers,
         )
@@ -129,17 +129,17 @@ def test_native_station_encodes_both_branches_then_releases_qwen(
             source_files=("text_encoder-00000.safetensors",),
         )
 
-    monkeypatch.setattr(station_module, "Qwen3VLTextModel", _FakeModel)
-    monkeypatch.setattr(station_module, "load_qwen3_vl_text_weights", fake_load)
-    monkeypatch.setattr(station_module, "load_component_tokenizer", make_tokenizer)
+    monkeypatch.setattr(stage_module, "Qwen3VLTextModel", _FakeModel)
+    monkeypatch.setattr(stage_module, "load_qwen3_vl_text_weights", fake_load)
+    monkeypatch.setattr(stage_module, "load_component_tokenizer", make_tokenizer)
     monkeypatch.setattr(
-        station_module,
+        stage_module,
         "prepare_krea2_token_batch",
         lambda _tokenizer, prompts, **_kwargs: _token_batch(prompts),
     )
-    monkeypatch.setattr(station_module, "_cleanup_qwen", lambda: events.append("cleanup"))
+    monkeypatch.setattr(stage_module, "_cleanup_qwen", lambda: events.append("cleanup"))
 
-    result = NativeKrea2TextConditioner()(
+    result = Krea2TextConditioner()(
         ("positive one", "positive two"),
         resources,
         negative_prompts=("negative one", "negative two"),
@@ -173,13 +173,13 @@ def test_native_station_encodes_both_branches_then_releases_qwen(
         resources,
         capabilities=replace(resources.capabilities, is_distilled=False),
     )
-    raw_result = NativeKrea2TextConditioner()("positive", raw_authority)
+    raw_result = Krea2TextConditioner()("positive", raw_authority)
     assert raw_result.provenance.is_distilled is False
     assert raw_result.negative is None
     assert events[-3:] == ["load", "encode:1", "cleanup"]
 
 
-def test_native_station_rejects_mismatched_negative_batch_before_qwen(tmp_path) -> None:
+def test_native_stage_rejects_mismatched_negative_batch_before_qwen(tmp_path) -> None:
     source = make_snapshot(tmp_path / "source", variant="turbo")
     resources = prepare_resources(
         Krea2Settings(source_path=source),
@@ -189,7 +189,7 @@ def test_native_station_rejects_mismatched_negative_batch_before_qwen(tmp_path) 
     )
 
     with pytest.raises(ValueError, match="batch size"):
-        NativeKrea2TextConditioner()(
+        Krea2TextConditioner()(
             ("one", "two"),
             resources,
             negative_prompts=("only one",),
@@ -252,7 +252,7 @@ def _write_conditioning(path, conditioning: Krea2TextConditioning) -> None:
 def test_saved_custom_system_prompt_roundtrip_and_mismatch(tmp_path, monkeypatch, policy):
     resources = _small_resources(tmp_path)
     monkeypatch.setattr(
-        station_module,
+        stage_module,
         "load_component_tokenizer",
         lambda path: SimpleNamespace(encode=lambda text: tuple(range(80))),
     )
@@ -370,7 +370,7 @@ def test_replay_batch_mismatch_reports_saved_and_expanded_counts(
     _write_conditioning(sidecar, _saved_conditioning(resources, negative=False))
     request = resolve_request_sources(Krea2Request(text_conditioning=sidecar, images_per_prompt=2))
     monkeypatch.setattr(
-        station_module, "load_weights", lambda _path: pytest.fail("batch mismatch loaded tensors")
+        stage_module, "load_weights", lambda _path: pytest.fail("batch mismatch loaded tensors")
     )
 
     with pytest.raises(ValueError, match="has 2 rows.*expands to 4 rows.*images_per_prompt=1"):
@@ -446,7 +446,7 @@ def test_saved_text_shape_is_rejected_before_payload_materialization(
     sidecar = tmp_path / "bad_text.safetensors"
     mx.save_safetensors(str(sidecar), tensors, metadata=dict(artifact.metadata))
     monkeypatch.setattr(
-        station_module,
+        stage_module,
         "load_weights",
         lambda _path: pytest.fail("invalid header reached payload materialization"),
     )
@@ -457,9 +457,9 @@ def test_saved_text_shape_is_rejected_before_payload_materialization(
 
 def test_empty_saved_user_prompt_roundtrip_and_conflict(tmp_path):
     resources = _small_resources(tmp_path)
-    station = _saved_conditioning(resources, negative=False, prompts=("",))
+    stage = _saved_conditioning(resources, negative=False, prompts=("",))
     path = tmp_path / "empty.safetensors"
-    _write_conditioning(path, station)
+    _write_conditioning(path, stage)
     for explicit in (False, True):
         request = resolve_request_sources(
             Krea2Request(text_conditioning=path, prompt_unconditional=explicit)
@@ -477,7 +477,7 @@ def test_empty_saved_user_prompt_roundtrip_and_conflict(tmp_path):
         resolve_request_sources(Krea2Request(text_conditioning=path, prompt_unconditional=True))
 
 
-def test_native_station_reuses_loaded_tables_for_identity(tmp_path, monkeypatch) -> None:
+def test_native_stage_reuses_loaded_tables_for_identity(tmp_path, monkeypatch) -> None:
     resources = _small_resources(tmp_path)
     derivations: list[object] = []
 
@@ -503,19 +503,19 @@ def test_native_station_reuses_loaded_tables_for_identity(tmp_path, monkeypatch)
     def fake_load(model, *, source_bindings=(), reporter=None) -> Qwen3VLLoadReceipt:
         del reporter
         loads.append(source_bindings)
-        count, digest = station_module.qwen3_vl_target_identity(model.config, model.selected_layers)
+        count, digest = stage_module.qwen3_vl_target_identity(model.config, model.selected_layers)
         return Qwen3VLLoadReceipt(count, digest, ("model.safetensors",))
 
-    monkeypatch.setattr(station_module, "Qwen3VLTextModel", _FakeModel)
-    monkeypatch.setattr(station_module, "load_qwen3_vl_text_weights", fake_load)
+    monkeypatch.setattr(stage_module, "Qwen3VLTextModel", _FakeModel)
+    monkeypatch.setattr(stage_module, "load_qwen3_vl_text_weights", fake_load)
     monkeypatch.setattr(
-        station_module,
+        stage_module,
         "prepare_krea2_token_batch",
         lambda _tokenizer, prompts, **_kwargs: _token_batch(prompts),
     )
-    monkeypatch.setattr(station_module, "_cleanup_qwen", lambda: None)
+    monkeypatch.setattr(stage_module, "_cleanup_qwen", lambda: None)
 
-    result = NativeKrea2TextConditioner()(("one prompt",), resources)
+    result = Krea2TextConditioner()(("one prompt",), resources)
 
     assert loads == [resources.text_encoder.bindings]
     assert len(derivations) == 1

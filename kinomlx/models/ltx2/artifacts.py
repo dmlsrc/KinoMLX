@@ -3,13 +3,11 @@
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from types import MappingProxyType
-from typing import Literal, Protocol
+from typing import Protocol
 
 import mlx.core as mx
 
 from kinomlx.artifacts import TensorArtifact
-from kinomlx.config.stations import OutputPolicy
 from kinomlx.config_records import config_record
 from kinomlx.types import VideoPixelShape
 
@@ -22,43 +20,20 @@ from .conditioning import (
     VideoConditionByLatentIndex,
     VideoConditionByReferenceLatent,
 )
+from .output_policies import ARTIFACT_GROUPS, ARTIFACT_STAGES, OUTPUT_POLICIES
+from .restart_rules import (
+    FINAL_LATENTS,
+    READABLE,
+    STAGE_1_CONDITIONING,
+    STAGE_1_LATENTS,
+    STAGE_2_CONDITIONING,
+    START_STAGES,
+    TEXT_CONDITIONING,
+    LTX2Stage,
+    consumed_artifacts,
+)
+from .vocabularies import LTX2FirstFrameMode
 
-TEXT_CONDITIONING = "text_conditioning"
-STAGE_1_CONDITIONING = "stage_1_conditioning"
-STAGE_2_CONDITIONING = "stage_2_conditioning"
-STAGE_1_LATENTS = "stage_1_latents"
-FINAL_LATENTS = "final_latents"
-
-# A restart station re-emits what it consumed and still holds, so a bundle it
-# writes can itself be restarted. Stage-2 reloads saved text and the stage-1
-# latent before it runs; decode reloads exactly one latent product and
-# ``requested_artifacts`` narrows the pair below to the stage it consumed.
-ARTIFACT_STATIONS = MappingProxyType(
-    {
-        TEXT_CONDITIONING: OutputPolicy(frozenset({"generate", "stage-2"})),
-        STAGE_1_CONDITIONING: OutputPolicy(frozenset({"generate"})),
-        STAGE_2_CONDITIONING: OutputPolicy(frozenset({"generate", "stage-2"})),
-        STAGE_1_LATENTS: OutputPolicy(frozenset({"generate", "stage-2", "decode"})),
-        FINAL_LATENTS: OutputPolicy(frozenset({"generate", "stage-2", "decode"})),
-    }
-)
-ARTIFACT_GROUPS = MappingProxyType(
-    {
-        "save_latents": (STAGE_1_LATENTS, FINAL_LATENTS),
-        "save_text_conditioning": (TEXT_CONDITIONING,),
-        "save_media_conditioning": (STAGE_1_CONDITIONING, STAGE_2_CONDITIONING),
-    }
-)
-OUTPUT_POLICIES = MappingProxyType(
-    {
-        field: OutputPolicy(
-            frozenset(
-                station for name in artifacts for station in ARTIFACT_STATIONS[name].produced_at
-            )
-        )
-        for field, artifacts in ARTIFACT_GROUPS.items()
-    }
-)
 _TEXT_CONDITIONING_V3_FIELDS = frozenset(
     {
         "tokenizer_source_sha256",
@@ -121,17 +96,17 @@ def requested_artifacts(
     *,
     save_all: bool = False,
     has_media_conditioning: bool = False,
-    station: Literal["generate", "decode", "stage-2"] = "generate",
-    source_latent_stage: Literal["stage-1", "final"] = "final",
+    stage: LTX2Stage = LTX2Stage.TEXT,
+    source_latent_stage: LTX2Stage | None = None,
 ) -> frozenset[str]:
     """Resolve enabled LTX-2 tensor artifacts from host output selections.
 
     ``source_latent_stage`` names the latent product a decode restart consumed.
-    Decode re-emits that one product and never the other, so a requested
-    artifact is always one the station can actually write.
+    A restart re-emits only what it read back, so decode narrows to that one
+    product and a requested artifact is always one the stage can write.
     """
-    if station not in {"generate", "decode", "stage-2"}:
-        raise ValueError(f"unknown artifact station {station!r}")
+    if stage not in START_STAGES:
+        raise ValueError(f"unknown artifact stage {stage!r}")
     requested: set[str] = set()
     for field, artifacts in ARTIFACT_GROUPS.items():
         value = getattr(options, field)
@@ -139,17 +114,17 @@ def requested_artifacts(
         selected = OUTPUT_POLICIES[field].selected(
             value,
             save_all=save_all and (not media or has_media_conditioning),
-            station=station,
+            stage=stage,
             field=field,
         )
         if selected and media and not has_media_conditioning:
             raise ValueError("save_media_conditioning requires --image or --hdr-reference")
         if selected:
             requested.update(
-                name for name in artifacts if station in ARTIFACT_STATIONS[name].produced_at
+                name for name in artifacts if stage in ARTIFACT_STAGES[name].produced_at
             )
-    if station == "decode":
-        requested.discard(STAGE_1_LATENTS if source_latent_stage == "final" else FINAL_LATENTS)
+    if stage != START_STAGES[0]:
+        requested -= set(READABLE[stage]) - set(consumed_artifacts(stage, source_latent_stage))
     return frozenset(requested)
 
 
@@ -194,11 +169,18 @@ def distilled_stage_latents_artifact(
     audio_latent: mx.array | None,
     final: bool,
     noise_state: NoiseArtifactState | None = None,
+    generated_keyframes: mx.array | None = None,
 ) -> TensorArtifact:
-    """Build one materialized two-stage distilled latent artifact."""
+    """Build one materialized two-stage distilled latent artifact.
+
+    ``generated_keyframes`` holds the stage's denoised keyframe slots, which a stage-2
+    restart needs to seed stage 2's slots.
+    """
     tensors: tuple[tuple[str, mx.array], ...] = (("video_latent", video_latent),)
     if audio_latent is not None:
         tensors += (("audio_latent", audio_latent),)
+    if generated_keyframes is not None:
+        tensors += (("generated_keyframes", generated_keyframes),)
     return TensorArtifact(
         name=FINAL_LATENTS if final else STAGE_1_LATENTS,
         tensors=tensors,
@@ -224,6 +206,7 @@ def media_conditioning_artifact(
     conditions: Sequence[EncodedCondition],
     geometry: VideoPixelShape,
     fps: float,
+    first_frame_mode: LTX2FirstFrameMode,
 ) -> TensorArtifact:
     """Build one stage's ordered VAE-encoded media-conditioning product."""
 
@@ -238,6 +221,9 @@ def media_conditioning_artifact(
         ("artifact", "ltx2_media_conditioning"),
         ("stage", str(stage)),
         ("condition_count", str(len(conditions))),
+        # How the frame-0 condition was applied; the families below stay keyed
+        # to the source, so a frame-0 source is still the ``image`` family.
+        ("first_frame_mode", str(first_frame_mode)),
         ("frame_count", str(geometry.frames)),
         ("width", str(geometry.width)),
         ("height", str(geometry.height)),
@@ -260,7 +246,8 @@ def media_conditioning_artifact(
                     (f"{prefix}_family", source.family),
                     (f"{prefix}_source_path", str(source.path)),
                     (f"{prefix}_frame_index", str(source.frame_index)),
-                    (f"{prefix}_strength", str(source.strength)),
+                    # The strength this stage applied, not the common intent.
+                    (f"{prefix}_strength", str(source.strength_for_stage(stage))),
                     (
                         f"{prefix}_hdr_authoring",
                         "none" if source.hdr_authoring is None else source.hdr_authoring,

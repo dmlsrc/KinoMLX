@@ -9,10 +9,12 @@ from typing import cast
 
 import mlx.core as mx
 
+from kinomlx.kernels import low_rank_fusion
+from kinomlx.modeling.dtypes import FloatDType
 from kinomlx.modeling.loading import WeightTarget
 
 from .algebra import plain_lora_entry, reconstruct_delta
-from .formats import AdapterOperation
+from .formats import AdapterKind, AdapterOperation
 from .lora import validated_lora_scale
 from .validation import AdapterWeightCheck
 
@@ -42,16 +44,17 @@ def _fused_weight(
     *,
     transposed: bool,
     base_weight: mx.array | None = None,
-    accumulation: str = "float32",
+    accumulation: FloatDType = FloatDType.FLOAT32,
 ) -> mx.array:
     original = logical_weight(target, transposed=transposed)
     ordered = sorted(operations, key=lambda item: (item.order_key, item.strength))
     entries = [(plain_lora_entry(selected.operation), selected) for selected in ordered]
     if (
-        accumulation == "float16"
+        accumulation == FloatDType.FLOAT16
         and original.dtype == mx.float16
         and all(
-            entry is not None and selected.operation.kind == "lora" for entry, selected in entries
+            entry is not None and selected.operation.kind == AdapterKind.LORA
+            for entry, selected in entries
         )
     ):
         # Half targets accumulate plain low-rank terms in half: the GEMM sums in
@@ -71,6 +74,22 @@ def _fused_weight(
                     fused, entry.b.astype(mx.float16), entry.a.astype(mx.float16), alpha=scale
                 )
         return fused
+    if all(entry is not None for entry, _selected in entries):
+        terms = []
+        for entry, selected in entries:
+            assert entry is not None
+            scale = validated_lora_scale(entry, selected.strength * selected.operation.scalar)
+            if (entry.b.shape[0], entry.a.shape[1]) != original.shape:
+                raise ValueError("LoRA shape mismatch for its logical target")
+            if scale != 0:
+                terms.append((entry.b, entry.a, scale))
+        physical = cast(mx.array, getattr(target.owner, target.attribute))
+        factors = [(up, down) for up, down, _scale in terms]
+        if terms and low_rank_fusion.applies(physical, factors, transposed=transposed):
+            # The chain below in one kernel pass, bit for bit, written in the stored layout:
+            # the caller's contiguous copy of a stored transpose then has nothing to copy.
+            fused = low_rank_fusion.fuse(physical, terms, transposed=transposed)
+            return fused.T if transposed else fused
     base = original.astype(mx.float32)
     fused = base
     for selected in ordered:
@@ -108,7 +127,7 @@ def half_accumulation_fallbacks(
     for name, group in operations.items():
         entries = [(plain_lora_entry(item.operation), item) for item in group if _effective(item)]
         if not entries or any(
-            entry is None or item.operation.kind != "lora" for entry, item in entries
+            entry is None or item.operation.kind != AdapterKind.LORA for entry, item in entries
         ):
             continue
         peaks: list[mx.array] = []
@@ -138,7 +157,7 @@ def fuse_weight(
     value: mx.array,
     operations: tuple[WeightedAdapterOperation, ...],
     *,
-    accumulation: str = "float32",
+    accumulation: FloatDType = FloatDType.FLOAT32,
 ) -> mx.array:
     """Return one logical ``[out, in]`` weight with its effective adapters applied.
 
@@ -163,7 +182,8 @@ def _companion_weight(
     transposed: frozenset[str],
 ) -> mx.array | None:
     if not any(
-        item.operation.kind == "glora_peft" and item.operation.part == "bias" for item in operations
+        item.operation.kind == AdapterKind.GLORA_PEFT and item.operation.part == "bias"
+        for item in operations
     ):
         return None
     weight_name = name.removesuffix("bias") + "weight"
@@ -185,7 +205,7 @@ def _effective(item: WeightedAdapterOperation) -> bool:
         return True
     if operation.scalar == 0:
         return False
-    return not (operation.kind == "adalora" and operation.factors["down"].shape[0] == 0)
+    return not (operation.kind == AdapterKind.ADALORA and operation.factors["down"].shape[0] == 0)
 
 
 def fuse_adapter_operations(
@@ -194,7 +214,7 @@ def fuse_adapter_operations(
     *,
     pending: AdapterWeightCheck,
     transposed: frozenset[str] = frozenset(),
-    accumulation: str = "float32",
+    accumulation: FloatDType = FloatDType.FLOAT32,
 ) -> None:
     """Validate structure, bind lazy expressions, and register first-use checks.
 
@@ -213,7 +233,7 @@ def fuse_adapter_operations(
         if not effective:
             continue
         selected[name] = effective
-        replacements = [item for item in effective if item.operation.kind == "set"]
+        replacements = [item for item in effective if item.operation.kind == AdapterKind.SET]
         if len(replacements) > 1:
             sources = ", ".join(sorted(item.order_key for item in replacements))
             raise ValueError(
@@ -241,7 +261,7 @@ def fuse_adapter_operations(
                 if logical_weight(targets[name], transposed=name in transposed).dtype == mx.float16
             }
         )
-        if accumulation == "float16"
+        if accumulation == FloatDType.FLOAT16
         else frozenset()
     )
     # Base-dependent bias updates must precede replacement of their companion matrix.
@@ -252,7 +272,7 @@ def fuse_adapter_operations(
             selected[name],
             transposed=name in transposed,
             base_weight=_companion_weight(name, selected[name], targets, transposed),
-            accumulation="float32" if name in fallbacks else accumulation,
+            accumulation=FloatDType.FLOAT32 if name in fallbacks else accumulation,
         )
         physical = mx.contiguous(candidate.T if name in transposed else candidate)
         setattr(target.owner, target.attribute, physical)

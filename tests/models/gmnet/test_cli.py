@@ -1,6 +1,7 @@
 """The ``--model gmnet`` command: routing, precedence, and refusals."""
 
 import json
+import logging
 import subprocess
 import sys
 import tomllib
@@ -466,6 +467,41 @@ def test_expand_refuses_existing_targets_without_force(tmp_path) -> None:
         )
         == 2
     )
+
+
+def test_dry_run_reports_the_checkpoint_and_writes_nothing(tmp_path, capsys, caplog) -> None:
+    override = tmp_path / "custom.safetensors"
+    override.write_bytes(b"converted")
+    outputs = tmp_path / "renders"
+    arguments = [
+        "--model",
+        "gmnet",
+        "--dry-run",
+        "--weights-path",
+        str(override),
+        "--output-dir",
+        str(outputs),
+    ]
+
+    with caplog.at_level(logging.INFO, logger="kinomlx"):
+        assert main(arguments) == 0
+
+    # Without --json the same run states the resolved checkpoint for a reader.
+    assert "Resources" in caplog.text
+    assert capsys.readouterr().out == ""
+
+    assert main([*arguments, "--json"]) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["model"] == "gmnet"
+    assert report["weights"] == str(override.absolute())
+    assert not outputs.exists()
+
+
+def test_dry_run_refuses_an_expansion(tmp_path) -> None:
+    source = tmp_path / "frame.png"
+    source.write_bytes(b"stub")
+    with pytest.raises(ConfigError, match="Resource-only operations"):
+        _assemble(["--dry-run", "--image", str(source)])
 
 
 def test_json_error_is_a_single_machine_record(capsys) -> None:

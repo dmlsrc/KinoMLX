@@ -17,7 +17,7 @@ TRANSFORM_PHASES = (
 )
 
 # A rule can consume a virtual input without leaving a null assignment behind.
-DELETE_FIELD = object()
+DELETE_FIELD = sentinel("DELETE_FIELD")
 
 
 @dataclass(frozen=True)

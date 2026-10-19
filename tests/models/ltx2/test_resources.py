@@ -252,7 +252,7 @@ def test_prepare_resources_returns_deeply_immutable_values_without_live_weights(
 
     settings = LTX2Settings(
         weights_path=checkpoint,
-        gemma_path=gemma,
+        text_encoder_path=gemma,
         spatial_upscaler_path=upscaler,
         transformer_dtype="float16",
         video_ff_layout_specs=("project_in:pretranspose",),
@@ -769,7 +769,7 @@ def test_split_pack_prepares_transformer_weights_without_live_model_state(
     assert plan.require(ComponentKind.AUDIO_VAE).source_path == paths["audio_vae_path"].resolve()
     assert plan.require(ComponentKind.VOCODER).source_path == paths["audio_vae_path"].resolve()
     assert plan.capabilities.recipe_families == ("distilled",)
-    assert plan.capabilities.sampler_policy == "ancestral-stage1-deterministic-stage2"
+    assert plan.capabilities.stage_samplers == ("ancestral", "ancestral")
     assert plan.capabilities.generates_audio
     assert plan.capabilities.duration_available
     assert plan.capabilities.temporal_latent_upscaler_available
@@ -929,6 +929,35 @@ def test_gemma_discovery_plain_variant_switch(tmp_path: Path) -> None:
     assert resolved == plain.resolve()
 
 
+@pytest.mark.parametrize("explicit", [False, True])
+def test_ltx23_text_encoder_is_discovered_unless_text_encoder_path_names_one(
+    tmp_path: Path, monkeypatch, explicit: bool
+) -> None:
+    checkpoint = tmp_path / "model.safetensors"
+    upscaler = tmp_path / "upscaler.safetensors"
+    checkpoint.touch()
+    upscaler.touch()
+    cached = _fake_gemma_snapshot(
+        tmp_path, "Lightricks/gemma-3-12b-it-qat-q4_0-unquantized", "qat-snap"
+    )
+    local = tmp_path / "local-gemma"
+    local.mkdir()
+    (local / "config.json").touch()
+    _stub_compatibility(monkeypatch, generation="2.3", embedded_video_vae=True)
+
+    plan = resources.prepare_resources(
+        LTX2Settings(
+            weights_path=checkpoint,
+            spatial_upscaler_path=upscaler,
+            text_encoder_path=local if explicit else None,
+        ),
+        infrastructure=Settings(hf_home=tmp_path),
+    )
+
+    selected = plan.require(ComponentKind.TEXT_ENCODER).source_path
+    assert selected == (local if explicit else cached).resolve()
+
+
 def test_gemma_discovery_never_falls_back_across_variants(tmp_path: Path) -> None:
     _fake_gemma_snapshot(tmp_path, "google/gemma-3-12b-it", "plain-snap")
 
@@ -951,7 +980,7 @@ def test_prepare_resources_describes_every_component_by_source_only(
 
     settings = LTX2Settings(
         weights_path=checkpoint,
-        gemma_path=gemma,
+        text_encoder_path=gemma,
         spatial_upscaler_path=upscaler,
         transformer_dtype="float16",
     )
@@ -992,7 +1021,7 @@ def test_streaming_keeps_the_configured_allocator_cache_limit(
     _stub_compatibility(monkeypatch, generation="2.3", embedded_video_vae=True)
     settings = LTX2Settings(
         weights_path=checkpoint,
-        gemma_path=gemma,
+        text_encoder_path=gemma,
         spatial_upscaler_path=upscaler,
         stream_transformer=True,
     )
@@ -1012,7 +1041,7 @@ def test_weight_policy_carries_the_resolved_adapter_accumulation() -> None:
     assert _weight_policy(streamed_half.resolve_presets()).adapter_accumulation == "float16"
     resident_half = LTX2Settings(transformer_dtype="float16")
     assert _weight_policy(resident_half).adapter_accumulation == "float32"
-    streamed_wide = LTX2Settings(stream_transformer=True)
+    streamed_wide = LTX2Settings(stream_transformer=True, transformer_dtype="bfloat16")
     assert _weight_policy(streamed_wide.resolve_presets()).adapter_accumulation == "float32"
 
 
@@ -1050,3 +1079,55 @@ def test_transformer_override_prefers_its_local_pack_without_hub(tmp_path):
     assert (
         selected.text_encoder_path == pack / resources._LTX25_COMPONENT_PATHS["text_encoder_path"]
     )
+
+
+def test_dry_run_report_names_every_resolved_source_but_no_resolved_policy(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    checkpoint = tmp_path / "model.safetensors"
+    upscaler = tmp_path / "upscaler.safetensors"
+    gemma = tmp_path / "gemma"
+    checkpoint.touch()
+    upscaler.touch()
+    gemma.mkdir()
+    (gemma / "config.json").touch()
+    _stub_compatibility(monkeypatch, generation="2.3", embedded_video_vae=True)
+
+    report = resources.prepare_resources(
+        LTX2Settings(
+            weights_path=checkpoint,
+            text_encoder_path=gemma,
+            spatial_upscaler_path=upscaler,
+            transformer_dtype="float16",
+        ),
+        infrastructure=Settings(),
+    ).describe()
+
+    assert report["model"] == "ltx2"
+    assert report["model_generation"] == "2.3"
+    assert report["model_version"] == "2.3.0"
+    assert report["layout"] == "monolithic"
+    assert report["source"] == str(checkpoint.absolute())
+    assert report["source_identity"] == "sha256:model.safetensors"
+    dtypes = report["dtypes"]
+    assert isinstance(dtypes, dict)
+    assert dtypes["transformer"] == "float16"
+    assert dtypes["video_vae"] == "bfloat16"
+    assert report["check_adapter_weights"] is True
+    # The transformer weight, execution and capability policies are resolved
+    # decisions rather than sources, and naming them is a separate design call.
+    assert not {"capabilities", "weight_policy", "execution_policy"} & set(report)
+    components = report["components"]
+    assert isinstance(components, list)
+    transformer = next(entry for entry in components if entry["kind"] == "transformer")
+    assert transformer["source"] == str(checkpoint.absolute())
+    assert transformer["graph_identity"]
+    assert "config_digest" not in transformer
+    assert transformer["family"] == "ltx2-av-transformer"
+    assert transformer["declared_model_version"] == "2.3.0"
+    text_encoder = next(entry for entry in components if entry["kind"] == "text_encoder")
+    assert text_encoder["source"] == str(gemma.resolve())
+    # Only the transformer carries an inferred-field annotation, so the report
+    # states each component's own annotations instead of padding a fixed shape.
+    assert "inferred_constructor_fields" not in text_encoder

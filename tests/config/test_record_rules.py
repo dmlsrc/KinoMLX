@@ -147,7 +147,7 @@ def test_new_semantic_rule_runs_at_each_model_boundary_before_resource_access(
         from kinomlx.settings import Settings
 
         resources = importlib.import_module(f"kinomlx.models.{model}.resources")
-        prepare = resources.inspect_resources if model == "flux2" else resources.prepare_resources
+        prepare = resources.prepare_resources
         invoke = partial(prepare, record(), infrastructure=Settings())
     with pytest.raises(ValueError, match="new owned rule executed"):
         invoke()

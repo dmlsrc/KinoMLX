@@ -29,7 +29,7 @@ def _to_uint8_rgb(frame: mx.array) -> mx.array:
     to a uint8 RGB mlx array for histogram / thumbnail work.
     """
     f = frame
-    if str(f.dtype).split(".")[-1] in ("float16", "float32"):
+    if f.dtype in (mx.float16, mx.float32):
         return mx.clip(f[..., :3] * 255.0, 0, 255).astype(mx.uint8)
     if f.shape[-1] == 4:
         return f[..., :3]

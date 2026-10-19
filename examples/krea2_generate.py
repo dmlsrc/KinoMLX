@@ -1,6 +1,6 @@
 """Generate Raw or Turbo stills through the public Krea 2 API.
 
-Download the model components described in docs/KREA2.md before running this
+Download the model components described in docs/krea2/downloads.md before running this
 example. Resource preparation discovers local sources and captures execution
 policy. The ordinary variant defaults supply the step count and guidance. Output
 paths must be unused PNG or TIFF files.

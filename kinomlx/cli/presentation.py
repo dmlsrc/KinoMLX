@@ -8,7 +8,7 @@ from rich.cells import cell_len
 
 from kinomlx.adapters.selection import AdapterSelection
 from kinomlx.errors import log_debug_exception
-from kinomlx.model_registry import MODEL_SPECS
+from kinomlx.model_catalog import MODEL_SPECS
 from kinomlx.ui.logging import console_message_width
 
 from .machine_output import emit_json

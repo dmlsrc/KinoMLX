@@ -150,8 +150,6 @@ class _SourceSelection:
     generation: FieldPath
     video_vae: FieldPath
     video_vae_source: FieldPath
-    gemma: FieldPath
-    text_encoder: FieldPath
 
     def __call__(self, values: Mapping[FieldPath, object]) -> Mapping[FieldPath, object]:
         patch: dict[FieldPath, object] = {}
@@ -163,10 +161,6 @@ class _SourceSelection:
         split = any(values.get(path) is not None for path in self.split)
         if monolithic != split:
             patch.update(dict.fromkeys(self.split if monolithic else self.monolithic))
-        gemma = values.get(self.gemma) is not None
-        text = values.get(self.text_encoder) is not None
-        if gemma != text:
-            patch[self.text_encoder if gemma else self.gemma] = None
         return patch
 
 
@@ -179,8 +173,6 @@ def source_selection_rule(schema: ModelConfigSpec) -> LayerTransform:
         LTX2ConfigGroup.MODEL_GENERATION_SELECTOR,
         LTX2ConfigGroup.MODEL_VIDEO_VAE_SELECTOR,
         LTX2ConfigGroup.MODEL_VIDEO_VAE_SOURCE,
-        LTX2ConfigGroup.MODEL_GEMMA_SOURCE,
-        LTX2ConfigGroup.MODEL_TEXT_ENCODER_SOURCE,
     )
     paths = tuple(schema.paths_in_group(group) for group in groups)
     if any(len(members) != 1 for members in paths[3:]):
@@ -192,20 +184,16 @@ def source_selection_rule(schema: ModelConfigSpec) -> LayerTransform:
         paths[3][0],
         paths[4][0],
         paths[5][0],
-        paths[6][0],
-        paths[7][0],
     )
     return LayerTransform(
         name="ltx_source_selection",
-        reads=frozenset(path for members in paths for path in members),
+        reads=frozenset(*members for members in paths),
         writes=frozenset(
             (
                 *selection.sources,
                 *selection.monolithic,
                 *selection.split,
                 selection.video_vae_source,
-                selection.gemma,
-                selection.text_encoder,
             )
         ),
         run=selection,

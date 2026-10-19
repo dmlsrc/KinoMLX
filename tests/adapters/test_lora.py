@@ -1,5 +1,6 @@
 """Behavioral tests for low-rank pairs and application controls."""
 
+from dataclasses import replace
 from pathlib import Path
 
 import mlx.core as mx
@@ -45,6 +46,18 @@ def test_config_rejects_bad_exclusion() -> None:
 def test_config_canonicalizes_exclusion_identity() -> None:
     config = LoRAConfig(path="/x", exclude=("video", "audio", "video"))
     assert config.exclude == ("audio", "video")
+
+
+def test_config_keeps_the_selected_path_outside_its_identity(tmp_path: Path) -> None:
+    blob = tmp_path / "0123abcd"
+    blob.write_bytes(b"weights")
+    link = tmp_path / "adapter_model.safetensors"
+    link.symlink_to(blob)
+    selected = LoRAConfig(path=link)
+    assert selected.path == blob.resolve()
+    assert selected.source == link
+    assert selected == LoRAConfig(path=blob)
+    assert replace(selected, strength=0.5).source == link
 
 
 # ---------------------------------------------------------------------------

@@ -1,6 +1,7 @@
 """Precision-sensitive operations backed by Metal kernels and faithful formulas."""
 
 from collections.abc import Callable
+from functools import cache
 from typing import cast
 
 import mlx.core as mx
@@ -475,4 +476,21 @@ def pixel_norm(
     return value / rms
 
 
-__all__ = ["gelu_approx", "group_norm", "pixel_norm", "rms_norm", "silu"]
+@cache
+def _fp16_pixel_norm_weight(channels: int) -> mx.array:
+    weight = mx.ones((channels,), dtype=mx.float16)
+    mx.eval(weight)
+    return weight
+
+
+def pixel_norm_fp16(value: mx.array, *, eps: float) -> mx.array:
+    """Fuse channel-last FP16 PixelNorm while reducing squared values in FP32."""
+    if value.dtype != mx.float16 or value.ndim < 1:
+        raise ValueError("fused PixelNorm requires a channel-last float16 array")
+    if mx.default_device() == mx.cpu:
+        wide = value.astype(mx.float32)
+        return mx.fast.rms_norm(wide, None, eps).astype(mx.float16)
+    return mx.fast.rms_norm(value, _fp16_pixel_norm_weight(int(value.shape[-1])), eps)
+
+
+__all__ = ["gelu_approx", "group_norm", "pixel_norm", "pixel_norm_fp16", "rms_norm", "silu"]

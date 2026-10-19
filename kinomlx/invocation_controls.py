@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
-from kinomlx.config_bindings import CliBinding
+from kinomlx.config_bindings import CliAction, CliBinding
 from kinomlx.config_surfaces import MODEL_SURFACES, UTILITY_SURFACES, SurfacePolicy
 
 
@@ -80,14 +80,14 @@ INVOCATION_CONTROLS = (
     InvocationControl(
         "set_overrides",
         tuple[str, ...],
-        CliBinding("Invocation", flags=("--set",), action="append", metavar="KEY=VALUE"),
+        CliBinding("Invocation", flags=("--set",), action=CliAction.APPEND, metavar="KEY=VALUE"),
         "Apply a TOML-typed key override after config and ordinary CLI flags.",
         "selection",
     ),
     InvocationControl(
         "print_config",
         bool,
-        CliBinding("Invocation", action="store_true"),
+        CliBinding("Invocation", action=CliAction.STORE_TRUE),
         "Print canonical input TOML with commented reference defaults and exit.",
         "utility",
         False,
@@ -102,7 +102,7 @@ INVOCATION_CONTROLS = (
     InvocationControl(
         "only_non_defaults",
         bool,
-        CliBinding("Invocation", action="store_true"),
+        CliBinding("Invocation", action=CliAction.STORE_TRUE),
         "With --print-config or --save-config, omit the commented reference defaults. "
         "Executable inputs retain explicit values, environment selections and clearing.",
         "utility",
@@ -131,7 +131,7 @@ def validate_control_declarations(controls: tuple[InvocationControl, ...]) -> No
     names = {control.name for control in controls}
     if len(names) != len(controls):
         raise ValueError("duplicate invocation control names")
-    flags = [flag for control in controls for flag in control.binding.option_strings(control.name)]
+    flags = [*control.binding.option_strings(control.name) for control in controls]
     if len(flags) != len(set(flags)):
         raise ValueError("duplicate invocation control flags")
     for control in controls:

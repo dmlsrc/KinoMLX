@@ -12,10 +12,10 @@ from kinomlx.models.ltx2.arguments import build_parser
 from kinomlx.models.ltx2.config import assemble
 from kinomlx.models.ltx2.config_schema import CONFIG_SCHEMA
 from kinomlx.models.ltx2.types import (
-    DistilledRequest,
-    ImageConditioningConfig,
+    LTX2ImageConditioningConfig,
+    LTX2Request,
+    LTX2VideoVAETilingConfig,
     TilingGridConstraint,
-    VideoVAETilingConfig,
 )
 
 
@@ -52,9 +52,9 @@ def test_nested_collection_reports_exact_index_and_allows_repaired_final_record(
 
 
 def test_ltx_nested_rule_runs_at_generation_boundary_before_file_checks():
-    request = DistilledRequest(
+    request = LTX2Request(
         text_conditioning="missing.safetensors",
-        vae_tiling=VideoVAETilingConfig(mode="custom", temporal_overlap_frames=256),
+        vae_tiling=LTX2VideoVAETilingConfig(mode="custom", temporal_overlap_frames=256),
     )
     with pytest.raises(ValueError, match=r"\[generate\].vae_tiling: .*overlap"):
         request.validate_for_generation()
@@ -106,7 +106,7 @@ def test_later_layer_can_repair_semantic_tiling_conflict(tmp_path):
 )
 def test_tiling_grid_errors_are_local_admission_errors(values):
     with pytest.raises(ValueError, match=next(iter(values))):
-        VideoVAETilingConfig(**values)
+        LTX2VideoVAETilingConfig(**values)
 
 
 @pytest.mark.parametrize(
@@ -117,22 +117,27 @@ def test_invalid_tiling_grid_declarations_fail(values):
         TilingGridConstraint(**values)
 
 
-@pytest.mark.parametrize("name", ["noise_backend", "sampler", "hdr", "vae_decode_dtype"])
+@pytest.mark.parametrize(
+    "name",
+    ["noise_backend", "stage_1_sampler", "stage_2_sampler", "hdr", "vae_decode_dtype"],
+)
 def test_ltx_request_choices_are_owned_by_fields_and_bound_by_schema(name):
-    assert CONFIG_SCHEMA.field(("generate", name)).choices == field_choices(DistilledRequest, name)
+    assert CONFIG_SCHEMA.field(("generate", name)).choices == field_choices(LTX2Request, name)
     with pytest.raises(ValueError, match=name):
-        DistilledRequest(**{name: "unknown"})
+        LTX2Request(**{name: "unknown"})
 
 
 def test_ltx_prompt_policy_can_be_repaired_before_final_validation():
-    request = DistilledRequest(prompt="hello", prompt_unconditional=True)
+    request = LTX2Request(prompt="hello", prompt_unconditional=True)
     with pytest.raises(ValueError, match=r"\[generate\]: prompt_unconditional cannot"):
         validate_record(request, location="[generate]")
     validate_record(replace_config(request, prompt_unconditional=False), location="[generate]")
 
 
 def test_image_frame_bounds_can_be_repaired_before_final_validation():
-    request = DistilledRequest(frames=9, image=ImageConditioningConfig("frame.png", frame_index=9))
+    request = LTX2Request(
+        frames=9, images=(LTX2ImageConditioningConfig("frame.png", frame_index=9),)
+    )
     with pytest.raises(ValueError, match=r"\[generate\]: image frame_index"):
         validate_record(request, location="[generate]")
     validate_record(replace_config(request, frames=17), location="[generate]")
@@ -140,35 +145,33 @@ def test_image_frame_bounds_can_be_repaired_before_final_validation():
 
 def test_higher_layer_repairs_image_frame_relationship(tmp_path):
     config = tmp_path / "config.toml"
-    config.write_text(
-        '[generate]\nframes = 9\n[generate.image]\npath = "frame.png"\nframe_index = 9\n'
-    )
+    config.write_text('[generate]\nframes = 9\nimages = [{path = "frame.png", frame_index = 9}]\n')
     options = build_parser().parse_args(
         ["--config", str(config), "--frames", "17", "--print-config"]
     )
     invocation = assemble(options)
     assert invocation.request.frames == 17
-    assert invocation.request.image.frame_index == 9
+    assert invocation.request.images[0].frame_index == "9"
 
 
 @pytest.mark.parametrize(
     "values",
     [
         {"prompt": "hello", "prompt_unconditional": True},
-        {"frames": 9, "image": {"path": "frame.png", "frame_index": 9}},
+        {"frames": 9, "images": ({"path": "frame.png", "frame_index": 9},)},
     ],
 )
 def test_direct_restart_validates_final_request_before_artifact_checks(tmp_path, values):
     from types import SimpleNamespace
 
     from kinomlx.memory_policy import MLXMemoryPolicy
-    from kinomlx.models.ltx2.pipelines.restart import restart_distilled
-    from kinomlx.models.ltx2.restart import DistilledRestart
+    from kinomlx.models.ltx2.pipelines.restart import restart_ltx2
+    from kinomlx.models.ltx2.restart import LTX2Restart
 
-    request = DistilledRequest(**values)
+    request = LTX2Request(**values)
     resources = SimpleNamespace(memory_policy=MLXMemoryPolicy())
-    restart = DistilledRestart.decode(tmp_path / "missing.safetensors")
+    restart = LTX2Restart.decode(tmp_path / "missing.safetensors")
     with pytest.raises(
         ValueError, match=r"\[generate\]: (?:prompt_unconditional cannot|image frame_index)"
     ):
-        restart_distilled(request, resources, restart=restart)
+        restart_ltx2(request, resources, restart=restart)

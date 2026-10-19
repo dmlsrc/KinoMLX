@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
 
+from kinomlx.cli.resource_operation import Operation, refuse_resource_only_work
 from kinomlx.cli.seed_config import seed_config
 from kinomlx.config import (
     ConfigError,
@@ -22,15 +23,16 @@ from kinomlx.config.paths import TargetPath
 from kinomlx.config.provenance import PreparedConfig
 from kinomlx.config_records import derive_config
 from kinomlx.config_rules import validate_record
+from kinomlx.image_restart_config import ImageStage
 from kinomlx.io.image import image_size
 from kinomlx.io.output_config import ImageOutputConfig
 from kinomlx.settings import Settings
 
-from .config_schema import CONFIG_SCHEMA, Flux2Operation
+from .config_schema import CONFIG_SCHEMA
 from .image_processing import output_size, reference_geometry
 from .restart import RestartManifest
 from .settings import Flux2Settings
-from .stations import Flux2Conditioning, load_conditioning
+from .text_conditioning import Flux2Conditioning, load_conditioning
 from .types import Flux2Request, Flux2RestartConfig
 
 
@@ -38,7 +40,7 @@ from .types import Flux2Request, Flux2RestartConfig
 class Flux2Invocation:
     settings: Settings
     model_settings: Flux2Settings
-    operation: Flux2Operation
+    operation: Operation
     generate: Flux2Request
     output: ImageOutputConfig
     resolved_config: dict[str, object]
@@ -62,10 +64,11 @@ def assemble(options: argparse.Namespace) -> Flux2Invocation:
     base = PreparedConfig({}, {})
     if selection is not None:
         with restart_source(selection.run):
-            restart = RestartManifest.load(selection)
-            base = restart.base_config()
+            restart = RestartManifest.load(selection, schema=schema)
+            base = restart.base_config(schema=schema)
     inputs = sources.prepare(
-        base, station="generate" if restart is None else restart.selection.phase
+        base,
+        stage=ImageStage.TEXT if restart is None else restart.selection.stage,
     )
     input_paths = []
     for layer in (inputs.file, inputs.cli, inputs.override):
@@ -91,19 +94,20 @@ def assemble(options: argparse.Namespace) -> Flux2Invocation:
     )
     generate = dataclass_from_mapping(Flux2Request, merged.get("generate", {}), table="[generate]")
     output = dataclass_from_mapping(ImageOutputConfig, merged.get("output", {}), table="[output]")
-    operation = dataclass_from_mapping(
-        Flux2Operation, merged.get("operation", {}), table="[operation]"
-    )
+    operation = dataclass_from_mapping(Operation, merged.get("operation", {}), table="[operation]")
     settings.validate()
     model_settings.validate()
     validate_record(output, location="[output]")
-    if operation.dry_run and (
-        generate.prompt is not None
-        or generate.prompt_unconditional
-        or restart is not None
-        or generate.text_conditioning is not None
-    ):
-        raise ConfigError("Resource-only operations cannot be combined with generation or restart")
+    refuse_resource_only_work(
+        dry_run=operation.dry_run,
+        requested=(
+            generate.prompt is not None
+            or generate.prompt_unconditional
+            or restart is not None
+            or generate.text_conditioning is not None
+        ),
+        work="generation or restart",
+    )
     if restart:
         current_roots = {
             "settings": settings,
@@ -121,7 +125,7 @@ def assemble(options: argparse.Namespace) -> Flux2Invocation:
                 Flux2Settings, base.values.get("model_settings", {}), table="[model_settings]"
             ),
             "operation": dataclass_from_mapping(
-                Flux2Operation, base.values.get("operation", {}), table="[operation]"
+                Operation, base.values.get("operation", {}), table="[operation]"
             ),
             "generate": dataclass_from_mapping(
                 Flux2Request, base.values.get("generate", {}), table="[generate]"
@@ -135,27 +139,27 @@ def assemble(options: argparse.Namespace) -> Flux2Invocation:
         }
         refuse_restart_changes(
             schema,
-            schema.station_changes(
+            schema.stage_changes(
                 current_roots,
                 parent_roots,
-                station=restart.selection.phase,
+                stage=restart.selection.stage,
                 active_explicit=inputs.active_explicit_paths(),
             ),
-            station=restart.selection.phase,
+            stage=restart.selection.stage,
         )
         # A multi-image source run is narrowed to its selected image by
         # RestartManifest.base_config, so anything still plural here is a
         # request the restart cannot satisfy.
         if len(generate.prompts()) != 1 or len(generate.selected_seeds()) != 1:
             raise ConfigError(
-                "Saved-station restart resumes one image; select it with [restart].index "
+                "Saved-stage restart resumes one image; select it with [restart].index "
                 "and do not add prompts or seeds"
             )
     if restart is None:
         validate_record(generate, location="[generate]")
     conditioning = None
     if (restart is None and generate.text_conditioning is not None) or (
-        restart is not None and restart.selection.phase == "denoise"
+        restart is not None and restart.selection.stage == "denoise"
     ):
         artifact = generate.text_conditioning
         if restart:
@@ -196,7 +200,7 @@ def assemble(options: argparse.Namespace) -> Flux2Invocation:
         ):
             raise ConfigError("Edit replay must preserve the saved output grid")
     generate.validate(model_settings.variant)
-    if not operation.dry_run and not (restart and restart.selection.phase == "decode"):
+    if not operation.dry_run and not (restart and restart.selection.stage == "decode"):
         if not generate.prompts() and not (options.print_config or options.save_config):
             raise ConfigError(
                 "[generate].prompt, [generate].prompt_file, [generate].text_conditioning, "

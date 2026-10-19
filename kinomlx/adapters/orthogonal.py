@@ -4,7 +4,7 @@ import math
 
 import mlx.core as mx
 
-from .formats import AdapterOperation
+from .formats import AdapterKind, AdapterOperation
 
 
 def _cayley(skew: mx.array) -> mx.array:
@@ -143,12 +143,14 @@ def peft_orthogonal_delta(operation: AdapterOperation, base: mx.array) -> mx.arr
     """Apply rotations/reflections without a model-sized square matrix."""
     if base.ndim != 2:
         raise ValueError("PEFT orthogonal adapters require a linear target")
-    if operation.kind == "hra":
+    if operation.kind == AdapterKind.HRA:
         vectors, triangular = _hra_components(operation)
         if vectors.shape[0] != base.shape[1]:
             raise ValueError("PEFT HRA vectors do not match the target input dimension")
         projected = base @ vectors
         projected = 2.0 * projected if triangular is None else projected @ triangular
         return -(projected @ vectors.T) * operation.scalar
-    adapted = _oft(operation, base) if operation.kind == "oft_peft" else _boft(operation, base)
+    adapted = (
+        _oft(operation, base) if operation.kind == AdapterKind.OFT_PEFT else _boft(operation, base)
+    )
     return (adapted - base) * operation.scalar

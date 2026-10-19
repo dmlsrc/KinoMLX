@@ -6,7 +6,6 @@ from pathlib import Path
 
 import pytest
 
-from kinomlx.cli._registry import validate_model_parser
 from kinomlx.cli.config_init import build_config_parser
 from kinomlx.cli.config_templates import (
     _render_field,
@@ -15,6 +14,7 @@ from kinomlx.cli.config_templates import (
     template_models,
 )
 from kinomlx.cli.main import main
+from kinomlx.cli.parser_contract import validate_model_parser
 from kinomlx.config import (
     ConfigFieldSpec,
     ConfigGroup,
@@ -24,7 +24,8 @@ from kinomlx.config import (
 )
 from kinomlx.config_surfaces import MODEL_SURFACES, STRUCTURED_SURFACES
 from kinomlx.invocation_controls import MODEL_CONTROL
-from kinomlx.model_registry import config_registry, model_choices
+from kinomlx.model_catalog import model_choices
+from kinomlx.model_registry import config_registry
 from kinomlx.models.ltx2.arguments import build_parser
 
 
@@ -60,11 +61,11 @@ def test_every_registered_model_has_one_distinct_template() -> None:
     video = registry.model("ltx2").table(("settings",))
     still = registry.model("gmnet").table(("settings",))
     # One shared declaration owns infrastructure settings; only restart
-    # applicability is per model, and GMNet has no restart station.
+    # applicability is per model, and GMNet has no restart stage.
     assert video.record is still.record
     assert [field.name for field in video.fields] == [field.name for field in still.fields]
-    assert video.stations == registry.model("ltx2").restart_stations
-    assert still.stations == ()
+    assert video.stages == registry.model("ltx2").restart_stages
+    assert still.stages == ()
     with pytest.raises(RuntimeError, match="registry is frozen"):
         registry.register(registry.model("ltx2"))
 
@@ -270,8 +271,9 @@ def test_save_all_coverage_rejects_an_untagged_new_boolean() -> None:
             model="sample",
             title="Sample configuration",
             introduction=("Describe the sample configuration.",),
-            restart_stations=(),
-            no_restart_reason="The sample contribution has no saved station.",
+            stages=("process",),
+            restart_stages=(),
+            no_restart_reason="The sample contribution has no saved stage.",
             root_fields=(model,),
             tables=(output,),
             implications=(implication,),
@@ -330,8 +332,9 @@ def test_field_rejects_an_unregistered_semantic_group() -> None:
             model="sample",
             title="Sample configuration",
             introduction=("Describe the sample configuration.",),
-            restart_stations=(),
-            no_restart_reason="The sample contribution has no saved station.",
+            stages=("process",),
+            restart_stages=(),
+            no_restart_reason="The sample contribution has no saved stage.",
             root_fields=(model,),
             tables=(ConfigTableSpec(path=("sample",), record=_Record, fields=(field,)),),
         )
@@ -342,7 +345,9 @@ def test_template_keeps_human_readable_blocks_and_line_width() -> None:
     assert "prompt = '''\nDescribe your video here.\n'''" in template
     assert '# Valid values:\n#   "auto"' in template
     assert (
-        '# [generate.image]\n# path = "input.png"\n# frame_index = 0\n# strength = 0.95' in template
+        '# images = [\n#   { path = "first.png" },\n'
+        '#   { path = "last.png", frame_index = "last", strength = 0.8, stage2_strength = 0.5 },'
+        "\n# ]" in template
     )
     assert "# width = 1024\n\n\n# Set the output height" in template
     assert max(map(len, template.splitlines())) <= 96
@@ -509,19 +514,19 @@ def test_a_required_field_reads_as_required_in_every_template() -> None:
                 block = template.split(f"# {field.purpose}.")[1].split("\n\n")[0]
                 assert "# Default: required." in block
                 assert "# Default: unset." not in block
-    assert seen >= 5
+    assert seen >= 4
 
 
 def test_a_missing_required_member_names_its_configuration_path() -> None:
     """F-28: a nested constructor argument is not a spelling a reader can act on."""
     from kinomlx.config import ConfigError, dataclass_from_mapping
-    from kinomlx.models.ltx2.types import ImageConditioningConfig
+    from kinomlx.models.ltx2.types import LTX2ImageConditioningConfig
 
     with pytest.raises(ConfigError) as error:
         dataclass_from_mapping(
-            ImageConditioningConfig, {"frame_index": 0}, table="[generate].image"
+            LTX2ImageConditioningConfig, {"frame_index": 0}, table="[generate].images[0]"
         )
-    assert str(error.value) == "[generate].image.path is required"
+    assert str(error.value) == "[generate].images[0].path is required"
 
 
 @pytest.mark.parametrize("model", ["flux2", "krea2", "ltx2"])

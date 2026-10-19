@@ -24,6 +24,7 @@ from kinomlx.models.ltx2.resources import (
 )
 from kinomlx.models.ltx2.transformer_config import TransformerConstructorConfig
 from kinomlx.models.ltx2.video_vae.config import LTX23_VIDEO_VAE_CONFIG
+from kinomlx.models.ltx2.video_vae.kinds import VideoVAEKind
 
 
 @pytest.fixture(autouse=True)
@@ -132,7 +133,7 @@ def _resources(
             recipe_families=("distilled",),
             condition_families=("text",),
             video_compression=LTX23_VIDEO_VAE_CONFIG.encoder_scale,
-            video_vae_kind="native-conv3d",
+            video_vae_kind=VideoVAEKind.CONV,
             text_encoder_family="gemma-3-12b-it",
             native_hdr=False,
             generates_audio=True,
@@ -157,12 +158,9 @@ def _resources(
             resident_blocks=None,
         ),
         execution_policy=TransformerExecutionPolicy(
-            use_steel_attention=False,
             compile_attention=False,
-            steel_attention_d64=False,
-            steel_attention_probe=False,
             fast_mode=True,
-            compile_block_groups=None,
+            compile_block_group_size=None,
             transformer_compile_group_size=None,
         ),
         video_vae_config=LTX23_VIDEO_VAE_CONFIG,
@@ -222,6 +220,11 @@ def test_transformer_lease_releases_callback_capture_before_cleanup(
     cleanup_observations: list[bool] = []
 
     class _Model:
+        transformer_block_streamer = None
+
+        def enable_mpp_weight_conversion(self) -> None:
+            pass
+
         def close_streamer(self) -> None:
             pass
 
@@ -265,6 +268,9 @@ def test_transformer_loader_binds_prepared_weights_and_passes_fp16_owner_explici
     events = []
 
     class _Model:
+        def enable_mpp_weight_conversion(self) -> None:
+            events.append("convert mpp weights")
+
         def close_streamer(self) -> None:
             events.append("close streamer")
 
@@ -324,6 +330,8 @@ def test_transformer_loader_binds_prepared_weights_and_passes_fp16_owner_explici
     assert fuse_event[3]["model_generation"] == "2.3"
     if streamed:
         assert callable(model.transformer_block_streamer.on_evaluated)
+    # Converting MPP weights in place would add to a streamer's memory, not replace it.
+    assert ("convert mpp weights" in events) is not streamed
     lease.close()
     lease.close()
     assert events[-2:] == ["close streamer", "cleanup"]
@@ -339,6 +347,11 @@ def test_ltx25_transformer_fuses_nonempty_lora_after_weights_binding(
     events = []
 
     class _Model:
+        transformer_block_streamer = None
+
+        def enable_mpp_weight_conversion(self) -> None:
+            pass
+
         def close_streamer(self) -> None:
             events.append("close")
 
@@ -384,7 +397,7 @@ def test_spatial_upscaler_loads_only_video_vae_statistics(
     )
     monkeypatch.setattr(
         components,
-        "load_native_vae_encoder_statistics",
+        "load_vae_encoder_statistics",
         lambda path, **kwargs: (
             events.append(("statistics", path))
             or SimpleNamespace(per_channel_statistics=statistics)
@@ -421,7 +434,7 @@ def test_temporal_upscaler_loads_only_video_vae_statistics(
     )
     monkeypatch.setattr(
         components,
-        "load_native_vae_encoder_statistics",
+        "load_vae_encoder_statistics",
         lambda path, **kwargs: (
             events.append(("statistics", path))
             or SimpleNamespace(per_channel_statistics=statistics)
@@ -538,10 +551,10 @@ def test_component_parity_component_leases_each_close_exactly_once(
         def __call__(self, latent, *, reporter=None):
             return latent
 
-    monkeypatch.setattr(components, "NativeConv3dVideoEncoder", lambda *args, **kwargs: _Model())
-    monkeypatch.setattr(components, "NativeConv3dVideoDecoder", lambda *args, **kwargs: _Model())
-    monkeypatch.setattr(components, "load_native_vae_encoder_weights", lambda *args, **kwargs: 86)
-    monkeypatch.setattr(components, "load_native_vae_decoder_weights", lambda *args, **kwargs: 86)
+    monkeypatch.setattr(components, "Conv3dVideoEncoder", lambda *args, **kwargs: _Model())
+    monkeypatch.setattr(components, "Conv3dVideoDecoder", lambda *args, **kwargs: _Model())
+    monkeypatch.setattr(components, "load_vae_encoder_weights", lambda *args, **kwargs: 86)
+    monkeypatch.setattr(components, "load_vae_decoder_weights", lambda *args, **kwargs: 86)
     monkeypatch.setattr(
         components,
         "create_audio_decoder_from_checkpoint",
@@ -559,11 +572,12 @@ def test_component_parity_component_leases_each_close_exactly_once(
     )
     monkeypatch.setattr(
         components,
-        "load_native_vae_encoder_statistics",
+        "load_vae_encoder_statistics",
         lambda *args, **kwargs: SimpleNamespace(per_channel_statistics=object()),
     )
     monkeypatch.setattr(components.mx, "eval", lambda *args, **kwargs: None)
     monkeypatch.setattr(components, "_cleanup_mlx", lambda: cleanups.append("cleanup"))
+    monkeypatch.setattr(components, "_cleanup_video_decoder", lambda: cleanups.append("decoder"))
 
     for loader in (
         components.load_video_encoder,
@@ -576,7 +590,17 @@ def test_component_parity_component_leases_each_close_exactly_once(
         lease.close()
         lease.close()
 
-    assert cleanups == ["cleanup"] * 5
+    assert cleanups == ["cleanup", "decoder", "cleanup", "cleanup", "cleanup"]
+
+
+def test_video_decoder_close_does_not_clear_allocator_cache(monkeypatch) -> None:
+    events = []
+    monkeypatch.setattr(components.mx, "synchronize", lambda: events.append("synchronize"))
+    monkeypatch.setattr(components.mx, "clear_cache", lambda: events.append("clear"))
+
+    components._cleanup_video_decoder()
+
+    assert events == ["synchronize"]
 
 
 def test_family_components_bind_prepared_source_tensors(
@@ -598,21 +622,21 @@ def test_family_components_bind_prepared_source_tensors(
             return ()
 
     monkeypatch.setattr(components, "family_source_weights", fake_family_weights)
-    monkeypatch.setattr(components, "NativeConv3dVideoEncoder", lambda *a, **k: _Model())
-    monkeypatch.setattr(components, "NativeConv3dVideoDecoder", lambda *a, **k: _Model())
+    monkeypatch.setattr(components, "Conv3dVideoEncoder", lambda *a, **k: _Model())
+    monkeypatch.setattr(components, "Conv3dVideoDecoder", lambda *a, **k: _Model())
     monkeypatch.setattr(
         components,
-        "load_native_vae_encoder_weights",
+        "load_vae_encoder_weights",
         lambda model, source: events.append(("encoder", source)) or 1,
     )
     monkeypatch.setattr(
         components,
-        "load_native_vae_decoder_weights",
+        "load_vae_decoder_weights",
         lambda model, source: events.append(("decoder", source)) or 1,
     )
     monkeypatch.setattr(
         components,
-        "load_native_vae_encoder_statistics",
+        "load_vae_encoder_statistics",
         lambda source, **kwargs: (
             events.append(("statistics", source)) or SimpleNamespace(per_channel_statistics=None)
         ),

@@ -9,7 +9,7 @@ import mlx.core as mx
 
 import kinomlx._mlx_nn as nn
 from kinomlx.kernels import silu
-from kinomlx.modeling.dtypes import resolve_float_dtype
+from kinomlx.modeling.dtypes import FloatDType, resolve_float_dtype
 from kinomlx.modeling.layers import conv2d_shell
 from kinomlx.reporting import NullReporter, Reporter
 
@@ -21,7 +21,7 @@ type Krea2VAEBoundaryObserver = Callable[[str, mx.array], None]
 _FLOAT_DTYPES = frozenset((mx.float16, mx.bfloat16, mx.float32))
 
 
-def resolve_vae_dtype(value: str | mx.Dtype) -> mx.Dtype:
+def resolve_vae_dtype(value: FloatDType | mx.Dtype) -> mx.Dtype:
     """Resolve one supported Krea VAE compute/weight dtype."""
     return resolve_float_dtype(value, owner="Krea 2 VAE")
 
@@ -266,7 +266,7 @@ class Krea2ImageDecoder(nn.Module):
         self,
         config: Krea2VAEConfig,
         *,
-        compute_dtype: str | mx.Dtype = mx.bfloat16,
+        compute_dtype: FloatDType | mx.Dtype = mx.bfloat16,
         output_scale: int = 1,
     ) -> None:
         super().__init__()

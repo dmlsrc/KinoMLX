@@ -87,7 +87,7 @@ def test_override_failure_precedes_default_discovery(tmp_path, monkeypatch):
 
     monkeypatch.setattr(resources, "resolve_cached_snapshot", forbidden)
     with pytest.raises((OSError, ValueError)):
-        resources.inspect_resources(
+        resources.prepare_resources(
             Flux2Settings(vae_path=tmp_path / "absent"),
             infrastructure=Settings(),
         )
@@ -123,21 +123,21 @@ def test_real_profiles_inventory_and_component_deduplication(tmp_path):
     graphs = []
     for variant in ("base", "distilled", "kv"):
         try:
-            graph = resources.inspect_resources(
+            graph = resources.prepare_resources(
                 Flux2Settings(variant=variant), infrastructure=infrastructure
             )
         except FileNotFoundError:
             pytest.skip("bundled Klein checkpoints are not cached")
         assert [len(c.bindings) for c in graph.components] == [0, 399, 233, 251]
         assert [len(c.active_bindings) for c in graph.components] == [0, 298, 233, 250]
-        again = resources.inspect_resources(
+        again = resources.prepare_resources(
             Flux2Settings(variant=variant), infrastructure=infrastructure
         )
         assert graph == again
         graphs.append(graph)
     kv = graphs[-1]
     overrides = {f"{c.kind}_path": c.source.source_path for c in kv.components}
-    local = resources.inspect_resources(
+    local = resources.prepare_resources(
         Flux2Settings(variant="kv", **overrides),
         infrastructure=replace(infrastructure, hf_home=tmp_path / "absent-hub"),
     )
@@ -157,7 +157,7 @@ def test_tokenizer_tables_are_derived_once_for_validation_and_loading(tmp_path, 
     from types import SimpleNamespace
 
     from kinomlx.modeling.artifacts import TokenizerSource
-    from kinomlx.models.flux2.loading import load_tokenizer
+    from kinomlx.models.flux2.source_loading import load_tokenizer
 
     source = TokenizerSource(
         tmp_path, tmp_path / "tokenizer.json", tmp_path / "tokenizer_config.json", "source", 151643
@@ -167,7 +167,9 @@ def test_tokenizer_tables_are_derived_once_for_validation_and_loading(tmp_path, 
     monkeypatch.setattr(
         resources, "load_tokenizer_tables", lambda *args: calls.append(args) or tables
     )
-    monkeypatch.setattr("kinomlx.models.flux2.loading.QwenByteBPETokenizer", lambda tables: tables)
+    monkeypatch.setattr(
+        "kinomlx.models.flux2.source_loading.QwenByteBPETokenizer", lambda tables: tables
+    )
     component = resources.tokenizer_component(source)
     assert load_tokenizer(component) is tables
     assert load_tokenizer(component) is tables
@@ -203,7 +205,7 @@ def test_single_override_keeps_default_discovery_for_other_flux_components(
         "resolve_cached_snapshot",
         lambda *a: SimpleNamespace(path=snapshot, revision="test"),
     )
-    result = resources.inspect_resources(
+    result = resources.prepare_resources(
         Flux2Settings(**{f"{kind}_path": override}),
         infrastructure=Settings(hf_home=tmp_path),
     )

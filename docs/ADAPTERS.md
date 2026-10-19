@@ -1,84 +1,59 @@
 # Using adapters
 
-Adapters are additional learned weights that change a model's style, subject,
-motion, or generation recipe. LoRA is one adapter format; LoKr, LoHa, and other
-formats use different ways to represent the learned change.
-
-Download an adapter compatible with your model, then add its local safetensors
-file to a generation command. KinoMLX does not bundle or download adapters.
+Adapters are small sets of learned weights that change a model's style, subject, motion, or
+sampling recipe. LoRA is one adapter format; LoKr, LoHa, and the others store their change
+differently. KinoMLX does not bundle or download adapters: download one made for your model, then
+add its local file.
 
 ```bash
-kinomlx --model krea2 \
-  --prompt "A ceramic vase beside a window" \
+kinomlx --model krea2 --prompt "A ceramic vase beside a window" \
   --adapter style.safetensors:0.8
 ```
 
-Replace `style.safetensors` with your file. If the author specifies trigger words,
-include them in the prompt; KinoMLX does not insert them automatically. The
-`--lora` spelling remains an alias for `--adapter`.
+Add any trigger words the author lists to your prompt; KinoMLX does not insert them. `--lora` is
+the same option as `--adapter`.
 
 - [Choose a compatible adapter](#choose-a-compatible-adapter)
-- [Set strengths and combine adapters](#inline-strengths)
-- [Understand strength, alpha, and scaling](#strength-alpha-and-effective-scale)
+- [Set strengths and stack adapters](#set-strengths-and-stack-adapters)
+- [Strength, alpha, and effective scale](#strength-alpha-and-effective-scale)
 - [Exclude parts of an adapter](#exclude-parts-of-an-adapter)
-- [Keep required export files](#keep-the-export-self-contained)
-- [Understand performance and output changes](#fusion-and-accounting)
-- [Troubleshoot loading and checks](#first-use-weight-checks)
+- [Keep the export self-contained](#keep-the-export-self-contained)
+- [Supported static export formats](#supported-static-export-formats)
+- [How adapters are applied](#how-adapters-are-applied)
+- [First-use weight checks](#first-use-weight-checks)
 
 ## Choose a compatible adapter
 
-The adapter must match the model architecture as well as a supported export
-format. A recognizable filename or a successfully parsed file does not establish
-that it was trained for your selected model.
+An adapter must be made for your model's architecture as well as be in a supported format. A
+familiar filename, or a file that parses, does not show it was trained for the model you selected.
 
-| Model | Adapter support | Model-specific instructions |
+| Model | Supports | Guide |
 | --- | --- | --- |
-| LTX-2.3 / LTX-2.5 | Ordinary two-dimensional LoRA weight adapters for the corresponding generation; stage-specific strengths and exclusions | [LTX adapter composition](LTX2.md#adapter-composition) |
-| Krea 2 | Static LoRA, LoKr, LoHa, and the export families below; denoiser only, including text-fusion layers | [Krea adapters](KREA2.md#adapters) |
-| FLUX.2 Klein 9B | The shared static export families, with Klein-compatible targets; choose adapters intended for your variant and recipe | [Klein generation and adapters](FLUX2.md#generate-and-edit) |
-| GMNet | No adapter support | [GMNet guide](GMNET.md) |
+| LTX-2.3 / LTX-2.5 | Ordinary LoRA, with a strength per stage | [LTX2 adapters](ltx2/adapters.md) |
+| Krea 2 | The static formats below, on the denoiser | [Krea 2 adapters](krea2/adapters.md) |
+| FLUX.2 Klein 9B | The static formats below, on the transformer | [Klein adapters](flux2/adapters.md) |
+| GMNet | No adapters | |
 
-Krea adapters trained on Raw can be intended for Turbo inference; follow the
-[Krea pairing guidance](KREA2.md#adapters). Acceleration adapters also require
-appropriate steps and guidance: adding a file alone does not select its sampling
-recipe. LTX's distilled adapters and Klein base Turbo LoRAs have examples in their
-model guides.
+Acceleration adapters also need their own steps and guidance: adding the file does not select
+its recipe. LTX2's distilled LoRAs and Klein's Turbo LoRAs have worked examples in their guides.
 
-## Inline strengths
+For Krea 2, Krea's guidance is to train adapters on Raw and run them on Turbo.
 
-Append a strength to each path. The default is `1.0`; lowering it generally reduces
-that adapter's influence. Strength is a multiplier, not a percentage of the final
-image, and different adapters can respond differently to the same value.
+## Set strengths and stack adapters
+
+Append a strength to the path; it defaults to 1. Strength multiplies the adapter's learned change.
+It is not a percentage of the image, and different adapters respond differently to one value.
 
 ```bash
 kinomlx --model flux2 --prompt "A ceramic vase beside a window" \
   --adapter style.safetensors:0.8 --adapter detail.safetensors:0.3
 ```
 
-Repeat `--adapter` to stack files. Selecting the same file twice applies it twice;
-KinoMLX does not deduplicate paths. Keep the order fixed when comparing results,
-since floating-point accumulation can depend on order.
+Repeat `--adapter` to stack adapters. The same file twice is applied twice; KinoMLX does not
+remove duplicates. Keep the order fixed when comparing results, because floating-point
+accumulation can depend on it.
 
-For LTX-2, a two-value suffix sets absolute stage-1 and stage-2 strengths:
-
-```bash
-kinomlx --model ltx2 --prompt "A slow camera move around a ceramic vase" \
-  --adapter style.safetensors:0.25:0.5 \
-  --adapter detail.safetensors:0:0.8
-```
-
-Here the style adapter affects both stages, while the detail adapter affects only
-stage 2. One suffix applies to both stages. Krea and Klein accept one strength
-because their generation recipes have one denoising stage.
-
-Strengths must be finite. Zero disables an adapter's contribution in the selected
-stage, and negative strengths subtract its learned change. Large magnitudes can
-produce poor results or overflow FP16; start with the author's recommended range.
-Quote the entire argument if the path contains spaces. Numeric `.safetensors` suffixes decode
-without filesystem probes; use a structured path for a literal numeric suffix.
-
-All adapter models use ordered adapter records. A modifier applies to the latest preceding CLI item,
-with no broadcasting:
+Separate flags set the same members on the latest `--adapter`, and never on its siblings:
 
 ```bash
 kinomlx --model krea2 --prompt "A ceramic vase beside a window" \
@@ -86,138 +61,135 @@ kinomlx --model krea2 --prompt "A ceramic vase beside a window" \
   --adapter detail.safetensors --adapter-strength 0.3
 ```
 
-A modifier requires a preceding local `--adapter`. Supplying the same member twice is an error,
-including equal values, aliases, and shorthand followed by a separate strength. Controls on one
-item do not affect its siblings. An omitted strength retains the default `1.0` for that item.
+A flag before any `--adapter`, or a member set twice, is an error, even with an equal value or
+through an alias or the shorthand.
 
-Their TOML and API surfaces use `generate.adapters` and `adapters`, respectively. Every record has
-`path`, `strength` and `exclude`. Krea and Klein add `step_strengths` and `sigma_window`; LTX adds
-`stage1_strength` and `stage2_strength`. Unsupported model-specific fields are errors. Structured
-paths remain literal.
-See [Krea records](KREA2.md#adapters) and [Klein records](FLUX2.md#adapter-records) for examples and
-model-specific category vocabularies. Higher-precedence collections replace the lower user
-collection; `adapters=[]` clears user adapters while preserving independently enabled profiles.
+LTX2 also takes two numbers, `PATH:STAGE1:STAGE2`, and its own per-stage flags; see
+[LTX2 strength per stage](ltx2/adapters.md#strength-per-stage).
 
-LTX adds `--adapter-stage1-strength` and `--adapter-stage2-strength`. Each overrides that item's
-common strength for one stage; a single inline common strength can be combined with a separate
-stage override. Two-number shorthand explicitly supplies both stages. Its
-[model guide](LTX2.md#adapter-composition) describes stage-specific restart locks. `--lora*` aliases
-are command-line spellings only. Former public parallel-array fields are not accepted.
-Variables in the selected model's configuration namespace must also match the current schema;
-unknown names fail even when empty or overridden by the CLI. Use `KINO_KREA2_ADAPTERS`,
-`KINO_FLUX2_ADAPTERS`, or `KINO_LTX2_ADAPTERS` with the same array-of-records syntax shown above.
+Strengths must be finite. Zero turns an adapter off, and a negative strength subtracts its change.
+Large values can ruin the result or overflow FP16, so start from the author's recommendation.
+Quote a path that contains spaces. A numeric suffix after `.safetensors` is read as a strength
+without checking the file; use a config file record for a path that really ends in one.
 
-## Varying strength over a run
+In TOML and Python, adapters are an ordered `adapters` list of records with `path`, `strength`,
+and `exclude`; `exclude = []` clears a record's exclusions. Krea 2 and Klein add `step_strengths`
+and `sigma_window`, and LTX2 adds `stage1_strength` and `stage2_strength`. A member another model
+uses, such as `stage1_strength` in a Krea 2 record, is an error. The `--lora` spellings exist only
+on the command line.
 
-An adapter can apply a different strength at each denoise step, either by step
-index or by noise level, which switches it from fused to an unfused path applied
-to activations. That changes which adapter formats are usable, how the run
-compares numerically to a fused one, and how it composes with fused adapters.
+A list from a later source replaces the earlier list. `adapters=[]` clears yours but keeps
+profiles switched on separately, such as Krea 2's `--turbo-4step`. The `KINO_<MODEL>_ADAPTERS`
+variables take the same list.
 
-See [Denoise schedules](SCHEDULES.md#adapter-strength-over-a-run) for the
-spellings, the format support table, and the interactions worth knowing.
+An adapter's strength can also change from step to step; see
+[Denoise schedules](SCHEDULES.md#adapter-strength-over-a-run).
 
 ## Strength, alpha, and effective scale
 
-The strength you select controls the adapter's contribution at inference. Saved
-`alpha` describes how an export scales its learned factors; it is not a second
-user strength. KinoMLX handles it differently for LTX and for Krea/Klein, so do
-not manually multiply your requested strength by alpha without checking the format.
+Your strength controls the adapter's contribution. A saved `alpha` describes how an export scales
+its own factors; it is not a second strength. LTX2 and the image models treat it differently, so
+do not multiply your strength by alpha yourself.
 
-### LTX: direct strength, without alpha scaling
+### LTX2: direct strength, except for PEFT exports
 
-LTX applies ordinary LoRA factors as:
+LTX2 applies ordinary LoRA factors at your strength, ignoring saved alpha and any saved export
+scalar:
 
 ```text
 W_run = W_base + stage_strength * (B @ A)
 ```
 
-Saved alpha is deliberately ignored. There is no additional `alpha/r` or
-`alpha/sqrt(r)` multiplier, including when a supported LoRA has a PEFT companion
-configuration. LTX uses the mapped A/B factors directly; it does not carry a saved
-export scalar into this update either. A stage override is the total strength for
-that stage, not a multiplier on the common strength.
+A rank-16 LoRA with alpha 8 at strength 0.5 therefore adds `0.5 * (B @ A)`. That matches
+Lightricks' loader and the community LoRAs made for it. A stage strength replaces the common
+strength for its stage; it does not multiply it.
 
-For example, rank 16, saved alpha 8, and strength `0.5` still give an LTX update of
-`0.5 * (B @ A)`. This preserves the direct-strength behavior used by its community
-checkpoints.
+A PEFT export is the exception. When it carries PEFT configuration, in an
+[`adapter_config.json`](#keep-the-export-self-contained) or as Diffusers metadata inside the file,
+LTX applies the scale it declares, as PEFT does when merging:
+
+```text
+W_run = W_base + stage_strength * (lora_alpha / r) * (B @ A)
+```
+
+Rank-stabilized LoRA (`use_rslora`) uses `lora_alpha / sqrt(r)`, and `alpha_pattern` and
+`rank_pattern` entries override per module. Strength 1 then reproduces the author's merge: `r = 32`
+with `lora_alpha = 64` adds `2 * (B @ A)`.
 
 ### Krea and Klein: export scaling, then user strength
-
-For ordinary additive adapters, the effective update is:
 
 ```text
 W_run = W_base + user_strength * export_scalar * intrinsic_scale * raw_delta
 ```
 
-`raw_delta` is `B @ A` for ordinary LoRA; other formats reconstruct it differently.
-A saved `scalar`, where supplied by the export, is multiplied once and otherwise
-defaults to `1`. The intrinsic scale follows the format:
+`raw_delta` is `B @ A` for ordinary LoRA; other formats rebuild it their own way. A saved
+`scalar`, where the export has one, multiplies once; otherwise it is 1. The intrinsic scale
+depends on the format:
 
-| Export | Intrinsic scale before user strength and saved scalar |
+| Export | Intrinsic scale |
 | --- | --- |
-| Ordinary LoRA with saved alpha | `alpha/r`, where `r` is the factor rank |
+| Ordinary LoRA with saved alpha | `alpha/r`, where `r` is the rank |
 | Configured rank-stabilized LoRA (`use_rslora`) | `alpha/sqrt(r)` |
-| Rank-scaled LoHa or factored LoKr | `alpha/r`, using the format's rank denominator |
-| Dense/dense LyCORIS or AI Toolkit LoKr without PEFT configuration | `1`; alpha is ignored because there is no rank divisor |
-| Configured PEFT LoKr, including dense/dense factors | `alpha/r`, using the configured rank |
+| Rank-scaled LoHa or factored LoKr | `alpha/r`, with the format's rank |
+| Dense LyCORIS or AI Toolkit LoKr without PEFT configuration | `1`: no rank divisor, so alpha is ignored |
+| Configured PEFT LoKr, dense factors included | `alpha/r`, with the configured rank |
 | Self-contained rank-scaled LoRA, LoHa, or LoKr with no alpha | `1` |
-| Rank-scaled LoRA, LoHa, or LoKr with saved alpha `0` | `1`; zero means unit intrinsic scaling, not a disabled adapter |
+| Rank-scaled LoRA, LoHa, or LoKr with saved alpha `0` | `1`: zero means unit scaling, not off |
 
-For configured LoRA, LoHa, and LoKr, an explicit alpha tensor takes precedence.
-Otherwise KinoMLX uses a matching `alpha_pattern`, then `lora_alpha` (or `alpha`),
-with a fallback of `8` if those settings are absent. Rank-stabilized LoRA still
-uses the square-root rank rule when alpha comes from a tensor. Keep the matching
-[export configuration](#keep-the-export-self-contained): removing it can change
-the effective scale even when the weight tensors are unchanged.
+For configured LoRA, LoHa, and LoKr, an alpha tensor wins; otherwise KinoMLX uses a matching
+`alpha_pattern`, then `lora_alpha` or `alpha`, then 8. Rank-stabilized LoRA keeps its square-root
+rule even with an alpha tensor. Keep the export's configuration with it: removing it can change
+the scale even though the weights are the same.
 
-For example, ordinary LoRA with rank 16, alpha 8, scalar 1, and user strength `0.5`
-contributes `0.25 * (B @ A)`. With rank-stabilized scaling it contributes
-`1.0 * (B @ A)`. These are coefficients on the learned update, not percentages of
-the generated image.
+For example, a rank-16 LoRA with alpha 8 at strength 0.5 contributes `0.25 * (B @ A)`, or
+`1.0 * (B @ A)` with rank-stabilized scaling. A huge alpha in a dense LyCORIS or AI Toolkit LoKr
+changes nothing, because that format ignores alpha; the same alpha in a rank-scaled export can
+make a very large update.
 
-A very large finite alpha in dense/dense LyCORIS or AI Toolkit LoKr does not make
-that update enormous: the format uses unit intrinsic scaling. This is a format
-rule, not a general clamp on large alpha values. The same alpha in a rank-scaled
-export can produce a very large update.
+**To turn an adapter off, set its strength to 0.** Editing saved alpha to 0 does not, as the
+table shows, and it would not stop DoRA magnitude changes or saved biases either. The one case
+where strength 0 still applies is a noise-level window whose bands carry their own `@strength`.
 
-**Set user strength to `0` to disable a contribution.** The one exception is a
-noise-level window whose bands carry their own `@strength`: those bands own the
-magnitude, so the adapter still applies. Editing saved alpha to zero does not
-disable a contribution either: the rank-scaled families above treat it as unit
-scaling, and it
-does not suppress DoRA magnitude changes or saved bias updates. Specialized
-formats such as AdaLoRA and OFT have their own parameter meanings; OFT's alpha,
-for example, controls a rotation constraint rather than the LoRA multiplier.
-For magnitude and rotation formats, user strength blends the completed adapted
-result with the original weight. Saved full weights use replacement semantics;
-see [fusion and accounting](#fusion-and-accounting).
+Some formats give alpha other meanings: in OFT it bounds a rotation, for example. For magnitude
+and rotation formats, strength blends the finished adapted weight with the original. Saved full
+weights replace the originals; see [how adapters are applied](#how-adapters-are-applied).
+
+### See which scale applied
+
+When an intrinsic scale applies, the console names its source and its effect at your strength.
+That happens for PEFT configuration on any model, and for a Krea 2 or Klein saved alpha that moves
+the scale away from 1:
+
+```text
+LTX-2.3 adapter adapter_model.safetensors: scale 2 from adapter_config.json (lora_alpha=64, r=32); effective 2 at strength 1
+```
+
+The run record keeps the same facts as `scale_source` and `intrinsic_scales` in the adapter's
+receipt. No line means your strength applies to the raw update as it is.
 
 ## Exclude parts of an adapter
 
-Use `--adapter-exclude` when you want to keep selected model components unchanged.
-For example, an LTX visual adapter can leave audio and cross-modal targets alone:
+`--adapter-exclude` keeps parts of the model unchanged by the latest adapter. For example, an LTX2
+visual adapter can leave the audio and the audio-video attention alone:
 
 ```bash
 kinomlx --model ltx2 --prompt "A quiet coastal sunrise" --generate-audio \
   --adapter style.safetensors:0.8 --adapter-exclude audio,cross
 ```
 
-Each exclusion modifier supplies one comma-separated list for the latest preceding adapter.
-Omit it for an item with no exclusions; `exclude=[]` explicitly clears a structured record's list.
-Category names differ by model; consult
-[LTX](LTX2.md#adapter-composition), [Krea](KREA2.md#adapters), or
-[Klein](FLUX2.md#adapter-records) before reusing an exclusion across models.
-Exclusions select model weights, not spatial regions in the output.
+Give the categories as one comma-separated list. Each model has its own categories, so check
+[LTX2](ltx2/adapters.md#exclude-parts-of-the-model), [Krea
+2](krea2/adapters.md#exclude-parts-of-the-model), or
+[Klein](flux2/adapters.md#exclude-parts-of-the-model) before reusing a list across models.
+Exclusions select model weights, not regions of the image.
 
 ## Keep the export self-contained
 
-A standalone community LoRA or LoKr file does not automatically need an
-`adapter_config.json`. Supported self-contained exports carry the needed factors,
-alpha values, and format information in their tensors or safetensors metadata.
-Do not create a companion file just because the download did not include one.
+A standalone community LoRA or LoKr file needs no `adapter_config.json`: its tensors and metadata
+carry the factors, alpha, and format. Do not create a configuration file because a download came
+without one.
 
-The separate JSON belongs to the standard PEFT export layout:
+The separate JSON belongs to PEFT's export layout:
 
 ```text
 adapter-folder/
@@ -225,60 +197,53 @@ adapter-folder/
   adapter_config.json
 ```
 
-It supplies settings that weight shapes alone may not reveal, such as adapter
-family, alpha/scaling rules, saved biases, and format-specific options. Keep both
-files when the author distributes this layout. KinoMLX requires the companion
-for the exact filename `adapter_model.safetensors`, with one exception: Krea and
-Klein can use a valid embedded Diffusers `lora_adapter_metadata` configuration
-when no companion is present. LTX's ordinary-LoRA loader requires the companion
-for that filename and does not use this embedded-configuration exception.
+It holds what weight shapes cannot show: the adapter family, scaling rules, saved biases, and
+format options. Keep both files when the author ships them. KinoMLX reads the configuration next
+to a file named exactly `adapter_model.safetensors`, along the path you gave and every link it
+follows, so a file selected from the Hugging Face cache still finds it. Embedded Diffusers
+`lora_adapter_metadata` works too; if both are present, they must agree.
 
-For other filenames, KinoMLX does not apply an unrelated neighboring
-`adapter_config.json`. Krea and Klein still read supported embedded configuration.
-If both embedded and companion configurations are used, they must agree.
-Do not rename a PEFT export to bypass a missing-config error: that can lose its
-scaling semantics. Obtain the matching configuration or a self-contained re-export.
-If an export contains several named adapters, export the intended adapter separately.
+An `adapter_config.json` next to a differently named file is ignored.
 
-If loading reports missing parameters, obtain a complete export from its author. These
-formats have specific requirements:
+A file that looks like a PEFT export, because it is named `adapter_model.safetensors` or its keys
+start with PEFT's `base_model.model.`, still loads without its configuration. KinoMLX warns that
+its scale is unknown and applies your strength without `alpha/r`; get the matching configuration
+or a self-contained re-export. Formats whose factors cannot be read without their configuration
+fail.
 
-- VeRA, PVeRA, and RandLoRA need their saved projection bases. UniLoRA needs its
-  saved indices and scales; SUPERTUNING needs saved precomputed indices.
-- TinyLoRA needs saved projection tensors. Multiple vector groups require a
-  producer-side conversion because the export omits the module-to-group map.
-- ADAMSS, FROD, OSF, and PSOFT exports omit cluster assignments or frozen
-  initialization bases. Convert in the producer environment to a complete
-  static LoRA or dense delta against the original base checkpoint.
-- PiSSA, CorDA, OLoRA, LoftQ, LoRA-GA, and KaSA can change the frozen base during
-  setup. Export a delta that includes that change against the original
-  checkpoint; ordinary saved A/B factors alone do not describe the full update.
-- Parameterized PEANUT activations require omitted activation state. Export a
-  complete dense delta rather than substituting freshly initialized parameters.
-- WaveFT exports using the inconsistent PEFT `coif5` filter definition need a
-  corrected export. That definition has 48 filter taps but declares a 28-sample
-  reduction, so substituting another wavelet would change the intended adapter.
+Do not rename a PEFT export or move it away from its configuration, and export a multi-adapter
+file one adapter at a time.
 
-Reconstruction does not substitute a different random generator or guess
-trainer-specific module order. FourierFT and WaveFT's declared location seeds
-are reproducible without Torch. Projection bases omitted by other families are
-not recreated from a seed alone.
+If loading reports missing parameters, get a complete export from the author. These formats have
+specific needs:
 
-Prompt/embedding tuners, input/task-dependent routing (LILY, POLY, X-LoRA,
-SHADOW, Arrow), token-conditional aLoRA, PVeRA sampling during inference, and
-timestep-dependent TLoRA are not supported as static adapters in KinoMLX.
-Spatial convolution adapters cannot be fitted to denoiser Linear weights.
+- VeRA, PVeRA, and RandLoRA need their saved projection bases; UniLoRA its saved indices and
+  scales; SUPERTUNING its saved precomputed indices.
+- TinyLoRA needs its saved projection tensors. Several vector groups need converting where the
+  adapter was made, because the export omits which module uses which group.
+- ADAMSS, FROD, OSF, and PSOFT exports omit cluster assignments or frozen bases. Convert them where
+  they were made, into a complete LoRA or dense delta against the original checkpoint.
+- PiSSA, CorDA, OLoRA, LoftQ, LoRA-GA, and KaSA can change the base weights during setup. Export a
+  delta that includes that change; the saved A/B factors alone do not describe the update.
+- Parameterized PEANUT activations need state the export omits. Export a dense delta instead.
+- WaveFT exports using PEFT's inconsistent `coif5` filter need a corrected export: that filter has
+  48 taps but declares a 28-sample reduction.
+
+KinoMLX does not invent missing data: it does not substitute another random generator or guess
+module order. FourierFT and WaveFT locations are rebuilt from their declared seeds, but other
+omitted projection bases are not recreated from a seed.
+
+Not supported as static adapters: prompt and embedding tuners, input-dependent routing (LILY,
+POLY, X-LoRA, SHADOW, Arrow), token-conditional aLoRA, PVeRA sampling during inference, and
+timestep-dependent TLoRA. Spatial convolution adapters do not fit the denoisers' linear weights.
 
 ## Supported static export formats
 
-Krea and Klein accept the following static export families when their saved
-parameters describe a complete update to compatible denoiser weights. LTX accepts
-only the ordinary LoRA format described above. This table is useful when choosing
-an export from a training tool or diagnosing a format error; most users can start
-with the author's ready-made safetensors file and its companion configuration.
-
-Different formats can interpret rank, alpha, bias, or normalization differently.
-Those distinctions affect the result even when filenames all say "LoRA".
+Krea 2 and Klein accept these families when the saved parameters describe a complete update to
+compatible weights; LTX2 accepts ordinary LoRA only. Most users can start from the author's
+ready-made file; this table helps when choosing a training tool's export or reading a format
+error. Formats that share the name "LoRA" can still read rank, alpha, bias, or normalization
+differently, and that changes the result.
 
 | Export family | Compatibility details |
 | --- | --- |
@@ -311,84 +276,64 @@ Those distinctions affect the result even when filenames all say "LoRA".
 | VeLoRA / Monteclora / MiCA inference | Complete saved A/B factors; declared training-only state is accounted for but not applied |
 | Full / norm / replacement | Direct weight/bias deltas, `set_weight`, configured full modules, and trained base biases |
 
-Exported target names must identify actual weights in the selected model.
-Official dotted names, supported Diffusers/PEFT wrappers, and recognized flattened
-names are accepted. A legacy `lora_unet_` prefix alone does not indicate the model
-architecture. Ambiguous names or conflicting updates produce an error rather than
-silently applying a different interpretation.
+Target names must name real weights in the selected model. Official dotted names, the supported
+Diffusers and PEFT wrappers, and known flattened names are accepted. A legacy `lora_unet_` prefix
+says nothing about the architecture. Ambiguous names or conflicting updates are errors, never a
+silent reinterpretation.
 
-## Fusion and accounting
+## How adapters are applied
 
-### Why loading an adapter does not change the checkpoint
+KinoMLX merges adapters into the model's weights in memory, for the current run only. The
+checkpoint files never change, so leaving out `--adapter` next time gives the original model. LTX2
+can merge a different set for each stage.
 
-KinoMLX combines adapters with model weights in memory for the current generation.
-Original checkpoint files stay unchanged, so removing `--adapter` on the next run
-returns to the original model. LTX can use a different combination in each stage.
+Most of the merging runs on the GPU when denoising first uses the weights, so the first step is
+slower and the adapter preparation time alone understates the cost. LTX2 streaming repeats the
+merge whenever a block reloads; see [LTX2 performance](ltx2/performance.md#run-on-32-gb).
 
-Adapter preparation includes file validation and building the calculation, but much of the GPU
-work runs when denoising first uses the weights. Consequently, the adapter preparation time
-alone understates the full cost. LTX block streaming can repeat fusion each time a block is
-reloaded; retained tensors avoid that repeat work at the cost of additional live memory. See
-[LTX streaming](LTX2.md#block-streaming-on-32-gb-systems).
+Updates are computed against the original weight, summed in a fixed order in FP32, and cast to the
+transformer's dtype once, so the result does not depend on how the work was scheduled. LTX2's
+`--adapter-accumulation auto` sums in FP16 on a streamed FP16 transformer instead, where the
+merge repeats; that changes rounding, see [fusion precision](ltx2/adapters.md#fusion-precision).
 
-### Why precision and format affect the result
+For magnitude and rotation formats, a fractional strength blends the finished adapted weight with
+the original, rather than scaling an internal parameter. Saved full weights and trained biases
+replace their parameters instead of adding to them.
 
-Ordinary adapter deltas are computed against the same original weight, accumulated
-in a stable order in FP32, then cast to the selected transformer dtype. User
-strength multiplies the complete unit-strength delta. For magnitude and rotation
-formats, fractional strength blends the completed adapted result with the original
-weight; it does not simply scale an internal normalization or rotation parameter.
-Saved full weights and trained biases replace their corresponding parameters, so
-they should not be interpreted as another additive low-rank delta.
+A few rotation and projection formats need small matrix inverses or QR decompositions, which run
+on the CPU. That adds preparation time only; ordinary LoRA merging and the transformer stay on the
+GPU.
 
-LTX's `--adapter-accumulation auto` instead accumulates ordinary LoRA terms in FP16
-on a streamed FP16 transformer, where fusion repeats. Its matrix products still
-sum in FP32. `--adapter-accumulation float32` selects FP32 fusion explicitly when
-comparing resident and streamed results. FP16 accumulation can be faster but
-changes rounding and numerical range; see [LTX precision details](LTX2.md#component-loading).
+### Coverage warnings
 
-Some rotation and projection formats need small inverses or QR decompositions on
-the CPU because MLX does not provide those operations on the GPU. This can add
-preparation time without moving ordinary LoRA fusion or the transformer to the
-CPU. Supported spectral adapters reproduce their declared frequency locations;
-missing random projection bases are not guessed from a seed.
+Coverage is the share of the adapter that found a weight in the selected model. Shared bases and
+training-only tensors are counted separately, so they do not inflate it. Low coverage warns rather
+than refusing the file, because a deliberately partial adapter can be valid; unmapped updates warn
+even when coverage is high.
 
-### Understand coverage warnings
-
-Coverage reports how much of the adapter could apply to the selected model.
-Shared projection bases and training-only tensors are recorded separately so they
-do not inflate this percentage. Low coverage warns rather than automatically
-rejecting the file; intentionally partial adapters can be valid. Unmapped updates
-still warn even when aggregate coverage is high.
-
-If an adapter appears ineffective, check its model/variant, strength, exclusions,
-trigger words, and coverage warnings. Inspect the saved run record for applied,
-excluded, unmapped, shared, and training-only tensors. An error about unknown
-parameters on a recognized target requires a compatible export, not a larger strength.
+If an adapter seems to do nothing, check its model and variant, strength, exclusions, trigger
+words, and coverage. The run record lists which tensors were applied, excluded, unmapped, shared,
+or training-only. An unknown parameter on a recognized target needs a compatible export, not a
+higher strength.
 
 ## First-use weight checks
 
-Klein, Krea, and LTX check adapter-modified active floating-point weights after
-first use. This catches nonfinite fused weights before continuing generation.
-Stacked updates to one target share a check; disabled and excluded updates do not
-schedule a scan. A new transformer or adapter stage profile can require another
-check. The console reports the duration and tensor count within denoising time.
-Packed LTX weights rely on per-step latent checks instead of this weight scan.
+LTX2, Krea 2, and Klein check every adapter-changed weight the run uses for nonfinite values after
+its first use, catching a broken merge before the run continues. Stacked updates to one weight share
+a check, excluded or disabled updates skip it, and a new transformer or LTX2 stage profile is
+checked again. The console reports the check's time and tensor count within denoising time. Packed
+LTX2 weights rely on the per-step latent checks instead.
 
-The check is enabled by default. These controls are equivalent:
+The check is on by default. These are equivalent ways to turn it off:
 
-- CLI: `--check-adapter-weights` / `--no-check-adapter-weights`.
-- TOML: `[settings].check_adapter_weights = true` or `false`.
-- Environment: `KINO_CHECK_ADAPTER_WEIGHTS=true` or `false`.
-- Python: `Settings(check_adapter_weights=False)` when constructing the runner or resources.
+- CLI: `--no-check-adapter-weights` (and `--check-adapter-weights` to turn it back on).
+- TOML: `[settings].check_adapter_weights = false`.
+- Environment: `KINO_CHECK_ADAPTER_WEIGHTS=false`.
+- Python: `Settings(check_adapter_weights=False)` for the runner or resources.
 
-Disabling it removes the final fused-weight scan, which can save time for a
-previously checked model/dtype/adapter combination. It does not disable per-step
-latent checks or format, shape, strength, and target validation. Ordinary LoRA and
-LoKr factors are not separately certified finite before fusion, so detection can
-happen when weights or latents are evaluated. Format-specific constraints such as
-DoRA normalization remain mandatory.
+Turning it off saves its time on a model, dtype, and adapter combination you have already
+checked. The per-step latent checks and the format, shape, strength, and target validation stay,
+as do format rules such as DoRA normalization.
 
-For a nonfinite result, try BF16, reduce unusually large strengths, and verify the
-adapter's intended base model. Passing a finite-value check establishes numerical
-finiteness, not visual quality or that the adapter matches your intended subject.
+For a nonfinite result, try BF16, lower unusually large strengths, and check that the adapter was
+made for this model. Passing the check shows the numbers are finite, not that the image is good.

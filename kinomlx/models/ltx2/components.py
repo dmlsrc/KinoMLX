@@ -27,28 +27,33 @@ from .transformer import LTXAVModel, Modality, X0Model
 from .upscaler import SpatialUpscaler, TemporalUpscaler
 from .upscaler import load_spatial_upscaler as _load_spatial_upscaler_model
 from .upscaler import load_temporal_upscaler as _load_temporal_upscaler_model
-from .upscaler.ports import LatentStatisticsPort, SpatialUpscalerPort, TemporalUpscalerPort
+from .upscaler.ports import (
+    LTX2LatentStatisticsPort,
+    LTX2SpatialUpscalerPort,
+    LTX2TemporalUpscalerPort,
+)
 from .video_vae.decoder import (
-    NativeConv3dVideoDecoder,
-    load_native_vae_decoder_weights,
+    Conv3dVideoDecoder,
+    load_vae_decoder_weights,
 )
 from .video_vae.diffusion_decoder import (
-    NativeDiffusionVideoDecoder,
+    DiffusionVideoDecoder,
     load_diffusion_video_decoder_weights,
 )
 from .video_vae.encoder import (
-    NativeConv3dVideoEncoder,
+    Conv3dVideoEncoder,
     WeightSource,
-    load_native_vae_encoder_statistics,
-    load_native_vae_encoder_weights,
+    load_vae_encoder_statistics,
+    load_vae_encoder_weights,
 )
+from .video_vae.kinds import VideoVAEKind
 from .video_vae.ops import PerChannelStatistics
 from .weights.loading import bind_transformer
 
 _log = logging.getLogger(__name__)
 
 
-class TransformerPort(Protocol):
+class LTX2TransformerPort(Protocol):
     """Denoised-prediction transformer surface consumed by recipes."""
 
     adapter_receipts: tuple[LTX2AdapterReceipt, ...]
@@ -66,12 +71,12 @@ class _VideoEncoderCallablePort(Protocol):
     def __call__(self, video: mx.array, *, reporter: Reporter | None = None) -> mx.array: ...
 
 
-class VideoEncoderPort(_VideoEncoderCallablePort, Protocol):
+class LTX2VideoEncoderPort(_VideoEncoderCallablePort, Protocol):
     @property
-    def per_channel_statistics(self) -> LatentStatisticsPort: ...
+    def per_channel_statistics(self) -> LTX2LatentStatisticsPort: ...
 
 
-class DurationPredictorPort(Protocol):
+class LTX2DurationPredictorPort(Protocol):
     def predict_num_frames(
         self,
         video_tokens: mx.array | None = None,
@@ -84,7 +89,7 @@ class DurationPredictorPort(Protocol):
     ) -> int: ...
 
 
-class AudioDecoderPort(Protocol):
+class LTX2AudioDecoderPort(Protocol):
     def __call__(
         self,
         latent: mx.array,
@@ -94,14 +99,14 @@ class AudioDecoderPort(Protocol):
     ) -> mx.array: ...
 
 
-class VocoderPort(Protocol):
+class LTX2VocoderPort(Protocol):
     @property
     def output_sample_rate(self) -> int: ...
 
     def __call__(self, mel: mx.array, *, reporter: Reporter | None = None) -> mx.array: ...
 
 
-class VideoDecoderPort(Protocol):
+class LTX2VideoDecoderPort(Protocol):
     def __call__(
         self,
         latent: mx.array,
@@ -112,71 +117,71 @@ class VideoDecoderPort(Protocol):
     ) -> mx.array: ...
 
 
-class TransformerProvider(Protocol):
+class LTX2TransformerProvider(Protocol):
     def transformer(
         self,
         resources: LTX2Resources,
         profile: LoRAProfile = (),
-    ) -> ComponentLease[TransformerPort]: ...
+    ) -> ComponentLease[LTX2TransformerPort]: ...
 
 
-class VideoEncoderProvider(Protocol):
+class LTX2VideoEncoderProvider(Protocol):
     def video_encoder(
         self,
         resources: LTX2Resources,
-    ) -> ComponentLease[VideoEncoderPort]: ...
+    ) -> ComponentLease[LTX2VideoEncoderPort]: ...
 
 
-class SpatialUpscalerProvider(Protocol):
+class LTX2SpatialUpscalerProvider(Protocol):
     def spatial_upscaler(
         self,
         resources: LTX2Resources,
-    ) -> ComponentLease[SpatialUpscalerPort]: ...
+    ) -> ComponentLease[LTX2SpatialUpscalerPort]: ...
 
 
-class TemporalUpscalerProvider(Protocol):
+class LTX2TemporalUpscalerProvider(Protocol):
     def temporal_upscaler(
         self,
         resources: LTX2Resources,
-    ) -> ComponentLease[TemporalUpscalerPort]: ...
+    ) -> ComponentLease[LTX2TemporalUpscalerPort]: ...
 
 
-class DurationPredictorProvider(Protocol):
+class LTX2DurationPredictorProvider(Protocol):
     def duration_predictor(
         self,
         resources: LTX2Resources,
-    ) -> ComponentLease[DurationPredictorPort]: ...
+    ) -> ComponentLease[LTX2DurationPredictorPort]: ...
 
 
-class AudioDecoderProvider(Protocol):
+class LTX2AudioDecoderProvider(Protocol):
     def audio_decoder(
         self,
         resources: LTX2Resources,
-    ) -> ComponentLease[AudioDecoderPort]: ...
+    ) -> ComponentLease[LTX2AudioDecoderPort]: ...
 
 
-class VocoderProvider(Protocol):
+class LTX2VocoderProvider(Protocol):
     def vocoder(
         self,
         resources: LTX2Resources,
-    ) -> ComponentLease[VocoderPort]: ...
+    ) -> ComponentLease[LTX2VocoderPort]: ...
 
 
-class VideoDecoderProvider(Protocol):
+class LTX2VideoDecoderProvider(Protocol):
     def video_decoder(
         self,
         resources: LTX2Resources,
-    ) -> ComponentLease[VideoDecoderPort]: ...
+    ) -> ComponentLease[LTX2VideoDecoderPort]: ...
 
 
-class DistilledComponents(
-    TransformerProvider,
-    VideoEncoderProvider,
-    SpatialUpscalerProvider,
-    DurationPredictorProvider,
-    AudioDecoderProvider,
-    VocoderProvider,
-    VideoDecoderProvider,
+class LTX2ComponentsProvider(
+    LTX2TransformerProvider,
+    LTX2VideoEncoderProvider,
+    LTX2SpatialUpscalerProvider,
+    LTX2DurationPredictorProvider,
+    LTX2AudioDecoderProvider,
+    LTX2VocoderProvider,
+    LTX2VideoDecoderProvider,
     Protocol,
 ):
     """Native or injected component surface needed by the distilled recipe."""
@@ -186,6 +191,13 @@ def _cleanup_mlx() -> None:
     gc.collect()
     mx.synchronize()
     mx.clear_cache()
+
+
+def _cleanup_video_decoder() -> None:
+    # The decode stream retains allocations across tiles and returns the
+    # process cache limit to its prior value when it closes.
+    gc.collect()
+    mx.synchronize()
 
 
 def _family_weights(resources: LTX2Resources, kind: ComponentKind) -> WeightSource:
@@ -202,7 +214,7 @@ def load_transformer(
     loras: LoRAProfile = (),
     *,
     reporter: Reporter | None = None,
-) -> ComponentLease[TransformerPort]:
+) -> ComponentLease[LTX2TransformerPort]:
     """Load one pristine transformer from source and fuse one full profile."""
     execution = resources.execution_policy
     policy = resources.weight_policy
@@ -215,12 +227,10 @@ def load_transformer(
         model = LTXAVModel.from_config(
             config,
             compute_dtype=resources.dtype_policy.transformer,
-            use_steel_attention=execution.use_steel_attention,
             compile_attention=execution.compile_attention,
-            steel_attention_d64=execution.steel_attention_d64,
-            steel_attention_probe=execution.steel_attention_probe,
+            dense_attention_kernel=execution.dense_attention_kernel,
             fast_mode=execution.fast_mode,
-            compile_block_groups=execution.compile_block_groups,
+            compile_block_group_size=execution.compile_block_group_size,
             transformer_compile_group_size=execution.transformer_compile_group_size,
         )
         source_loader = transformer_source_loader(resources, adapters=profile)
@@ -246,6 +256,8 @@ def load_transformer(
                 prepared_targets=source_loader.prepared_targets,
                 accumulation=policy.adapter_accumulation,
             )
+        if model.transformer_block_streamer is None and execution.compile_block_group_size is None:
+            model.enable_mpp_weight_conversion()
         if source_loader.streamed_targets and model.transformer_block_streamer is not None:
             model.transformer_block_streamer.on_evaluated = streamed_adapter_check(
                 source_loader.streamed_targets,
@@ -253,7 +265,7 @@ def load_transformer(
                 reporter=reporter or NullReporter(),
             )
         loaded_model: LTXAVModel = model
-        wrapped: TransformerPort = X0Model(loaded_model)
+        wrapped: LTX2TransformerPort = X0Model(loaded_model)
         # Receipts are run metadata, not MLX module state. Bypass nn.Module's
         # tuple registration while keeping the field explicit on the port.
         object.__setattr__(wrapped, "adapter_receipts", adapter_receipts)
@@ -281,16 +293,16 @@ def load_video_encoder(
     resources: LTX2Resources,
     *,
     reporter: Reporter | None = None,
-) -> ComponentLease[VideoEncoderPort]:
+) -> ComponentLease[LTX2VideoEncoderPort]:
     """Load the native Conv3d encoder from the video family source."""
     del reporter
-    model: NativeConv3dVideoEncoder | None = None
+    model: Conv3dVideoEncoder | None = None
     try:
-        model = NativeConv3dVideoEncoder(
+        model = Conv3dVideoEncoder(
             resources.video_vae_config,
             compute_dtype=resources.dtype_policy.video_vae,
         )
-        load_native_vae_encoder_weights(
+        load_vae_encoder_weights(
             model,
             _family_weights(resources, ComponentKind.VIDEO_VAE),
         )
@@ -321,7 +333,7 @@ class _TemporalUpscalerComponent:
 
 
 def _load_vae_statistics(resources: LTX2Resources) -> PerChannelStatistics:
-    return load_native_vae_encoder_statistics(
+    return load_vae_encoder_statistics(
         family_source_weights(
             resources,
             ComponentKind.VIDEO_VAE,
@@ -335,7 +347,7 @@ def load_spatial_upscaler(
     resources: LTX2Resources,
     *,
     reporter: Reporter | None = None,
-) -> ComponentLease[SpatialUpscalerPort]:
+) -> ComponentLease[LTX2SpatialUpscalerPort]:
     """Load the upscaler plus only the VAE statistics it consumes."""
     model: SpatialUpscaler | None = None
     try:
@@ -345,7 +357,7 @@ def load_spatial_upscaler(
             reporter=reporter,
         )
         statistics = _load_vae_statistics(resources)
-        component: SpatialUpscalerPort = _SpatialUpscalerComponent(
+        component: LTX2SpatialUpscalerPort = _SpatialUpscalerComponent(
             model=model,
             per_channel_statistics=statistics,
         )
@@ -360,7 +372,7 @@ def load_temporal_upscaler(
     resources: LTX2Resources,
     *,
     reporter: Reporter | None = None,
-) -> ComponentLease[TemporalUpscalerPort]:
+) -> ComponentLease[LTX2TemporalUpscalerPort]:
     """Load the optional temporal x2 model plus its VAE statistics payload."""
     model: TemporalUpscaler | None = None
     try:
@@ -370,7 +382,7 @@ def load_temporal_upscaler(
             reporter=reporter,
         )
         statistics = _load_vae_statistics(resources)
-        component: TemporalUpscalerPort = _TemporalUpscalerComponent(
+        component: LTX2TemporalUpscalerPort = _TemporalUpscalerComponent(
             model=model,
             per_channel_statistics=statistics,
         )
@@ -385,7 +397,7 @@ def load_duration_predictor(
     resources: LTX2Resources,
     *,
     reporter: Reporter | None = None,
-) -> ComponentLease[DurationPredictorPort]:
+) -> ComponentLease[LTX2DurationPredictorPort]:
     """Load the optional natural-duration head as a bounded component lease."""
     model: DurationHead | None = None
     try:
@@ -405,7 +417,7 @@ def load_audio_decoder(
     resources: LTX2Resources,
     *,
     reporter: Reporter | None = None,
-) -> ComponentLease[AudioDecoderPort]:
+) -> ComponentLease[LTX2AudioDecoderPort]:
     """Load one audio VAE decoder from the audio family source."""
     model: AudioDecoder | None = None
     try:
@@ -430,7 +442,7 @@ def load_vocoder(
     resources: LTX2Resources,
     *,
     reporter: Reporter | None = None,
-) -> ComponentLease[VocoderPort]:
+) -> ComponentLease[LTX2VocoderPort]:
     """Load one vocoder from the audio family source."""
     model: VocoderWithBWE | None = None
     try:
@@ -452,19 +464,19 @@ def load_video_decoder(
     resources: LTX2Resources,
     *,
     reporter: Reporter | None = None,
-) -> ComponentLease[VideoDecoderPort]:
+) -> ComponentLease[LTX2VideoDecoderPort]:
     """Load the metadata-selected native decoder from the video family source."""
-    model: NativeConv3dVideoDecoder | NativeDiffusionVideoDecoder | None = None
+    model: Conv3dVideoDecoder | DiffusionVideoDecoder | None = None
     sink = reporter if reporter is not None else NullReporter()
     phase = (
         "load diffusion video decoder"
-        if resources.video_vae_config.decoder_kind == "diffusion-na"
+        if resources.video_vae_config.decoder_kind == VideoVAEKind.DIFFUSION
         else "load video decoder"
     )
     sink.phase_start(phase, total=1, unit="file")
     try:
-        if resources.video_vae_config.decoder_kind == "diffusion-na":
-            model = NativeDiffusionVideoDecoder(
+        if resources.video_vae_config.decoder_kind == VideoVAEKind.DIFFUSION:
+            model = DiffusionVideoDecoder(
                 resources.video_vae_config,
                 compute_dtype=resources.dtype_policy.video_vae,
             )
@@ -473,11 +485,11 @@ def load_video_decoder(
                 _family_weights(resources, ComponentKind.VIDEO_VAE),
             )
         else:
-            model = NativeConv3dVideoDecoder(
+            model = Conv3dVideoDecoder(
                 resources.video_vae_config,
                 compute_dtype=resources.dtype_policy.video_vae,
             )
-            load_native_vae_decoder_weights(
+            load_vae_decoder_weights(
                 model,
                 _family_weights(resources, ComponentKind.VIDEO_VAE),
             )
@@ -485,7 +497,7 @@ def load_video_decoder(
         # decoder assets, not a lazy graph that allocates weights on first pull.
         mx.eval(model.parameters())
         sink.phase_advance(phase)
-        return ComponentLease(model, cleanup=_cleanup_mlx)
+        return ComponentLease(model, cleanup=_cleanup_video_decoder)
     except BaseException:
         model = None
         _cleanup_mlx()
@@ -495,7 +507,7 @@ def load_video_decoder(
 
 
 @dataclass(frozen=True)
-class NativeLTX2Components:
+class LTX2Components:
     """Default provider implementing the public structural component surface."""
 
     reporter: Reporter | None = None
@@ -504,7 +516,7 @@ class NativeLTX2Components:
         self,
         resources: LTX2Resources,
         profile: LoRAProfile = (),
-    ) -> ComponentLease[TransformerPort]:
+    ) -> ComponentLease[LTX2TransformerPort]:
         return load_transformer(
             resources,
             profile,
@@ -514,63 +526,63 @@ class NativeLTX2Components:
     def video_encoder(
         self,
         resources: LTX2Resources,
-    ) -> ComponentLease[VideoEncoderPort]:
+    ) -> ComponentLease[LTX2VideoEncoderPort]:
         return load_video_encoder(resources, reporter=self.reporter)
 
     def spatial_upscaler(
         self,
         resources: LTX2Resources,
-    ) -> ComponentLease[SpatialUpscalerPort]:
+    ) -> ComponentLease[LTX2SpatialUpscalerPort]:
         return load_spatial_upscaler(resources, reporter=self.reporter)
 
     def temporal_upscaler(
         self,
         resources: LTX2Resources,
-    ) -> ComponentLease[TemporalUpscalerPort]:
+    ) -> ComponentLease[LTX2TemporalUpscalerPort]:
         return load_temporal_upscaler(resources, reporter=self.reporter)
 
     def duration_predictor(
         self,
         resources: LTX2Resources,
-    ) -> ComponentLease[DurationPredictorPort]:
+    ) -> ComponentLease[LTX2DurationPredictorPort]:
         return load_duration_predictor(resources, reporter=self.reporter)
 
     def audio_decoder(
         self,
         resources: LTX2Resources,
-    ) -> ComponentLease[AudioDecoderPort]:
+    ) -> ComponentLease[LTX2AudioDecoderPort]:
         return load_audio_decoder(resources, reporter=self.reporter)
 
     def vocoder(
         self,
         resources: LTX2Resources,
-    ) -> ComponentLease[VocoderPort]:
+    ) -> ComponentLease[LTX2VocoderPort]:
         return load_vocoder(resources, reporter=self.reporter)
 
     def video_decoder(
         self,
         resources: LTX2Resources,
-    ) -> ComponentLease[VideoDecoderPort]:
+    ) -> ComponentLease[LTX2VideoDecoderPort]:
         return load_video_decoder(resources, reporter=self.reporter)
 
 
 __all__ = [
-    "AudioDecoderPort",
-    "AudioDecoderProvider",
-    "DistilledComponents",
-    "DurationPredictorPort",
-    "DurationPredictorProvider",
-    "NativeLTX2Components",
-    "SpatialUpscalerProvider",
-    "TemporalUpscalerProvider",
-    "TransformerPort",
-    "TransformerProvider",
-    "VideoDecoderPort",
-    "VideoDecoderProvider",
-    "VideoEncoderPort",
-    "VideoEncoderProvider",
-    "VocoderPort",
-    "VocoderProvider",
+    "LTX2AudioDecoderPort",
+    "LTX2AudioDecoderProvider",
+    "LTX2Components",
+    "LTX2ComponentsProvider",
+    "LTX2DurationPredictorPort",
+    "LTX2DurationPredictorProvider",
+    "LTX2SpatialUpscalerProvider",
+    "LTX2TemporalUpscalerProvider",
+    "LTX2TransformerPort",
+    "LTX2TransformerProvider",
+    "LTX2VideoDecoderPort",
+    "LTX2VideoDecoderProvider",
+    "LTX2VideoEncoderPort",
+    "LTX2VideoEncoderProvider",
+    "LTX2VocoderPort",
+    "LTX2VocoderProvider",
     "load_audio_decoder",
     "load_duration_predictor",
     "load_spatial_upscaler",

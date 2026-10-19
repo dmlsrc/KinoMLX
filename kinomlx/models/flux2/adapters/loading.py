@@ -11,7 +11,7 @@ import mlx.core as mx
 
 import kinomlx._mlx_nn as nn
 from kinomlx.adapters.algebra import ia3_input_scale, reconstruct_delta
-from kinomlx.adapters.formats import AdapterInventory, AdapterOperation
+from kinomlx.adapters.formats import AdapterInventory, AdapterKind, AdapterOperation
 from kinomlx.adapters.fusion import (
     WeightedAdapterOperation,
     fuse_adapter_operations,
@@ -21,6 +21,12 @@ from kinomlx.adapters.glora import glora_has_bias_paths
 from kinomlx.adapters.live import ScheduledAdapterOperation, install_live_adapters
 from kinomlx.adapters.peft import parse_configured_adapter, parse_lazy_adapter
 from kinomlx.adapters.receipt import AdapterPlacement, AdapterReceipt, log_adapter_receipt
+from kinomlx.adapters.scaling import (
+    UNKNOWN_SCALE_WARNING,
+    ScaleDetermination,
+    determine_scale,
+    log_scale_determination,
+)
 from kinomlx.adapters.schedule import render_strength_plan
 from kinomlx.adapters.selection import AdapterSelection
 from kinomlx.adapters.source import (
@@ -33,8 +39,8 @@ from kinomlx.io.safetensors import load_weights
 from kinomlx.modeling.layers import PretransposedLinear
 from kinomlx.modeling.loading import WeightTarget
 
-from ..loading import _target
 from ..shapes import transformer_shapes
+from ..source_loading import _target
 from ..transformer import Flux2Transformer
 from .categories import ADAPTER_EXCLUDE_CATEGORIES, target_categories
 from .keys import Flux2AdapterKeys, place_operation
@@ -105,12 +111,12 @@ def _place(
             continue
         operations = [operation]
         needs_bias = operation.part == "weight" and (
-            operation.kind in ("glora_peft", "road")
-            or (operation.kind == "ia3_peft" and not ia3_input_scale(operation))
+            operation.kind in (AdapterKind.GLORA_PEFT, AdapterKind.ROAD)
+            or (operation.kind == AdapterKind.IA3_PEFT and not ia3_input_scale(operation))
         )
         if needs_bias and (
             "base_bias" in operation.factors
-            or (operation.kind == "glora_peft" and glora_has_bias_paths(operation))
+            or (operation.kind == AdapterKind.GLORA_PEFT and glora_has_bias_paths(operation))
         ):
             operations.append(replace(operation, part="bias", source_keys=()))
         first = True
@@ -133,7 +139,7 @@ def _place(
                     base_for(target),
                     base_weight=(
                         base_for(target.removesuffix("bias") + "weight")
-                        if placed.kind == "glora_peft" and placed.part == "bias"
+                        if placed.kind == AdapterKind.GLORA_PEFT and placed.part == "bias"
                         else None
                     ),
                 )
@@ -172,7 +178,7 @@ def _place(
         ):
             raise ValueError(f"unsupported adapter semantics on known Klein target: {name}")
         placements.append(AdapterPlacement((name,), None, "unknown", "unmapped"))
-    consumed = [key for placement in placements for key in placement.source_keys]
+    consumed = [*placement.source_keys for placement in placements]
     if len(consumed) != len(set(consumed)) or set(consumed) != set(source.tensor_names):
         raise RuntimeError(
             "Klein adapter receipt must account for every source tensor exactly once"
@@ -241,8 +247,10 @@ def apply_flux2_adapters(
         # fusion applies a constant once rather than paying two operations
         # per adapted Linear per forward for the whole run.
         live_plan = None if selection.fuses else selection.strength_plan
+        scale = ScaleDetermination()
         if selection.effective:
             inventory = parse_lazy_adapter(load_weights(source.path), source.config)
+            scale = determine_scale(source.config_source, source.config, inventory.operations)
             placements, ops = _place(inventory, source, selection, live_base)
             for target, operation in ops:
                 if live_plan is None:
@@ -273,11 +281,13 @@ def apply_flux2_adapters(
             if "flux.2-klein-9b" in lower or "distilled" in lower
             else None
         )
-        warnings = tuple(
+        unmapped = tuple(
             f"Unmapped Klein adapter input: {p.source_keys}"
             for p in placements
             if p.status == "unmapped"
         )
+        scale_unknown = source.scale_unknown and selection.effective
+        warnings = unmapped + ((UNKNOWN_SCALE_WARNING,) if scale_unknown else ())
         receipt = AdapterReceipt(
             source.path,
             source.source_identity,
@@ -300,13 +310,15 @@ def apply_flux2_adapters(
                 None if selection.sigma_window is None else selection.sigma_window.to_metadata()
             ),
             application="fused" if live_plan is None else "live",
+            scale_source=scale.source,
+            intrinsic_scales=scale.scales,
         )
         receipts.append(receipt)
         _plan_detail = render_strength_plan(selection.schedule, selection.sigma_window)
         log_adapter_receipt(
             _log,
             model=f"Klein {variant}",
-            path=source.path,
+            path=selection.path,
             position=(index, len(prepared)),
             adapter_types=receipt.adapter_types,
             strength=selection.effective_strength,
@@ -320,8 +332,17 @@ def apply_flux2_adapters(
                 *(() if _plan_detail is None else (_plan_detail,)),
             ),
         )
-        for warning in warnings:
+        log_scale_determination(
+            _log,
+            model="Klein",
+            name=selection.path.name,
+            determination=scale,
+            strength=selection.effective_strength,
+        )
+        for warning in unmapped:
             _log.warning("%s", warning)
+        if scale_unknown:
+            _log.warning("Klein adapter %s: %s", selection.path.name, UNKNOWN_SCALE_WARNING)
         if not receipt.effective:
             _log.warning("Klein adapter has no effective merge: %s", source.path.name)
         elif receipt.coverage < 0.5:

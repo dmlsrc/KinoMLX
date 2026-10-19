@@ -14,9 +14,9 @@ from kinomlx.model_registry import config_registry
 from kinomlx.models.flux2.types import Flux2Request
 from kinomlx.models.krea2.types import Krea2GenerateConfig, Krea2Request
 from kinomlx.models.ltx2.types import (
-    DistilledRequest,
-    HDRReferenceConditioningConfig,
-    ImageConditioningConfig,
+    LTX2HDRReferenceConditioningConfig,
+    LTX2ImageConditioningConfig,
+    LTX2Request,
 )
 
 
@@ -33,8 +33,8 @@ def test_klein_invalid_local_numeric_values_fail_at_admission(name, value):
         (Flux2Request, "sigmas"),
         (Krea2Request, "sigmas"),
         (Krea2GenerateConfig, "sigmas"),
-        (DistilledRequest, "stage_1_sigmas"),
-        (DistilledRequest, "stage_2_sigmas"),
+        (LTX2Request, "stage_1_sigmas"),
+        (LTX2Request, "stage_2_sigmas"),
     ],
 )
 @pytest.mark.parametrize("sigmas", [(0.5, 1.0, 0.0), (1.0,), (1.0, float("nan")), (1.1, 0.0)])
@@ -61,12 +61,12 @@ def test_bad_lower_schedule_is_not_hidden_by_valid_override(model, tmp_path):
     ("values", "override", "message"),
     [
         (
-            {"image": ImageConditioningConfig(path="missing.exr")},
+            {"images": (LTX2ImageConditioningConfig(path="missing.exr"),)},
             {"hdr": "ACESCG"},
             "EXR conditioning requires an explicit --hdr signal interpretation",
         ),
         (
-            {"hdr_reference": HDRReferenceConditioningConfig(path="missing.mp4")},
+            {"hdr_reference": LTX2HDRReferenceConditioningConfig(path="missing.mp4")},
             {"hdr": "ACESCG"},
             "hdr_reference requires an explicit HDR output mode",
         ),
@@ -78,7 +78,7 @@ def test_bad_lower_schedule_is_not_hidden_by_valid_override(model, tmp_path):
     ],
 )
 def test_ltx_input_relationships_resolve_before_source_observation(values, override, message):
-    request = DistilledRequest(**values)
+    request = LTX2Request(**values)
     with pytest.raises(ValueError, match=rf"\[generate\]: {re.escape(message)}"):
         validate_record(request, location="[generate]")
     validate_record(replace_config(request, **override), location="[generate]")

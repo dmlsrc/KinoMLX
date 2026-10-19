@@ -67,8 +67,16 @@ def append_generated_keyframe_slots(
     *,
     pixel_frames: int,
     count: int,
+    initial: mx.array | None = None,
 ) -> tuple[LatentState, GeneratedKeyframeLayout, mx.array]:
-    """Append all-denoised one-frame slots and build the learned-position mask."""
+    """Append all-denoised one-frame slots and build the learned-position mask.
+
+    ``initial``, ``(batch, channels, count, height, width)`` at this stage's latent size,
+    seeds the slots' generative latent, which the noiser moves toward noise like the video
+    it joins; the clean latent stays zero because a slot's denoise mask is one. Stage 2
+    seeds its slots with the stage-1 slots, upsampled with the video. Without it the slots
+    start from zero.
+    """
     indices = generated_keyframe_indices(pixel_frames, count)
     if not indices:
         raise ValueError("append_generated_keyframe_slots requires a positive count")
@@ -80,20 +88,35 @@ def append_generated_keyframe_slots(
     tokens_per_slot = tools.target_shape.height * tools.target_shape.width
     first_token = int(state.latent.shape[1])
     slot_tokens = len(indices) * tokens_per_slot
-    slots = mx.zeros(
+    empty = mx.zeros(
         (tools.target_shape.batch, slot_tokens, state.latent.shape[2]),
         dtype=state.latent.dtype,
     )
+    seeded = empty
+    if initial is not None:
+        expected = (
+            tools.target_shape.batch,
+            tools.target_shape.channels,
+            len(indices),
+            tools.target_shape.height,
+            tools.target_shape.width,
+        )
+        if tuple(initial.shape) != expected:
+            raise ValueError(
+                f"initial generated keyframes have shape {tuple(initial.shape)}, "
+                f"expected {expected}"
+            )
+        seeded = tools.patchifier.patchify(initial).astype(state.latent.dtype)
     slot_mask = mx.ones(
         (tools.target_shape.batch, slot_tokens, state.denoise_mask.shape[-1]),
         dtype=state.denoise_mask.dtype,
     )
     prepared = replace(
         state,
-        latent=mx.concatenate([state.latent, slots], axis=1),
+        latent=mx.concatenate([state.latent, seeded], axis=1),
         denoise_mask=mx.concatenate([state.denoise_mask, slot_mask], axis=1),
         positions=mx.concatenate([state.positions, _slot_positions(tools, indices)], axis=2),
-        clean_latent=mx.concatenate([state.clean_latent, slots], axis=1),
+        clean_latent=mx.concatenate([state.clean_latent, empty], axis=1),
     )
     first_frame = mx.ones(
         (tools.target_shape.batch, tokens_per_slot),

@@ -79,6 +79,9 @@ class AdapterReceipt:
     # Whether the loader fused this adapter into the weight or installed a live
     # term; the loader states it from the routing decision it actually made.
     application: str = "fused"
+    # What set the intrinsic scale beneath user strength, and its LoRA values.
+    scale_source: str | None = None
+    intrinsic_scales: tuple[float, ...] = ()
 
     @property
     def placed_targets(self) -> int:
@@ -115,4 +118,6 @@ class AdapterReceipt:
             "step_strengths": list(self.step_strengths),
             "sigma_window": self.sigma_window,
             "application": self.application,
+            "scale_source": self.scale_source,
+            "intrinsic_scales": list(self.intrinsic_scales),
         }

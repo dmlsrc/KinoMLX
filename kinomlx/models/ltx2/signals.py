@@ -8,6 +8,7 @@ from kinomlx.media.signals import (
     ColorPrimaries,
     ColorRange,
     ColorTransfer,
+    SampleDType,
     UnsupportedSignalError,
     VideoLayout,
     VideoSignalSpec,
@@ -16,7 +17,7 @@ from kinomlx.media.signals import (
 
 LTX23_SDR_SIGNAL = VideoSignalSpec(
     layout=VideoLayout.HWC_RGB,
-    dtype="float16",
+    dtype=SampleDType.FLOAT16,
     value_domain=VideoValueDomain.NORMALIZED_SDR,
     primaries=ColorPrimaries.REC709,
     transfer=ColorTransfer.SRGB,
@@ -29,7 +30,7 @@ LTX23_SDR_SIGNAL = VideoSignalSpec(
 
 ACESCCT_WORKING_SIGNAL = VideoSignalSpec(
     layout=VideoLayout.HWC_RGB,
-    dtype="float32",
+    dtype=SampleDType.FLOAT32,
     value_domain=VideoValueDomain.ACESCCT_WORKING_CODES,
     primaries=ColorPrimaries.ACESCG,
     transfer=ColorTransfer.ACESCCT,
@@ -42,7 +43,7 @@ ACESCCT_WORKING_SIGNAL = VideoSignalSpec(
 
 LOGC3_WORKING_SIGNAL = VideoSignalSpec(
     layout=VideoLayout.HWC_RGB,
-    dtype="float32",
+    dtype=SampleDType.FLOAT32,
     value_domain=VideoValueDomain.LOGC3_WORKING_CODES,
     primaries=ColorPrimaries.REC709,
     transfer=ColorTransfer.LOGC3,
@@ -55,7 +56,7 @@ LOGC3_WORKING_SIGNAL = VideoSignalSpec(
 
 SCENE_LINEAR_HDR_SIGNAL = VideoSignalSpec(
     layout=VideoLayout.HWC_RGB,
-    dtype="float32",
+    dtype=SampleDType.FLOAT32,
     value_domain=VideoValueDomain.SCENE_LINEAR,
     primaries=ColorPrimaries.ACESCG,
     transfer=ColorTransfer.LINEAR,
@@ -126,7 +127,7 @@ def validate_ltx_hdr_working_signal(spec: VideoSignalSpec) -> None:
     }.get(spec.transfer)
     if (
         spec.layout is not VideoLayout.HWC_RGB
-        or spec.dtype != "float32"
+        or spec.dtype != SampleDType.FLOAT32
         or expected_domain is None
         or spec.value_domain is not expected_domain
         or spec.primaries

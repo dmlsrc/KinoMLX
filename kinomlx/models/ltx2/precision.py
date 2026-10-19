@@ -4,11 +4,9 @@ from dataclasses import dataclass
 
 import mlx.core as mx
 
-from .types import VideoVAEDecodeDType
+from kinomlx.modeling.dtypes import FloatDType, float_dtype_name, resolve_float_dtype
 
-
-def _dtype_name(dtype: mx.Dtype) -> str:
-    return str(dtype).removeprefix("mlx.core.")
+from .vocabularies import LTX2VideoVAEDecodeDType
 
 
 @dataclass(frozen=True)
@@ -16,11 +14,11 @@ class LTX2DTypePolicy:
     """Resolved component dtypes, separate from operator opmath policy.
 
     ``LTX2Settings.transformer_dtype`` is intentionally allowed to change only
-    ``transformer``. LTX-2 carries its persistent latents and the sequential
-    VAE/upscaler/audio components in BF16. Precision-sensitive arithmetic
-    inside those boundaries belongs in :mod:`kinomlx.kernels`; widening an
-    entire component to compensate for one operator would increase memory and
-    obscure which operation actually required FP32 math.
+    ``transformer``. LTX-2 carries its persistent latents and reference component
+    policy in BF16. The terminal video decoder selects FP16 separately (see
+    :func:`resolve_video_vae_decode_precision`); precision-sensitive arithmetic
+    inside components belongs in :mod:`kinomlx.kernels` rather than widening an
+    entire component.
 
     The individual fields remain constructible for focused tests, but only
     :meth:`reference` is used by the product runtime.
@@ -50,32 +48,36 @@ class LTX2DTypePolicy:
     def to_metadata(self) -> dict[str, str]:
         """Return stable user-facing names for generation receipts."""
         return {
-            "transformer": _dtype_name(self.transformer),
-            "latent": _dtype_name(self.latent),
-            "video_vae": _dtype_name(self.video_vae),
-            "spatial_upscaler": _dtype_name(self.spatial_upscaler),
-            "audio_vae": _dtype_name(self.audio_vae),
-            "duration_head": _dtype_name(self.duration_head),
-            "temporal_upscaler": _dtype_name(self.temporal_upscaler),
+            "transformer": float_dtype_name(self.transformer),
+            "latent": float_dtype_name(self.latent),
+            "video_vae": float_dtype_name(self.video_vae),
+            "spatial_upscaler": float_dtype_name(self.spatial_upscaler),
+            "audio_vae": float_dtype_name(self.audio_vae),
+            "duration_head": float_dtype_name(self.duration_head),
+            "temporal_upscaler": float_dtype_name(self.temporal_upscaler),
         }
 
 
-def resolve_video_vae_decode_dtype(
-    value: VideoVAEDecodeDType,
-    *,
-    hdr: bool,
-    default: mx.Dtype,
-) -> mx.Dtype:
-    """Resolve a request override against the recipe-aware decode default."""
-    if value == "auto":
-        return mx.float32 if hdr else default
-    if value == "bfloat16":
-        return mx.bfloat16
-    if value == "float16":
-        return mx.float16
-    if value == "float32":
-        return mx.float32
-    raise ValueError(f"unsupported video VAE decode dtype {value!r}")
+@dataclass(frozen=True)
+class VideoVAEDecodePrecision:
+    """The dtype a video decode computes in, and the one it decodes again in when its first
+    decoded frames are not finite.
+
+    ``auto`` decodes in FP16 with either decoder, SDR or HDR, and falls back to BF16, whose
+    range matches FP32's at half its memory. A requested dtype has no fallback: a nonfinite
+    decode stops the run.
+    """
+
+    dtype: mx.Dtype
+    overflow_fallback: mx.Dtype | None
 
 
-__all__ = ["LTX2DTypePolicy", "resolve_video_vae_decode_dtype"]
+def resolve_video_vae_decode_precision(value: LTX2VideoVAEDecodeDType) -> VideoVAEDecodePrecision:
+    """Resolve a request's video VAE decode dtype and its overflow fallback."""
+    if value == LTX2VideoVAEDecodeDType.AUTO:
+        return VideoVAEDecodePrecision(mx.float16, mx.bfloat16)
+    dtype = resolve_float_dtype(FloatDType(value), owner="LTX-2 video VAE decode")
+    return VideoVAEDecodePrecision(dtype, None)
+
+
+__all__ = ["LTX2DTypePolicy", "VideoVAEDecodePrecision", "resolve_video_vae_decode_precision"]

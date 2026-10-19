@@ -6,36 +6,38 @@ from pathlib import Path
 from kinomlx.config import CliBinding, ConfigGroup, ConfigTableSpec
 from kinomlx.config import ConfigFieldSpec as F
 from kinomlx.config.layer_rules import OUTPUT_SELECTION
-from kinomlx.config.stations import OutputPolicy, StationPolicy
-from kinomlx.config_bindings import argument_value
+from kinomlx.config.stages import IrrelevantAction, OutputPolicy, StageMode, StagePolicy
+from kinomlx.config_bindings import CliAction, argument_value
 from kinomlx.config_surfaces import CONFIG_SURFACES
 from kinomlx.io.output_config import ImageOutputConfig
 from kinomlx.samplers.sigmas import parse_sigmas
 
 SIGMAS_CLI = CliBinding("Generation", parse=argument_value(parse_sigmas, "sigmas"))
-SOURCE_IMAGE_CLI = CliBinding("Image editing", flags=("--source-image",), action="append")
+SOURCE_IMAGE_CLI = CliBinding("Image editing", flags=("--source-image",), action=CliAction.APPEND)
 SOURCE_ASPECT_CLI = CliBinding("Image editing", nargs="?", const="long")
 RESTART_RUN_CLI = CliBinding("Restart", flags=("--restart",))
-RESTART_PHASE_CLI = CliBinding("Restart", flags=("--restart-from",))
+RESTART_STAGE_CLI = CliBinding("Restart", flags=("--restart-from",))
 
 
-def _mutable(stations: tuple[str, ...], reason: str) -> tuple[StationPolicy, ...]:
-    return tuple(StationPolicy(station, "mutable", reason=reason) for station in stations)
+def _mutable(stages: tuple[str, ...], reason: str) -> tuple[StagePolicy, ...]:
+    return tuple(StagePolicy(stage, StageMode.MUTABLE, reason=reason) for stage in stages)
 
 
-def _artifact(stations: tuple[str, ...], availability: OutputPolicy) -> tuple[StationPolicy, ...]:
+def _artifact(stages: tuple[str, ...], availability: OutputPolicy) -> tuple[StagePolicy, ...]:
     return tuple(
-        StationPolicy(
-            station,
-            "mutable" if station in availability.produced_at else "irrelevant",
+        StagePolicy(
+            stage,
+            StageMode.MUTABLE if stage in availability.produced_at else StageMode.IRRELEVANT,
             reason=(
-                "This artifact is produced by the selected restart station."
-                if station in availability.produced_at
+                "This artifact is produced by the selected restart stage."
+                if stage in availability.produced_at
                 else "This artifact is not produced here; explicit requests remain invalid."
             ),
-            irrelevant_action=None if station in availability.produced_at else "ignore",
+            irrelevant_action=None
+            if stage in availability.produced_at
+            else IrrelevantAction.IGNORE,
         )
-        for station in stations
+        for stage in stages
     )
 
 
@@ -46,16 +48,16 @@ def image_output_table(
     latents_help: str,
     conditioning_help: str,
     output_policies: Mapping[str, OutputPolicy],
-    stations: tuple[str, ...],
+    stages: tuple[str, ...],
 ) -> ConfigTableSpec:
-    if not stations:
-        raise ValueError("image output table needs its model's restart stations")
+    if not stages:
+        raise ValueError("image output table needs its model's restart stages")
     return ConfigTableSpec(
         path=("output",),
         cli_generated=True,
         record=ImageOutputConfig,
-        stations=stations,
-        station_record=ImageOutputConfig,
+        stages=stages,
+        stage_record=ImageOutputConfig,
         fields=(
             F(
                 persistence="intent",
@@ -68,8 +70,8 @@ def image_output_table(
                 environment_key="output_path",
                 cli=CliBinding("Output", flags=("--output",)),
                 surfaces=CONFIG_SURFACES,
-                station_policies=_mutable(
-                    stations, "A restart writes a new output bundle at the requested path."
+                stage_policies=_mutable(
+                    stages, "A restart writes a new output bundle at the requested path."
                 ),
             ),
             F(
@@ -82,8 +84,8 @@ def image_output_table(
                 environment_key="output_dir",
                 cli=CliBinding("Output"),
                 surfaces=CONFIG_SURFACES,
-                station_policies=_mutable(
-                    stations, "A restart may place its new output bundle in another directory."
+                stage_policies=_mutable(
+                    stages, "A restart may place its new output bundle in another directory."
                 ),
             ),
             F(
@@ -97,8 +99,8 @@ def image_output_table(
                 cli=CliBinding("Output"),
                 default_text=f"{model}-<variant>-seed<seed>",
                 surfaces=CONFIG_SURFACES,
-                station_policies=_mutable(
-                    stations,
+                stage_policies=_mutable(
+                    stages,
                     "A restart may name its new output bundle independently of the source run.",
                 ),
             ),
@@ -110,11 +112,11 @@ def image_output_table(
                 valid="true or false",
                 example=False,
                 cli_dest="save_initial_noise",
-                cli=CliBinding("Output", action="boolean"),
+                cli=CliBinding("Output", action=CliAction.BOOLEAN),
                 default_text="unset, which inherits the save-all setting",
                 groups=frozenset({ConfigGroup.SAVE_ALL_CANDIDATE}),
                 surfaces=CONFIG_SURFACES,
-                station_policies=_artifact(stations, output_policies["save_initial_noise"]),
+                stage_policies=_artifact(stages, output_policies["save_initial_noise"]),
             ),
             F(
                 persistence="intent",
@@ -124,11 +126,11 @@ def image_output_table(
                 valid="true or false",
                 example=False,
                 cli_dest="save_final_latents",
-                cli=CliBinding("Output", action="boolean"),
+                cli=CliBinding("Output", action=CliAction.BOOLEAN),
                 default_text="unset, which inherits the save-all setting",
                 groups=frozenset({ConfigGroup.SAVE_ALL_CANDIDATE}),
                 surfaces=CONFIG_SURFACES,
-                station_policies=_artifact(stations, output_policies["save_final_latents"]),
+                stage_policies=_artifact(stages, output_policies["save_final_latents"]),
             ),
             F(
                 persistence="intent",
@@ -141,12 +143,12 @@ def image_output_table(
                 cli=CliBinding(
                     "Output",
                     flags=("--save-text-conditioning", "--save-text-embeddings"),
-                    action="boolean",
+                    action=CliAction.BOOLEAN,
                 ),
                 default_text="unset, which inherits the save-all setting",
                 groups=frozenset({ConfigGroup.SAVE_ALL_CANDIDATE}),
                 surfaces=CONFIG_SURFACES,
-                station_policies=_artifact(stations, output_policies["save_text_conditioning"]),
+                stage_policies=_artifact(stages, output_policies["save_text_conditioning"]),
             ),
             F(
                 persistence="intent",
@@ -155,13 +157,11 @@ def image_output_table(
                 valid="true or false",
                 example=False,
                 cli_dest="save_run_log",
-                cli=CliBinding("Output", action="boolean"),
+                cli=CliBinding("Output", action=CliAction.BOOLEAN),
                 default_text="unset, which inherits the save-all setting",
                 groups=frozenset({ConfigGroup.SAVE_ALL_CANDIDATE}),
                 surfaces=CONFIG_SURFACES,
-                station_policies=_mutable(
-                    stations, "The new run may save its own execution record."
-                ),
+                stage_policies=_mutable(stages, "The new run may save its own execution record."),
             ),
             F(
                 persistence="intent",
@@ -170,11 +170,11 @@ def image_output_table(
                 valid="true or false",
                 example=False,
                 cli_dest="save_console_log",
-                cli=CliBinding("Output", action="boolean"),
+                cli=CliBinding("Output", action=CliAction.BOOLEAN),
                 default_text="unset, which inherits the save-all setting",
                 groups=frozenset({ConfigGroup.SAVE_ALL_CANDIDATE}),
                 surfaces=CONFIG_SURFACES,
-                station_policies=_mutable(stations, "The new run may save its own console log."),
+                stage_policies=_mutable(stages, "The new run may save its own console log."),
             ),
             F(
                 persistence="intent",
@@ -183,12 +183,12 @@ def image_output_table(
                 valid="true or false",
                 example=False,
                 cli_dest="save_effective_config",
-                cli=CliBinding("Output", action="boolean"),
+                cli=CliBinding("Output", action=CliAction.BOOLEAN),
                 default_text="unset, which inherits the save-all setting",
                 groups=frozenset({ConfigGroup.SAVE_ALL_CANDIDATE}),
                 surfaces=CONFIG_SURFACES,
-                station_policies=_mutable(
-                    stations, "The new run may save its own effective configuration."
+                stage_policies=_mutable(
+                    stages, "The new run may save its own effective configuration."
                 ),
             ),
             F(
@@ -198,10 +198,10 @@ def image_output_table(
                 valid="true or false",
                 example=False,
                 cli_dest="save_all_sidecars",
-                cli=CliBinding("Output", action="boolean"),
+                cli=CliBinding("Output", action=CliAction.BOOLEAN),
                 surfaces=CONFIG_SURFACES,
-                station_policies=_mutable(
-                    stations, "The new run may select its available sidecars as a group."
+                stage_policies=_mutable(
+                    stages, "The new run may select its available sidecars as a group."
                 ),
             ),
             F(
@@ -211,10 +211,10 @@ def image_output_table(
                 valid="true or false",
                 example=False,
                 cli_dest="force",
-                cli=CliBinding("Output", action="boolean"),
+                cli=CliBinding("Output", action=CliAction.BOOLEAN),
                 surfaces=CONFIG_SURFACES,
-                station_policies=_mutable(
-                    stations,
+                stage_policies=_mutable(
+                    stages,
                     "Replacement applies only to the new output bundle, with source protection retained.",
                 ),
             ),

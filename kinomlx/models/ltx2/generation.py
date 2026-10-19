@@ -10,7 +10,7 @@ from kinomlx.media.signals import VideoSignalSpec
 
 
 @dataclass(frozen=True)
-class GenerationOutput:
+class LTX2GenerationOutput:
     """Encoder-ready output from a public recipe.
 
     ``frames`` is a closeable, single-consumer stream of owned
@@ -46,11 +46,11 @@ class GenerationOutput:
     def close(self) -> None:
         self.frames.close()
 
-    def __enter__(self) -> GenerationOutput:
+    def __enter__(self) -> LTX2GenerationOutput:
         return self
 
     def __exit__(self, *_exc_info: object) -> None:
         self.close()
 
 
-__all__ = ["GenerationOutput"]
+__all__ = ["LTX2GenerationOutput"]

@@ -149,7 +149,7 @@ def _collection_example(schema: ConfigRecordSpec) -> tuple[dict[str, object], ..
     groups = [shared]
     if _STEPS.name in owned:
         groups.append([_PATH.name, _STEPS.name])
-    extra = [name for name in owned if name not in {member for group in groups for member in group}]
+    extra = [name for name in owned if name not in {*group for group in groups}]
     if extra:
         groups.append([_PATH.name, *extra])
     return tuple(

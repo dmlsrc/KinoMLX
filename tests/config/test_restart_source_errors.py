@@ -72,7 +72,7 @@ def _assert_located_config_error(exit_code: int, caplog) -> None:
 
 @pytest.mark.parametrize("model", MODELS)
 def test_a_failed_source_run_is_a_located_configuration_error(model, tmp_path, caplog) -> None:
-    # A run that failed published none of the stations a restart consumes.
+    # A run that failed published none of the stages a restart consumes.
     run = _write_run(tmp_path, model, name=f"{model}_failed", status="failed", outputs={})
 
     _assert_located_config_error(_restart(model, run, caplog), caplog)

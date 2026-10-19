@@ -8,13 +8,14 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Literal, Protocol, Union, cast, get_args, get_origin, get_type_hints
 
-from kinomlx.config_constraints import canonicalize_field_value, validate_field_constraints
-from kinomlx.config_record_state import (
+from kinomlx._config_record_state import (
     construct_record,
     record_intent,
     supplied_fields,
     tracks_presence,
 )
+from kinomlx.config_constraints import canonicalize_field_value, validate_field_constraints
+from kinomlx.config_transport import TRANSPORT_SCALARS, enum_vocabulary
 from kinomlx.errors import KinoMLXError
 
 
@@ -154,6 +155,15 @@ def coerce_config_value(value: object, annotation: object, location: str) -> obj
             for index, (item, item_type) in enumerate(zip(value, arguments, strict=True))
         )
 
+    vocabulary = enum_vocabulary(annotation)
+    if vocabulary is not None:
+        if not isinstance(value, str):
+            raise ConfigError(f"{location}: expected string, got {type(value).__name__}")
+        try:
+            return vocabulary(value)
+        except ValueError as exc:
+            allowed = ", ".join(repr(item.value) for item in vocabulary)
+            raise ConfigError(f"{location}: expected one of {allowed}, got {value!r}") from exc
     if isinstance(annotation, type) and isinstance(value, annotation):
         return value
     raise ConfigError(f"{location}: unsupported schema type {_type_name(annotation)}")
@@ -270,7 +280,9 @@ def dataclass_from_mapping[DataclassT](
         raise ConfigError(f"{table}: {exc}") from exc
 
 
-def _record_value(value: object, *, omit_none: bool, preserve_nested_intent: bool) -> object:
+def _record_value(
+    value: object, *, omit_none: bool, preserve_nested_intent: bool, location: str
+) -> object:
     """Project records recursively while preserving scalar and sequence transport shapes."""
     if dataclasses.is_dataclass(value) and not isinstance(value, type):
         if preserve_nested_intent and tracks_presence(type(value)):
@@ -282,32 +294,55 @@ def _record_value(value: object, *, omit_none: bool, preserve_nested_intent: boo
                 },
                 omit_none=omit_none,
                 preserve_nested_intent=True,
+                location=location,
             )
         return dataclass_to_mapping(
-            value, omit_none=omit_none, preserve_nested_intent=preserve_nested_intent
+            value,
+            omit_none=omit_none,
+            preserve_nested_intent=preserve_nested_intent,
+            location=location,
         )
     if isinstance(value, list):
         return [
-            _record_value(item, omit_none=omit_none, preserve_nested_intent=preserve_nested_intent)
-            for item in value
+            _record_value(
+                item,
+                omit_none=omit_none,
+                preserve_nested_intent=preserve_nested_intent,
+                location=f"{location}[{index}]",
+            )
+            for index, item in enumerate(value)
         ]
     if isinstance(value, tuple):
         return tuple(
-            _record_value(item, omit_none=omit_none, preserve_nested_intent=preserve_nested_intent)
-            for item in value
+            _record_value(
+                item,
+                omit_none=omit_none,
+                preserve_nested_intent=preserve_nested_intent,
+                location=f"{location}[{index}]",
+            )
+            for index, item in enumerate(value)
         )
     if isinstance(value, Mapping):
         return {
             key: _record_value(
-                item, omit_none=omit_none, preserve_nested_intent=preserve_nested_intent
+                item,
+                omit_none=omit_none,
+                preserve_nested_intent=preserve_nested_intent,
+                location=f"{location}.{key}",
             )
             for key, item in value.items()
         }
-    return value
+    if value is None or isinstance(value, TRANSPORT_SCALARS):
+        return value
+    raise ConfigError(f"{location}: {type(value).__name__} is not a configuration transport type")
 
 
 def dataclass_to_mapping(
-    value: object, *, omit_none: bool = True, preserve_nested_intent: bool = False
+    value: object,
+    *,
+    omit_none: bool = True,
+    preserve_nested_intent: bool = False,
+    location: str = "",
 ) -> dict[str, object]:
     """Project a record's values, optionally retaining intent inside nested typed inputs.
 
@@ -323,6 +358,9 @@ def dataclass_to_mapping(
         if item is None and omit_none:
             continue
         result[field.name] = _record_value(
-            item, omit_none=omit_none, preserve_nested_intent=preserve_nested_intent
+            item,
+            omit_none=omit_none,
+            preserve_nested_intent=preserve_nested_intent,
+            location=f"{location}.{field.name}" if location else field.name,
         )
     return result

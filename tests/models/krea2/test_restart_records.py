@@ -1,4 +1,4 @@
-"""Saved-run composition, input identity, and phase-aware sidecar selection."""
+"""Saved-run composition, input identity, and stage-aware sidecar selection."""
 
 import json
 import logging
@@ -61,10 +61,10 @@ def source_run(tmp_path: Path) -> Path:
     return run
 
 
-def _invocation(run: Path, phase: str, *arguments: str):
+def _invocation(run: Path, stage: str, *arguments: str):
     return assemble(
         build_parser().parse_args(
-            ["--model", "krea2", "--restart", str(run), "--restart-from", phase, *arguments]
+            ["--model", "krea2", "--restart", str(run), "--restart-from", stage, *arguments]
         ),
         base_settings=Settings(),
         base_model_settings=Krea2Settings(),
@@ -72,11 +72,11 @@ def _invocation(run: Path, phase: str, *arguments: str):
 
 
 @pytest.mark.parametrize(
-    ("phase", "name"), [("decode", "final_latents"), ("denoise", "text_conditioning")]
+    ("stage", "name"), [("decode", "final_latents"), ("denoise", "text_conditioning")]
 )
 @pytest.mark.parametrize("produced", [False, True])
 def test_restart_prefers_output_then_immediate_consumed_input(
-    source_run: Path, phase: str, name: str, produced: bool, caplog
+    source_run: Path, stage: str, name: str, produced: bool, caplog
 ) -> None:
     payload = json.loads(source_run.read_text())
     original = source_run.parent / payload["outputs"][name]
@@ -93,7 +93,7 @@ def test_restart_prefers_output_then_immediate_consumed_input(
     source_run.write_text(json.dumps(payload))
 
     with caplog.at_level("INFO", logger="kinomlx.models.krea2.restart"):
-        invocation = _invocation(source_run, phase)
+        invocation = _invocation(source_run, stage)
     validate_for_execution(invocation)
     selected = original if produced else consumed
     receipt = invocation.restart.to_record()["inputs"][name]
@@ -111,7 +111,9 @@ def test_explicit_latents_override_a_missing_consumed_input(source_run: Path) ->
     }
     source_run.write_text(json.dumps(payload))
 
-    manifest = load_restart_manifest(RestartConfig(source_run, latents=latent))
+    manifest = load_restart_manifest(
+        RestartConfig(source_run, latents=latent), schema=config_registry().model("krea2")
+    )
     assert manifest.selected_latents == latent
     receipt = manifest.to_record()["inputs"]["final_latents"]
     assert receipt["matches_parent"] is False
@@ -130,10 +132,10 @@ def test_restart_protects_consumed_input_even_when_not_a_parent_output(source_ru
         validate_for_execution(invocation)
 
 
-@pytest.mark.parametrize("phase", ["decode", "denoise"])
+@pytest.mark.parametrize("stage", ["decode", "denoise"])
 @pytest.mark.parametrize("layer", ["file", "cli", "set"])
 def test_save_all_selects_only_produced_sidecars_and_round_trips(
-    source_run: Path, phase: str, layer: str
+    source_run: Path, stage: str, layer: str
 ) -> None:
     if layer == "file":
         config = source_run.with_suffix(".toml")
@@ -143,25 +145,23 @@ def test_save_all_selects_only_produced_sidecars_and_round_trips(
         arguments = ["--save-all-sidecars"]
     else:
         arguments = ["--set", "output.save_all_sidecars=true"]
-    invocation = _invocation(source_run, phase, *arguments)
+    invocation = _invocation(source_run, stage, *arguments)
     validate_for_execution(invocation)
-    plan = plan_krea2_output(
-        invocation.request, invocation.variant, invocation.output, station=phase
-    )
-    assert bool(plan.artifacts.initial_noise) is (phase == "denoise")
-    assert bool(plan.artifacts.text_conditioning) is (phase == "denoise")
-    # Both restart stations re-emit the final latent a further decode needs.
+    plan = plan_krea2_output(invocation.request, invocation.variant, invocation.output, stage=stage)
+    assert bool(plan.artifacts.initial_noise) is (stage == "denoise")
+    assert bool(plan.artifacts.text_conditioning) is (stage == "denoise")
+    # Both restart stages re-emit the final latent a further decode needs.
     assert bool(plan.artifacts.final_latents) is True
     assert set(plan.sidecar_paths()) == {"run_log", "execution_log", "effective_config"}
     saved = source_run.with_name("effective.toml")
     saved.write_text(config_registry().model("krea2").dump_config(invocation.resolved_config))
-    replay = _invocation(source_run, phase, "--config", str(saved))
+    replay = _invocation(source_run, stage, "--config", str(saved))
     validate_for_execution(replay)
     assert replay.output == invocation.output
 
 
 @pytest.mark.parametrize(
-    ("phase", "field"),
+    ("stage", "field"),
     [
         ("decode", "save_initial_noise"),
         ("decode", "save_text_conditioning"),
@@ -169,7 +169,7 @@ def test_save_all_selects_only_produced_sidecars_and_round_trips(
 )
 @pytest.mark.parametrize("same_layer", [False, True])
 def test_save_all_does_not_hide_explicit_unavailable_sidecars(
-    source_run: Path, phase: str, field: str, same_layer: bool
+    source_run: Path, stage: str, field: str, same_layer: bool
 ) -> None:
     config = source_run.with_suffix(".toml")
     config.write_text(f"[output]\n{field} = true\n")
@@ -178,7 +178,7 @@ def test_save_all_does_not_hide_explicit_unavailable_sidecars(
         arguments.append(f"--{field.replace('_', '-')}")
     else:
         arguments.extend(["--config", str(config)])
-    invocation = _invocation(source_run, phase, *arguments)
+    invocation = _invocation(source_run, stage, *arguments)
 
     with pytest.raises(ConfigError, match=field):
         validate_for_execution(invocation)
@@ -258,7 +258,7 @@ def test_denoise_replacement_does_not_require_original_text(
     assert invocation.request.negative_prompts == tuple(negatives)
     assert invocation.request.image_count == rows
 
-    with pytest.raises(ConfigError, match="belongs to an earlier station"):
+    with pytest.raises(ConfigError, match="belongs to an earlier stage"):
         _invocation(
             source_run,
             "denoise",
@@ -363,9 +363,15 @@ def test_a_canceled_run_is_restartable_only_for_what_it_published(
         with pytest.raises(
             ConfigError, match=f"image {index} of 2 was not published before cancellation"
         ):
-            load_restart_manifest(RestartConfig(run=run, phase="decode", index=index))
+            load_restart_manifest(
+                RestartConfig(run=run, stage="decode", index=index),
+                schema=config_registry().model("krea2"),
+            )
     for index in range(1, published + 1):
-        manifest = load_restart_manifest(RestartConfig(run=run, phase="decode", index=index))
+        manifest = load_restart_manifest(
+            RestartConfig(run=run, stage="decode", index=index),
+            schema=config_registry().model("krea2"),
+        )
         assert manifest.selected_latents.is_file()
         assert manifest.source_image_count == 2
 
@@ -377,12 +383,17 @@ def test_a_failed_multi_seed_run_keeps_its_artifacts_to_itself(multi_seed_run: P
     run.write_text(json.dumps(payload), encoding="utf-8")
 
     with pytest.raises(ConfigError, match="has no completed final_latents output"):
-        load_restart_manifest(RestartConfig(run=run, phase="decode", index=1))
+        load_restart_manifest(
+            RestartConfig(run=run, stage="decode", index=1), schema=config_registry().model("krea2")
+        )
 
 
 @pytest.mark.parametrize(("index", "seed"), [(1, 42), (2, 99)])
 def test_multi_seed_restart_selects_one_recorded_image(multi_seed_run: Path, index, seed) -> None:
-    manifest = load_restart_manifest(RestartConfig(run=multi_seed_run, phase="decode", index=index))
+    manifest = load_restart_manifest(
+        RestartConfig(run=multi_seed_run, stage="decode", index=index),
+        schema=config_registry().model("krea2"),
+    )
     assert (
         manifest.selected_latents.name == f"source-{index:03d}-seed{seed}_final_latents.safetensors"
     )
@@ -393,12 +404,18 @@ def test_multi_seed_restart_selects_one_recorded_image(multi_seed_run: Path, ind
 
 def test_multi_seed_restart_without_an_index_names_the_range(multi_seed_run: Path) -> None:
     with pytest.raises(ConfigError, match="recorded 2 images; select one"):
-        load_restart_manifest(RestartConfig(run=multi_seed_run, phase="decode"))
+        load_restart_manifest(
+            RestartConfig(run=multi_seed_run, stage="decode"),
+            schema=config_registry().model("krea2"),
+        )
 
 
 def test_multi_seed_restart_rejects_an_index_past_the_image_count(multi_seed_run: Path) -> None:
     with pytest.raises(ConfigError, match="between 1 and 2"):
-        load_restart_manifest(RestartConfig(run=multi_seed_run, phase="decode", index=3))
+        load_restart_manifest(
+            RestartConfig(run=multi_seed_run, stage="decode", index=3),
+            schema=config_registry().model("krea2"),
+        )
 
 
 def test_multi_seed_restart_keeps_an_explicit_latents_override(multi_seed_run: Path) -> None:
@@ -409,14 +426,17 @@ def test_multi_seed_restart_keeps_an_explicit_latents_override(multi_seed_run: P
         metadata={"schema": "kinomlx.krea2.tensor.v1", "artifact": "final_latents"},
     )
     manifest = load_restart_manifest(
-        RestartConfig(run=multi_seed_run, phase="decode", index=2, latents=replacement)
+        RestartConfig(run=multi_seed_run, stage="decode", index=2, latents=replacement),
+        schema=config_registry().model("krea2"),
     )
     assert manifest.selected_latents == replacement
     assert manifest.base_config().values["generate"]["seed"] == 99
 
 
 def test_single_image_restart_still_needs_no_index(source_run: Path) -> None:
-    manifest = load_restart_manifest(RestartConfig(run=source_run, phase="decode"))
+    manifest = load_restart_manifest(
+        RestartConfig(run=source_run, stage="decode"), schema=config_registry().model("krea2")
+    )
     assert manifest.selected_latents.name == "source_final_latents.safetensors"
     assert "seeds" not in manifest.base_config().values["generate"]
 
@@ -450,7 +470,9 @@ def test_a_canceled_multi_image_run_keeps_its_recorded_identity(source_run: Path
     run = _canceled_multi_image_run(source_run, record_planned_count=True)
 
     with caplog.at_level(logging.WARNING, logger="kinomlx"):
-        manifest = load_restart_manifest(RestartConfig(run, index=1))
+        manifest = load_restart_manifest(
+            RestartConfig(run, index=1), schema=config_registry().model("krea2")
+        )
 
     assert manifest.source_image_count == 2
     receipt = manifest.to_record()["inputs"]["final_latents"]
@@ -463,7 +485,7 @@ def test_a_record_without_a_planned_count_still_loads_without_its_digest(
 ) -> None:
     run = _canceled_multi_image_run(source_run, record_planned_count=False)
 
-    manifest = load_restart_manifest(RestartConfig(run))
+    manifest = load_restart_manifest(RestartConfig(run), schema=config_registry().model("krea2"))
 
     assert manifest.source_image_count == 1
     assert manifest.to_record()["inputs"]["final_latents"]["matches_parent"] is None

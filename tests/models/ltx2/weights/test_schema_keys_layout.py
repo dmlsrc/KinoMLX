@@ -129,11 +129,12 @@ def test_layout_key_selection_covers_ff_attention_audio_and_adaln() -> None:
     assert layout_weight_key("transformer_blocks.2.ff.project_out.weight", **common) is None
 
 
-def test_fp16_transformer_auto_adds_both_ff_pretransposes() -> None:
-    existing = (("project_out", "pretranspose"),)
-    normalized = ensure_ff_pretranspose_for_dtype(existing, mx.float16)
-    assert normalized == (
-        ("project_in", "pretranspose"),
-        ("project_out", "pretranspose"),
-    )
-    assert ensure_ff_pretranspose_for_dtype(existing, mx.bfloat16) == existing
+def test_fp16_transformer_auto_adds_only_the_ff_down_pretranspose() -> None:
+    down = (("project_out", "pretranspose"),)
+    assert ensure_ff_pretranspose_for_dtype((), mx.float16) == down
+    assert ensure_ff_pretranspose_for_dtype(down, mx.float16) == down
+    # An explicit up-projection pretranspose is kept; the policy no longer adds one.
+    up = (("project_in", "pretranspose"),)
+    assert ensure_ff_pretranspose_for_dtype(up, mx.float16) == down + up
+    assert ensure_ff_pretranspose_for_dtype((), mx.bfloat16) == ()
+    assert ensure_ff_pretranspose_for_dtype(down, mx.bfloat16) == down

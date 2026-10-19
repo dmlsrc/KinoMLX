@@ -8,12 +8,14 @@ from typing import TypedDict, TypeGuard, Unpack, cast
 import mlx.core as mx
 
 import kinomlx._mlx_nn as nn
-from kinomlx.modeling.dtypes import resolve_float_dtype
+from kinomlx.modeling.dtypes import FloatDType, resolve_float_dtype
 from kinomlx.modeling.evaluation import async_eval_arrays
 
 from ..transformer_config import TransformerConstructorConfig
-from .attention import _linear_shell
+from ..vocabularies import LTX2ModelGeneration
+from .attention import Attention, _linear_shell
 from .execution import TransformerExecution
+from .feed_forward import FeedForward
 from .graph import TransformerGraphSpec, transformer_parameter_shapes
 from .preprocessing import ModalityPreprocessor
 from .timestep import AdaLayerNormSingle
@@ -42,15 +44,13 @@ type _CompiledBlockGroup = Callable[
 
 
 class _LTXAVModelOptions(TypedDict, total=False):
-    compute_dtype: str | mx.Dtype
+    compute_dtype: FloatDType | mx.Dtype
     double_precision_rope: bool
     apply_gated_attention: bool
-    use_steel_attention: bool
     compile_attention: bool
-    steel_attention_d64: bool
-    steel_attention_probe: bool
+    dense_attention_kernel: bool
     fast_mode: bool
-    compile_block_groups: int | None
+    compile_block_group_size: int | None
     transformer_compile_group_size: int | None
 
 
@@ -158,16 +158,14 @@ class LTXAVModel(nn.Module):
         audio_ff_bias: bool = True,
         use_keyframes_abs_pos_embedding: bool = False,
         use_prompt_adaln_single: bool = True,
-        model_generation: str = "2.3",
-        compute_dtype: str | mx.Dtype = mx.bfloat16,
+        model_generation: LTX2ModelGeneration = LTX2ModelGeneration.LTX23,
+        compute_dtype: FloatDType | mx.Dtype = mx.bfloat16,
         double_precision_rope: bool = True,
         apply_gated_attention: bool = True,
-        use_steel_attention: bool = True,
         compile_attention: bool = True,
-        steel_attention_d64: bool = True,
-        steel_attention_probe: bool = False,
+        dense_attention_kernel: bool = True,
         fast_mode: bool = True,
-        compile_block_groups: int | None = None,
+        compile_block_group_size: int | None = None,
         transformer_compile_group_size: int | None = None,
     ) -> None:
         super().__init__()
@@ -175,8 +173,8 @@ class LTXAVModel(nn.Module):
             raise ValueError("transformer must contain at least one block")
         if video_heads != audio_heads:
             raise ValueError("LTX-2 A/V cross-attention requires equal head counts")
-        if compile_block_groups is not None and compile_block_groups <= 0:
-            raise ValueError("compile_block_groups must be positive")
+        if compile_block_group_size is not None and compile_block_group_size <= 0:
+            raise ValueError("compile_block_group_size must be positive")
         if transformer_compile_group_size is not None and transformer_compile_group_size <= 0:
             raise ValueError("transformer_compile_group_size must be positive")
         self.compute_dtype = resolve_float_dtype(compute_dtype, owner="LTX transformer")
@@ -188,7 +186,7 @@ class LTXAVModel(nn.Module):
             raise ValueError("LTX-2 video context must match the video hidden dimension")
         if audio_context_dim != self.audio_inner_dim:
             raise ValueError("LTX-2 audio context must match the audio hidden dimension")
-        if model_generation not in {"2.3", "2.5"}:
+        if model_generation not in LTX2ModelGeneration:
             raise ValueError(f"unsupported LTX model generation {model_generation!r}")
         graph_spec = TransformerGraphSpec(
             num_layers=num_layers,
@@ -246,10 +244,8 @@ class LTXAVModel(nn.Module):
             context_dim=video_context_dim,
             ff_bias=ff_bias,
             apply_gated_attention=apply_gated_attention,
-            use_steel_attention=use_steel_attention,
             compile_attention=compile_attention,
-            steel_attention_d64=steel_attention_d64,
-            steel_attention_probe=steel_attention_probe,
+            dense_attention_kernel=dense_attention_kernel,
         )
         audio_config = TransformerConfig(
             dim=self.audio_inner_dim,
@@ -258,10 +254,8 @@ class LTXAVModel(nn.Module):
             context_dim=audio_context_dim,
             ff_bias=audio_ff_bias,
             apply_gated_attention=apply_gated_attention,
-            use_steel_attention=use_steel_attention,
             compile_attention=compile_attention,
-            steel_attention_d64=steel_attention_d64,
-            steel_attention_probe=steel_attention_probe,
+            dense_attention_kernel=dense_attention_kernel,
         )
         self.transformer_blocks = [
             BasicAVTransformerBlock(
@@ -274,7 +268,7 @@ class LTXAVModel(nn.Module):
         ]
         self.transformer_block_streamer = None
         self._eval_frequency = 0 if fast_mode else 8
-        self.compile_block_groups = compile_block_groups
+        self.compile_block_group_size = compile_block_group_size
         self.transformer_compile_group_size = transformer_compile_group_size
         object.__setattr__(self, "_compiled_transformer_block_groups", {})
         object.__setattr__(self, "_transformer_block_compile_disabled", False)
@@ -418,11 +412,15 @@ class LTXAVModel(nn.Module):
         # The packed compile boundary deliberately omits the Python ``enabled``
         # flag. Guided denoisers can keep a disabled stream present as K/V
         # context for the other modality, so those calls must retain the eager
-        # branch semantics instead of being unpacked as enabled.
-        compile_modalities_enabled = all(args is None or args.enabled for args in (video, audio))
+        # branch semantics instead of being unpacked as enabled. It omits the
+        # sparse attention record too, whose per-layer choice a compiled group
+        # would also freeze at its first trace, so sparse forwards run eagerly.
+        compile_modalities_enabled = all(
+            args is None or args.enabled for args in (video, audio)
+        ) and (video is None or video.sparse_attention is None)
         streamer = self.transformer_block_streamer
         if streamer is None:
-            group_size = self.compile_block_groups
+            group_size = self.compile_block_group_size
             compile_disabled = object.__getattribute__(
                 self,
                 "_transformer_block_compile_disabled",
@@ -635,6 +633,16 @@ class LTXAVModel(nn.Module):
             else None
         )
         return video_output, audio_output
+
+    def enable_mpp_weight_conversion(self) -> None:
+        """Let BF16 projections keep the MPP form of their weights after its first use.
+
+        Only for resident weights: a streamed block's source arrays stay referenced by the
+        streamer, so a converted copy would add to memory instead of replacing them.
+        """
+        for module in self.modules():
+            if isinstance(module, (Attention, FeedForward)):
+                module.convert_mpp_weights = True
 
     def close_streamer(self) -> None:
         """Release a source-backed block streamer without owning other models."""

@@ -1,20 +1,29 @@
 """LTX LoRA stage-strength and target-knockout contracts."""
 
+import json
+import logging
 from pathlib import Path
 
 import mlx.core as mx
 import pytest
 
+from kinomlx.adapters.fusion import fuse_weight
 from kinomlx.adapters.lora import LoRAConfig
+from kinomlx.adapters.scaling import UNKNOWN_SCALE_WARNING
 from kinomlx.models.ltx2.adapters import loading as lora_module
 from kinomlx.models.ltx2.adapters.keys import lora_key_categories
 from kinomlx.models.ltx2.adapters.loading import (
+    community_adapter_operations,
     fuse_community_loras_into_model,
 )
 from kinomlx.models.ltx2.transformer import LTXAVModel
 from kinomlx.models.ltx2.weights.layout import install_layout_weight
+from tests.adapters._snapshot import link_as_snapshot
 
 from ..transformer._synthetic import build_shaped_ltx_model
+
+_LOADING_LOGGER = "kinomlx.models.ltx2.adapters.loading"
+_PEFT_TO_K = "base_model.model.transformer_blocks.0.attn1.to_k"
 
 
 def _live_model(dtype: mx.Dtype) -> LTXAVModel:
@@ -344,3 +353,196 @@ def test_half_accumulation_falls_back_to_fp32_for_wide_factors(tmp_path: Path, c
     values = [value for _key, value in tree_flatten(model.parameters())]
     mx.eval(values)
     assert all(mx.all(mx.isfinite(value)).item() for value in values)
+
+
+def test_audio_side_av_cross_attention_table_classifies_as_audio() -> None:
+    """The AV table's stream tag has no trailing underscore for ``audio_`` to find."""
+    assert "audio" in lora_key_categories("transformer_blocks.0.scale_shift_table_a2v_ca_audio")
+    assert "video" in lora_key_categories("transformer_blocks.0.scale_shift_table_a2v_ca_video")
+
+
+def test_live_model_lora_fuses_bare_adaln_tables_and_names_the_shape(
+    tmp_path: Path,
+    caplog,
+) -> None:
+    """A pair targeting a bare modulation table places, and the receipt says what it is.
+
+    LTX keeps its adaLN tables as bare parameters, so those targets carry no
+    ``.weight`` segment and resolve to no weight-owning leaf. They used to count as
+    missing while every ordinary target fused, which applied such an adapter's
+    attention half and silently discarded its conditioning half.
+    """
+    import logging
+
+    model = _live_model(mx.float32)
+    block = model.transformer_blocks[0]
+    tables = {
+        "transformer_blocks.0.scale_shift_table": (block, "scale_shift_table", 0.25),
+        "transformer_blocks.0.scale_shift_table_a2v_ca_audio": (
+            block,
+            "scale_shift_table_a2v_ca_audio",
+            0.5,
+        ),
+        "scale_shift_table": (model, "scale_shift_table", 0.75),
+    }
+    before = {name: mx.array(getattr(owner, attr)) for name, (owner, attr, _) in tables.items()}
+
+    weights: dict[str, mx.array] = {}
+    for name, (owner, attr, delta) in tables.items():
+        rows, dim = getattr(owner, attr).shape
+        weights[f"diffusion_model.{name}.lora_A.weight"] = mx.ones((1, dim), dtype=mx.float32)
+        weights[f"diffusion_model.{name}.lora_B.weight"] = mx.full(
+            (rows, 1), delta, dtype=mx.float32
+        )
+    weights["diffusion_model.transformer_blocks.0.ff.net.2.lora_A.weight"] = mx.ones((1, 32))
+    weights["diffusion_model.transformer_blocks.0.ff.net.2.lora_B.weight"] = mx.ones((8, 1))
+    adapter = tmp_path / "adaln-tables.safetensors"
+    mx.save_safetensors(str(adapter), weights)
+
+    with caplog.at_level(logging.INFO, logger="kinomlx.models.ltx2.adapters.loading"):
+        (receipt,) = fuse_community_loras_into_model(model, [LoRAConfig(adapter)])
+
+    for name, (owner, attr, delta) in tables.items():
+        expected = before[name] + delta
+        assert mx.allclose(getattr(owner, attr), expected).item(), name
+
+    assert receipt.placed_targets == 4
+    assert receipt.complete_targets == 4
+    assert receipt.bare_parameter_targets == 3
+    assert receipt.skipped_reasons == ()
+    assert receipt.warnings == ()
+    assert receipt.to_metadata()["bare_parameter_targets"] == 3
+    assert "is not a plain LoRA" in caplog.text
+
+
+def _pair(prefix: str, *, width: int = 8, up: float = 1.0) -> dict[str, mx.array]:
+    return {
+        f"{prefix}.lora_A.weight": mx.ones((1, width), dtype=mx.float32),
+        f"{prefix}.lora_B.weight": mx.full((width, 1), up, dtype=mx.float32),
+    }
+
+
+def _zeroed_to_k_model() -> tuple[LTXAVModel, mx.array]:
+    model = _live_model(mx.float32)
+    attention = model.transformer_blocks[0].attn1
+    attention.to_k.weight = mx.zeros_like(attention.to_k.weight)
+    return model, attention.to_k.weight
+
+
+def _to_k(model: LTXAVModel) -> mx.array:
+    return model.transformer_blocks[0].attn1.to_k.weight
+
+
+def _peft_export(folder: Path, weights: dict[str, mx.array], config: dict[str, object]) -> Path:
+    folder.mkdir(parents=True)
+    mx.save_safetensors(str(folder / "adapter_model.safetensors"), weights)
+    (folder / "adapter_config.json").write_text(json.dumps(config))
+    return folder / "adapter_model.safetensors"
+
+
+def test_peft_export_applies_the_scale_its_snapshot_configuration_declares(
+    tmp_path: Path, caplog
+) -> None:
+    model, zero = _zeroed_to_k_model()
+    export = _peft_export(
+        tmp_path / "export", _pair(_PEFT_TO_K), {"peft_type": "LORA", "r": 1, "lora_alpha": 2}
+    )
+    weights, _config = link_as_snapshot(
+        tmp_path / "hub", export, export.with_name("adapter_config.json"), folder="RL-Lora"
+    )
+
+    with caplog.at_level(logging.INFO, logger=_LOADING_LOGGER):
+        (receipt,) = fuse_community_loras_into_model(
+            model, [LoRAConfig(weights, strength=0.5)], model_generation="2.3"
+        )
+
+    # strength 0.5 x lora_alpha / r (2) x B @ A (1) in every element.
+    assert mx.array_equal(_to_k(model), mx.ones_like(zero)).item()
+    assert receipt.placed_targets == 1
+    assert receipt.path == weights.resolve()
+    assert receipt.scale_source == "adapter_config.json"
+    assert receipt.intrinsic_scales == (2.0,)
+    assert receipt.to_metadata()["scale_source"] == "adapter_config.json"
+    assert receipt.warnings == ()
+    assert "Adapter result 1/1: adapter_model.safetensors" in caplog.messages
+    assert (
+        "LTX-2.3 adapter adapter_model.safetensors: scale 2 from adapter_config.json "
+        "(lora_alpha=2, r=1); effective 1 at strength 0.5" in caplog.messages
+    )
+
+
+def test_pre_pack_operations_carry_the_peft_scale(tmp_path: Path) -> None:
+    export = _peft_export(
+        tmp_path / "export",
+        _pair("base_model.model.transformer_blocks.0.ff.net.2", width=2, up=2.0),
+        {"peft_type": "LORA", "r": 1, "lora_alpha": 3},
+    )
+    base = "transformer_blocks.0.ff.project_out"
+    operations = community_adapter_operations(
+        [LoRAConfig(export, strength=0.5)], target_shapes={base: (2, 2)}
+    )
+    (operation,) = operations[f"{base}.weight"]
+    assert operation.operation.alpha == 3.0
+    weight = mx.arange(4, dtype=mx.float32).reshape(2, 2).astype(mx.bfloat16)
+    # strength 0.5 x lora_alpha / r (3) x B (2.0) @ A (1.0) adds 3.0 to every element.
+    assert mx.array_equal(fuse_weight(weight, operations[f"{base}.weight"]), weight + 3).item()
+
+
+def test_peft_export_without_configuration_warns_and_keeps_direct_strength(
+    tmp_path: Path, caplog
+) -> None:
+    model, zero = _zeroed_to_k_model()
+    path = tmp_path / "adapter_model.safetensors"
+    mx.save_safetensors(str(path), _pair(_PEFT_TO_K))
+
+    with caplog.at_level(logging.INFO, logger=_LOADING_LOGGER):
+        (receipt,) = fuse_community_loras_into_model(model, [LoRAConfig(path, strength=0.5)])
+
+    assert mx.array_equal(_to_k(model), mx.full(zero.shape, 0.5)).item()
+    assert receipt.warnings == (UNKNOWN_SCALE_WARNING,)
+    assert receipt.scale_source is None
+    assert receipt.intrinsic_scales == ()
+    assert f"LTX-2 adapter adapter_model.safetensors: {UNKNOWN_SCALE_WARNING}" in caplog.messages
+    assert not [message for message in caplog.messages if ": scale " in message]
+
+
+def test_alpha_tensors_and_loose_alpha_metadata_keep_direct_strength(
+    tmp_path: Path, caplog
+) -> None:
+    model, zero = _zeroed_to_k_model()
+    prefix = "diffusion_model.transformer_blocks.0.attn1.to_k"
+    path = tmp_path / "community.safetensors"
+    mx.save_safetensors(
+        str(path),
+        {**_pair(prefix), f"{prefix}.alpha": mx.array(4.0)},
+        metadata={"lora_alpha": "384", "lora_rank": "384"},
+    )
+
+    with caplog.at_level(logging.INFO, logger=_LOADING_LOGGER):
+        (receipt,) = fuse_community_loras_into_model(model, [LoRAConfig(path, strength=0.5)])
+
+    assert mx.array_equal(_to_k(model), mx.full(zero.shape, 0.5)).item()
+    assert receipt.scale_source is None
+    assert receipt.warnings == ()
+    assert not [message for message in caplog.messages if ": scale " in message]
+
+
+def test_embedded_pipeline_configuration_sets_the_ltx_scale(tmp_path: Path) -> None:
+    model, zero = _zeroed_to_k_model()
+    path = tmp_path / "pytorch_lora_weights.safetensors"
+    config = {"peft_type": "LORA", "r": 1, "lora_alpha": 3}
+    mx.save_safetensors(
+        str(path),
+        _pair("diffusion_model.transformer_blocks.0.attn1.to_k"),
+        metadata={
+            "lora_adapter_metadata": json.dumps(
+                {f"transformer.{key}": value for key, value in config.items()}
+            )
+        },
+    )
+
+    (receipt,) = fuse_community_loras_into_model(model, [LoRAConfig(path, strength=0.5)])
+
+    assert mx.array_equal(_to_k(model), mx.full(zero.shape, 1.5)).item()
+    assert receipt.scale_source == "lora_adapter_metadata"
+    assert receipt.intrinsic_scales == (3.0,)

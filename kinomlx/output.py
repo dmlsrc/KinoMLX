@@ -23,6 +23,7 @@ from kinomlx.media.signals import (
     EncodedVideoDeliverySpec,
     ExrDeliverySpec,
     OutputColorPlan,
+    SampleDType,
     UnsupportedSignalError,
     VideoLayout,
     VideoSignalSpec,
@@ -279,7 +280,7 @@ class HDRGenerationSink:
         }
         if (
             source.layout is not VideoLayout.HWC_RGB
-            or source.dtype != "float32"
+            or source.dtype != SampleDType.FLOAT32
             or source.value_domain is not domains.get(source.transfer)
             or source.primaries not in {ColorPrimaries.REC709, ColorPrimaries.ACESCG}
         ):

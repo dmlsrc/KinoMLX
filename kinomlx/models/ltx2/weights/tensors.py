@@ -8,8 +8,7 @@ import mlx.core as mx
 from kinomlx.io.safetensors import load_weights, read_dtypes
 from kinomlx.models.ltx2.weights.schema import (
     TRANSFORMER_QUANTIZE_MODES,
-    TRANSFORMER_QUANTIZE_MXFP8_BLOCKS,
-    TRANSFORMER_QUANTIZE_MXFP8_BLOCKS_PRETRANSPOSE,
+    TransformerQuantize,
 )
 
 FP8_SAFETENSORS_DTYPES = frozenset({"F8_E4M3", "F8_E5M2"})
@@ -264,8 +263,8 @@ def quant_mode_for_key(
     if (
         transformer_quantize
         in {
-            TRANSFORMER_QUANTIZE_MXFP8_BLOCKS,
-            TRANSFORMER_QUANTIZE_MXFP8_BLOCKS_PRETRANSPOSE,
+            TransformerQuantize.MXFP8_BLOCKS,
+            TransformerQuantize.MXFP8_BLOCKS_PRETRANSPOSE,
         }
         and block_linear_base_for_key(mlx_key) is not None
     ):
@@ -278,7 +277,7 @@ def quant_mode_for_key(
 
 
 def quant_pretransposed(transformer_quantize: str) -> bool:
-    return transformer_quantize == TRANSFORMER_QUANTIZE_MXFP8_BLOCKS_PRETRANSPOSE
+    return transformer_quantize == TransformerQuantize.MXFP8_BLOCKS_PRETRANSPOSE
 
 
 __all__ = [

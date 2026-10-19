@@ -6,11 +6,12 @@ from pathlib import Path
 
 import pytest
 
-from kinomlx.cli._registry import validate_model_parser
+from kinomlx.cli.parser_contract import validate_model_parser
 from kinomlx.config.inspection import configuration_inventory
 from kinomlx.config_bindings import CliBinding
 from kinomlx.invocation_controls import INVOCATION_CONTROLS, InvocationControl
-from kinomlx.model_registry import config_registry, model_choices
+from kinomlx.model_catalog import model_choices
+from kinomlx.model_registry import config_registry
 from kinomlx.models.flux2.arguments import build_parser
 
 

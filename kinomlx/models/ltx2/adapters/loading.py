@@ -3,7 +3,7 @@
 import logging
 import re
 from collections.abc import Callable, Iterable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Protocol, cast
@@ -11,17 +11,25 @@ from typing import Protocol, cast
 import mlx.core as mx
 
 import kinomlx._mlx_nn as nn
-from kinomlx.adapters.formats import AdapterOperation
+from kinomlx.adapters.formats import AdapterKind, AdapterOperation
 from kinomlx.adapters.fusion import (
     WeightedAdapterOperation,
     fuse_adapter_operations,
 )
 from kinomlx.adapters.lora import LoRAConfig, iter_lora_entries
-from kinomlx.adapters.peft import companion_config, parse_configured_adapter
+from kinomlx.adapters.peft import parse_configured_adapter
 from kinomlx.adapters.receipt import LOW_COVERAGE_WARNING_THRESHOLD, log_adapter_receipt
+from kinomlx.adapters.scaling import (
+    UNKNOWN_SCALE_WARNING,
+    ScaleDetermination,
+    determine_scale,
+    log_scale_determination,
+)
+from kinomlx.adapters.source import adapter_configuration
 from kinomlx.adapters.validation import AdapterWeightCheck
 from kinomlx.io.identity import file_signature, payload_digest
 from kinomlx.io.safetensors import load_weights, read_metadata
+from kinomlx.modeling.dtypes import FloatDType
 from kinomlx.modeling.loading import WeightTarget
 from kinomlx.models.ltx2.weights.layout import get_layout_weight, install_layout_weight
 from kinomlx.models.ltx2.weights.quantization import is_quantized_linear
@@ -55,6 +63,7 @@ class _LoRAMappingStats:
     unmapped: int
     missing: int
     shape_mismatched: int
+    bare_parameter: int
     target_categories: tuple[tuple[str, int], ...]
     skipped_reasons: tuple[tuple[str, int], ...]
 
@@ -69,6 +78,11 @@ class _LTXAdapterClassification:
 
     adapter_types: tuple[str, ...]
     extra_unmapped: int = 0
+    # Alpha per source prefix, declared by a PEFT configuration. Empty without
+    # one, which keeps every other export on direct strength.
+    alphas: Mapping[str, float] = field(default_factory=dict)
+    scale: ScaleDetermination = ScaleDetermination()
+    scale_unknown: bool = False
 
 
 def _adapter_fingerprint(path: Path) -> str:
@@ -90,11 +104,22 @@ def _declared_generation(path: Path) -> str | None:
     return None if match is None else match.group(1)
 
 
-def _classify_adapter(path: Path, weights: dict[str, mx.array]) -> _LTXAdapterClassification:
-    """Classify one source and admit only ordinary two-dimensional LoRA weights."""
+def _classify_adapter(
+    config: LoRAConfig, weights: dict[str, mx.array]
+) -> _LTXAdapterClassification:
+    """Classify one source and admit only ordinary two-dimensional LoRA weights.
+
+    LTX applies community LoRA at direct strength and leaves saved alpha tensors
+    unused. A PEFT export is the exception: the configuration in its
+    ``adapter_config.json``, or embedded as Diffusers metadata, defines the
+    ``lora_alpha / r`` scale that PEFT itself merges with, so that scale applies.
+    """
+    configuration = adapter_configuration(
+        config.source or config.path, read_metadata(config.path), weights
+    )
     inventory = parse_configured_adapter(
         weights,
-        companion_config(path),
+        configuration.values,
         validate_values=False,
     )
     signatures = tuple(sorted({f"{item.kind}:{item.part}" for item in inventory.operations}))
@@ -103,7 +128,7 @@ def _classify_adapter(path: Path, weights: dict[str, mx.array]) -> _LTXAdapterCl
     for operation in inventory.operations:
         factors = operation.factors
         plain_weight = (
-            operation.kind == "lora"
+            operation.kind == AdapterKind.LORA
             and operation.part == "weight"
             and "magnitude" not in factors
             and "mid" not in factors
@@ -112,7 +137,7 @@ def _classify_adapter(path: Path, weights: dict[str, mx.array]) -> _LTXAdapterCl
         )
         if plain_weight:
             continue
-        if operation.kind == "lora" and operation.part == "bias":
+        if operation.kind == AdapterKind.LORA and operation.part == "bias":
             # The historical LTX mapper applies the paired weight and ignores
             # the optional LoRA B bias. Keep it visible in coverage instead of
             # rejecting an otherwise usable ordinary-LoRA file.
@@ -127,9 +152,21 @@ def _classify_adapter(path: Path, weights: dict[str, mx.array]) -> _LTXAdapterCl
             f"parsed adapter operations: {parsed}; first unsupported operation: "
             f"{first.prefix!r} ({first.kind}:{first.part})"
         )
+    if configuration.source is None:
+        return _LTXAdapterClassification(
+            inventory.adapter_types,
+            ignored_operations + len(inventory.unknown_keys) + len(inventory.shared_keys),
+            scale_unknown=configuration.scale_unknown,
+        )
     return _LTXAdapterClassification(
         inventory.adapter_types,
         ignored_operations + len(inventory.unknown_keys) + len(inventory.shared_keys),
+        alphas={
+            operation.prefix: operation.alpha
+            for operation in inventory.operations
+            if operation.part == "weight" and operation.alpha is not None
+        },
+        scale=determine_scale(configuration.source, configuration.values, inventory.operations),
     )
 
 
@@ -158,7 +195,15 @@ def _normalize_lora_for_weights(
     include_audio: bool,
     excluded_categories: frozenset[str],
     extra_unmapped: int = 0,
-) -> tuple[dict[str, mx.array], _LoRAMappingStats]:
+    alphas: Mapping[str, float] | None = None,
+) -> tuple[dict[str, mx.array], _LoRAMappingStats, dict[str, float]]:
+    """Map source pairs onto model targets; return the pairs, counts, and target alphas.
+
+    ``alphas`` holds a PEFT configuration's alpha per source prefix. Each placed
+    pair keeps its own under the target it maps to.
+    """
+    declared_alphas = alphas or {}
+    target_alphas: dict[str, float] = {}
     normalized: dict[str, mx.array] = {}
     resolved = 0
     present = 0
@@ -167,6 +212,7 @@ def _normalize_lora_for_weights(
     unmapped = extra_unmapped
     missing = 0
     shape_mismatched = 0
+    bare_parameter = 0
     category_counts: dict[str, int] = {}
     reason_counts: dict[str, int] = {"unmapped": extra_unmapped} if extra_unmapped else {}
     if extra_unmapped:
@@ -210,6 +256,14 @@ def _normalize_lora_for_weights(
             target = mlx_base
             present += 1
             matched_key = normal_key
+        elif mlx_base in base_weights:
+            # LTX keeps its adaLN modulation tables as bare parameters rather than
+            # modules, so an adapter targeting one has no `.weight` segment to match.
+            # The pair itself is ordinary; only the destination spelling differs.
+            target = mlx_base
+            present += 1
+            matched_key = mlx_base
+            bare_parameter += 1
         elif layout_key in base_weights:
             target = layout_key
             present += 1
@@ -230,12 +284,15 @@ def _normalize_lora_for_weights(
             shape_mismatched += 1
             reason_counts["shape_mismatch"] = reason_counts.get("shape_mismatch", 0) + 1
 
-        # Community checkpoints use direct-strength products for this model.
-        # Re-emit a canonical pair and intentionally omit alpha metadata.
+        # Community checkpoints use direct-strength products for this model, so
+        # the canonical pair omits any saved alpha tensor. A PEFT configuration's
+        # alpha travels beside it instead.
         normalized[f"{target}.lora_A.weight"] = entry.a
         normalized[f"{target}.lora_B.weight"] = entry.b
+        if (alpha := declared_alphas.get(raw_base)) is not None:
+            target_alphas[target] = alpha
 
-    return normalized, _LoRAMappingStats(
+    stats = _LoRAMappingStats(
         resolved=resolved,
         present=present,
         placed=placed,
@@ -243,16 +300,18 @@ def _normalize_lora_for_weights(
         unmapped=unmapped,
         missing=missing,
         shape_mismatched=shape_mismatched,
+        bare_parameter=bare_parameter,
         target_categories=tuple(sorted(category_counts.items())),
         skipped_reasons=tuple(sorted(reason_counts.items())),
     )
+    return normalized, stats, target_alphas
 
 
 def _adapter_receipt(
     config: LoRAConfig,
     stats: _LoRAMappingStats,
     *,
-    adapter_types: tuple[str, ...],
+    classification: _LTXAdapterClassification,
     model_generation: str | None,
 ) -> LTX2AdapterReceipt:
     declared = _declared_generation(config.path)
@@ -275,6 +334,8 @@ def _adapter_receipt(
         warnings.append("no effective merge (0% effective placement)")
     elif coverage < LOW_COVERAGE_WARNING_THRESHOLD:
         warnings.append(f"low target coverage ({coverage:.1%})")
+    if classification.scale_unknown and effective:
+        warnings.append(UNKNOWN_SCALE_WARNING)
     return LTX2AdapterReceipt(
         path=config.path,
         fingerprint=_adapter_fingerprint(config.path),
@@ -286,11 +347,14 @@ def _adapter_receipt(
         complete_targets=complete_targets,
         placed_targets=stats.placed,
         structural_coverage=coverage,
+        bare_parameter_targets=stats.bare_parameter,
         target_categories=stats.target_categories,
         skipped_reasons=stats.skipped_reasons,
         effective=effective,
         warnings=tuple(warnings),
-        adapter_types=adapter_types,
+        adapter_types=classification.adapter_types,
+        scale_source=classification.scale.source,
+        intrinsic_scales=classification.scale.scales,
     )
 
 
@@ -298,13 +362,17 @@ def _log_receipt(
     receipt: LTX2AdapterReceipt,
     stats: _LoRAMappingStats,
     *,
+    selected: Path,
+    scale: ScaleDetermination,
     model_generation: str | None,
     position: tuple[int, int],
 ) -> None:
+    """Log one receipt under the path as selected, which a blob digest would hide."""
+    model = f"LTX-{model_generation or 'unknown'}"
     log_adapter_receipt(
         _log,
-        model=f"LTX-{model_generation or 'unknown'}",
-        path=receipt.path,
+        model=model,
+        path=selected,
         position=position,
         adapter_types=receipt.adapter_types,
         strength=receipt.strength,
@@ -319,11 +387,28 @@ def _log_receipt(
             ("unmapped", stats.unmapped),
             ("missing", stats.missing),
             ("shape_mismatched", stats.shape_mismatched),
+            ("bare_parameter_targets", stats.bare_parameter),
             ("effective", str(receipt.effective).lower()),
         ),
     )
+    if receipt.effective:
+        log_scale_determination(
+            _log, model=model, name=selected.name, determination=scale, strength=receipt.strength
+        )
+    if receipt.bare_parameter_targets:
+        # Worth stating plainly: a file shaped like this is not portable. Diffusers
+        # rejects the whole checkpoint because these keys contain no "lora", and
+        # ComfyUI logs them as not loaded, so a user comparing against either tool
+        # is not comparing against the same applied weights.
+        _log.info(
+            "LTX-2 adapter %s is not a plain LoRA: %d of %d placed target(s) are bare "
+            "adaLN modulation tables rather than module weights",
+            selected.name,
+            receipt.bare_parameter_targets,
+            receipt.placed_targets,
+        )
     for warning in receipt.warnings:
-        _log.warning("LTX-2 adapter %s: %s", receipt.path.name, warning)
+        _log.warning("LTX-2 adapter %s: %s", selected.name, warning)
 
 
 def _resolve_live_module(model: object, path: str) -> object | None:
@@ -348,6 +433,25 @@ def _live_weight_owner(value: object | None) -> _LiveWeightOwner | None:
     return cast(_LiveWeightOwner, value)
 
 
+def _live_weight_slot(model: object, key: str) -> WeightTarget | None:
+    """Resolve a live fusion key to its mutable owner, for both target shapes.
+
+    A module target owns its value under ``weight``. A bare parameter is the value
+    itself, so its owner is the parent module and its attribute is the leaf name.
+    """
+    owner = _live_weight_owner(_resolve_live_module(model, key.removesuffix(".weight")))
+    if owner is not None:
+        return WeightTarget(owner, "weight", owner.weight.shape)
+    if key.endswith(".weight"):
+        return None
+    parent_path, _, leaf = key.rpartition(".")
+    parent = _resolve_live_module(model, parent_path) if parent_path else model
+    value = getattr(parent, leaf, None) if parent is not None else None
+    if not isinstance(value, mx.array):
+        return None
+    return WeightTarget(parent, leaf, value.shape)
+
+
 def _add_live_lora_target(
     table: dict[str, mx.array],
     model: object,
@@ -370,6 +474,11 @@ def _add_live_lora_target(
         return
     if owner is not None:
         table[normal_key] = owner.weight
+        return
+    if isinstance(module, mx.array):
+        # A bare parameter such as an adaLN modulation table: the resolved leaf is
+        # the weight itself, so it registers under its own name with no `.weight`.
+        table[mlx_base] = module
         return
     layout_key = f"{mlx_base}.weight_t"
     layout = get_layout_weight(model, layout_key)
@@ -491,13 +600,14 @@ def community_adapter_operations(
     for index, config in enumerate(configs):
         excluded = validate_adapter_exclusions(config.exclude)
         raw = load_weights(Path(config.path))
-        classification = _classify_adapter(config.path, raw)
-        normalized, stats = _normalize_lora_for_weights(
+        classification = _classify_adapter(config, raw)
+        normalized, stats, alphas = _normalize_lora_for_weights(
             table,
             raw,
             include_audio=include_audio,
             excluded_categories=excluded,
             extra_unmapped=classification.extra_unmapped,
+            alphas=classification.alphas,
         )
         if not normalized or not stats.placed or config.strength == 0.0:
             continue
@@ -507,11 +617,11 @@ def community_adapter_operations(
                 continue
             operation = AdapterOperation(
                 prefix,
-                "lora",
+                AdapterKind.LORA,
                 "weight",
                 {"down": entry.a, "up": entry.b},
                 (),
-                alpha=entry.alpha,
+                alpha=alphas.get(prefix),
             )
             operations.setdefault(key, []).append(
                 WeightedAdapterOperation(operation, config.strength, f"{index:012d}")
@@ -527,7 +637,7 @@ def fuse_community_loras_into_model(
     model_generation: str | None = None,
     pending: AdapterWeightCheck | None = None,
     prepared_targets: Mapping[str, tuple[int, ...]] | None = None,
-    accumulation: str = "float32",
+    accumulation: FloatDType = FloatDType.FLOAT32,
 ) -> tuple[LTX2AdapterReceipt, ...]:
     """Map admitted ordinary LoRAs into the shared lazy adapter fuser.
 
@@ -544,7 +654,7 @@ def fuse_community_loras_into_model(
     loaded = []
     for config, excluded in zip(configs, exclusions, strict=True):
         raw = load_weights(Path(config.path))
-        loaded.append((config, excluded, raw, _classify_adapter(config.path, raw)))
+        loaded.append((config, excluded, raw, _classify_adapter(config, raw)))
     classified = tuple(loaded)
     table = _live_lora_weight_table(
         target,
@@ -556,25 +666,31 @@ def fuse_community_loras_into_model(
     mapped = []
     receipts = []
     for index, (config, excluded, raw, classification) in enumerate(classified, 1):
-        normalized, stats = _normalize_lora_for_weights(
+        normalized, stats, alphas = _normalize_lora_for_weights(
             table,
             raw,
             include_audio=include_audio,
             excluded_categories=excluded,
             extra_unmapped=classification.extra_unmapped,
+            alphas=classification.alphas,
         )
         receipt = _adapter_receipt(
             config,
             stats,
-            adapter_types=classification.adapter_types,
+            classification=classification,
             model_generation=model_generation,
         )
         receipts.append(receipt)
         _log_receipt(
-            receipt, stats, model_generation=model_generation, position=(index, len(configs))
+            receipt,
+            stats,
+            selected=config.source or config.path,
+            scale=classification.scale,
+            model_generation=model_generation,
+            position=(index, len(configs)),
         )
         if normalized and stats.placed and config.strength != 0.0:
-            mapped.append((normalized, config.strength))
+            mapped.append((normalized, alphas, config.strength))
 
     if not mapped:
         return tuple(receipts)
@@ -590,7 +706,7 @@ def fuse_community_loras_into_model(
             continue
         shape = tuple(reversed(value.shape)) if key in transposed else value.shape
         targets[key] = WeightTarget(SimpleNamespace(weight=value), "weight", shape)
-    for index, (weights, strength) in enumerate(mapped):
+    for index, (weights, alphas, strength) in enumerate(mapped):
         for prefix, entry in iter_lora_entries(weights):
             key = prefix if prefix in table else prefix + ".weight"
             if key in prepared_keys:
@@ -599,11 +715,11 @@ def fuse_community_loras_into_model(
                 continue
             operation = AdapterOperation(
                 prefix,
-                "lora",
+                AdapterKind.LORA,
                 "weight",
                 {"down": entry.a, "up": entry.b},
                 (),
-                alpha=entry.alpha,
+                alpha=alphas.get(prefix),
             )
             operations.setdefault(key, []).append(
                 WeightedAdapterOperation(operation, strength, f"{index:012d}")
@@ -629,10 +745,10 @@ def fuse_community_loras_into_model(
                 value,
             )
         elif not key.startswith(QUANT_KEY_PREFIX):
-            owner = _live_weight_owner(_resolve_live_module(target, key.removesuffix(".weight")))
-            if owner is None:
+            slot = _live_weight_slot(target, key)
+            if slot is None:
                 raise RuntimeError(f"LoRA target disappeared during fusion: {key}")
-            owner.weight = value
+            setattr(slot.owner, slot.attribute, value)
     for key in tuple(check.targets):
         if key.startswith(LAYOUT_KEY_PREFIX):
 
@@ -644,10 +760,10 @@ def fuse_community_loras_into_model(
 
             check.targets[key] = layout_value
         else:
-            owner = _live_weight_owner(_resolve_live_module(target, key.removesuffix(".weight")))
-            if owner is None:
+            slot = _live_weight_slot(target, key)
+            if slot is None:
                 raise RuntimeError(f"adapter target disappeared: {key}")
-            check.add(key, WeightTarget(owner, "weight", owner.weight.shape))
+            check.add(key, slot)
     return tuple(receipts)
 
 

@@ -3,6 +3,7 @@
 import gc
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
+from functools import partial
 from pathlib import Path
 
 import mlx.core as mx
@@ -26,10 +27,10 @@ from ..artifacts import (
     text_conditioning_artifact,
 )
 from ..components import (
-    DistilledComponents,
-    DurationPredictorPort,
-    NativeLTX2Components,
-    TransformerPort,
+    LTX2Components,
+    LTX2ComponentsProvider,
+    LTX2DurationPredictorPort,
+    LTX2TransformerPort,
 )
 from ..conditioning import (
     EncodedCondition,
@@ -41,24 +42,28 @@ from ..conditioning import (
 )
 from ..conditioning.tools import AudioLatentTools, VideoLatentTools
 from ..decode import (
+    VideoDecoderProvider,
     decode_audio_mel,
     decode_ltx23_sdr_frames,
     decode_ltx_hdr_working_frames,
     video_decode_diagnostics,
     vocode_audio,
 )
-from ..denoise import DenoiseStepKind, TransitionNoiseProvider, denoise_loop
+from ..denoise import DenoiseStepKind, LTX2TransitionNoiseProvider, denoise_loop
+from ..frame_position import is_first_position, resolve_frame_positions
 from ..generated_keyframes import (
     GeneratedKeyframeLayout,
     append_generated_keyframe_slots,
+    extract_generated_keyframes,
 )
-from ..generation import GenerationOutput
+from ..generation import LTX2GenerationOutput
 from ..hdr_profile import resolve_hdr_recipe, validate_hdr_adapter_placement
 from ..noising import GaussianNoiser
-from ..precision import LTX2DTypePolicy, resolve_video_vae_decode_dtype
+from ..precision import LTX2DTypePolicy, resolve_video_vae_decode_precision
 from ..resources import LTX2Resources
 from ..sigmas import stage_sigmas
 from ..signals import ltx23_sdr_signal, ltx_hdr_working_signal
+from ..sparse_attention import SparseAttentionSchedule, SparseAttentionStep, stage_steps
 from ..state import (
     apply_encoded_conditions,
     create_audio_latent_tools,
@@ -67,23 +72,29 @@ from ..state import (
     init_video_latent_state,
 )
 from ..text_conditioning import (
-    EncodedTextConditioning,
-    NativeTextConditioner,
-    TextConditioner,
+    LTX2EncodedTextConditioning,
+    LTX2TextConditioner,
+    LTX2TextConditionerPort,
 )
 from ..transition_noise import SeededGaussianNoise
-from ..types import AudioLatentShape, DistilledRequest, LatentState, video_latent_shape_from_pixel
+from ..types import AudioLatentShape, LatentState, LTX2Request, video_latent_shape_from_pixel
 from ..upscaler import upsample_video
-from ..upscaler.ports import SpatialUpscalerPort
+from ..upscaler.ports import LTX2SpatialUpscalerPort
+from ..vocabularies import LTX2FirstFrameMode, LTX2StageSampler
 
 
 @dataclass(frozen=True)
 class StageLatents:
-    """Materialized video and optional audio latents crossing a station."""
+    """Materialized video and optional audio latents crossing a stage.
+
+    ``generated_keyframes`` holds the stage's denoised keyframe slots, one latent frame
+    each, which seed the next stage's slots.
+    """
 
     video: mx.array
     audio: mx.array | None = None
     initial_noise_state: NoiseStreamState | None = None
+    generated_keyframes: mx.array | None = None
 
 
 @dataclass(frozen=True)
@@ -98,21 +109,80 @@ class PreparedStage:
     generated_keyframe_layout: GeneratedKeyframeLayout | None = None
 
 
+# Each ancestral stage draws its transition noise from its own stream, seeded at the
+# request seed plus that stage's offset as ltx-pipelines does, so neither stage reuses
+# the initial noise or the other stage's draws.
+ANCESTRAL_SEED_OFFSETS = (10_000, 20_000)
+
+
+@dataclass(frozen=True)
+class DistilledStageSampler:
+    """One stage's requested and effective sampler, and its ancestral noise seed."""
+
+    stage: int
+    requested: LTX2StageSampler
+    effective: LTX2StageSampler
+    noise_seed: int | None
+
+    @property
+    def step_kind(self) -> DenoiseStepKind:
+        """The denoise step this stage runs."""
+        if self.effective == LTX2StageSampler.ANCESTRAL:
+            return "ancestral-rf"
+        return "deterministic-euler"
+
+    def transition_noise(
+        self,
+        *,
+        transitions: int,
+        backend: NoiseBackend,
+    ) -> SeededGaussianNoise | None:
+        """Open this stage's ancestral noise stream; a deterministic stage has none."""
+        if self.noise_seed is None:
+            return None
+        return SeededGaussianNoise(
+            self.noise_seed,
+            stage=self.stage,
+            transitions=transitions,
+            backend=backend,
+        )
+
+    def to_metadata(self) -> dict[str, object]:
+        return {
+            "requested": self.requested.value,
+            "effective": self.effective.value,
+            "noise_seed": self.noise_seed,
+        }
+
+
 @dataclass(frozen=True)
 class DistilledSamplerPlan:
-    """Resolved step behavior, effective policy, and independent transition seed."""
+    """Both stages' resolved samplers."""
 
-    policy: str
-    stage_1: DenoiseStepKind
-    stage_2: DenoiseStepKind
-    ancestral_seed: int | None
+    stage_1: DistilledStageSampler
+    stage_2: DistilledStageSampler
+
+    def metadata(
+        self,
+        noise_states: tuple[NoiseStreamState | None, NoiseStreamState | None] = (None, None),
+    ) -> dict[str, dict[str, object]]:
+        """Record both stages, with where each ancestral stream stopped when it ran."""
+        return {
+            f"stage_{stage.stage}": {
+                **stage.to_metadata(),
+                "noise_state": None if state is None else state.to_metadata(),
+            }
+            for stage, state in zip((self.stage_1, self.stage_2), noise_states, strict=True)
+        }
 
 
 @dataclass(frozen=True)
 class PreparedDistilledRecipe:
-    """Load-free request facts resolved before any heavyweight station."""
+    """Load-free request facts resolved before any heavyweight stage."""
 
-    sources: tuple[RawConditionSource, ...]
+    # Sources stay unset while the frame count does: a named frame position has
+    # no absolute index until the duration head has run.
+    sources: tuple[RawConditionSource, ...] | None
     frame_count: int | None
     sampler: DistilledSamplerPlan
 
@@ -121,12 +191,16 @@ class PreparedDistilledRecipe:
 class DistilledConditioning:
     """Seed-independent products owned by one multi-seed request."""
 
-    request: DistilledRequest | None = None
-    text: EncodedTextConditioning | None = None
+    request: LTX2Request | None = None
+    text: LTX2EncodedTextConditioning | None = None
     frames: int | None = None
-    stages: dict[VideoPixelShape, tuple[EncodedCondition, ...]] = field(default_factory=dict)
+    # Keyed by stage and geometry: a prepared condition now carries the strength
+    # its own stage applies, so geometry alone no longer identifies the product.
+    stages: dict[tuple[int, VideoPixelShape], tuple[EncodedCondition, ...]] = field(
+        default_factory=dict
+    )
 
-    def bind(self, request: DistilledRequest) -> None:
+    def bind(self, request: LTX2Request) -> None:
         identity = replace(request, seed=0, seeds=None)
         if self.request is not None and self.request != identity:
             raise ValueError("Shared conditioning requires identical non-seed request settings")
@@ -140,7 +214,7 @@ class DistilledConditioning:
 
 
 def resolve_adapter_profiles(
-    request: DistilledRequest,
+    request: LTX2Request,
 ) -> tuple[LoRAProfile, LoRAProfile]:
     """Resolve ordered, zero-free LoRA profiles for the selected adapters."""
     selections = request.resolved_adapters()
@@ -150,14 +224,22 @@ def resolve_adapter_profiles(
     )
 
 
-def condition_sources(request: DistilledRequest) -> tuple[RawConditionSource, ...]:
-    """Resolve caller-owned condition intent without loading an encoder."""
+def condition_sources(request: LTX2Request, *, frames: int) -> tuple[RawConditionSource, ...]:
+    """Resolve caller-owned condition intent without loading an encoder.
+
+    Every named frame position resolves here, against the frame count the run
+    settled on, so nothing downstream of the request sees a name.
+    """
+    positions = resolve_frame_positions(
+        tuple(image.frame_index for image in request.images), frames
+    )
     sources: list[RawConditionSource] = []
-    if request.image is not None:
-        hdr_authoring = request.hdr if request.image.path.suffix.lower() == ".exr" else None
+    for image, frame_index in zip(request.images, positions, strict=True):
+        hdr_authoring = request.hdr if image.path.suffix.lower() == ".exr" else None
         sources.append(
             ImageConditionSource.from_config(
-                request.image,
+                image,
+                frame_index=frame_index,
                 hdr_authoring=hdr_authoring,
             )
         )
@@ -166,27 +248,87 @@ def condition_sources(request: DistilledRequest) -> tuple[RawConditionSource, ..
     return tuple(sources)
 
 
-def _requested_frame_count(request: DistilledRequest) -> int | None:
+def requested_condition_families(request: LTX2Request) -> tuple[str, ...]:
+    """Classify each image condition's family before any frame count exists.
+
+    ``last`` on a one-frame run would be frame 0 and is classified as a keyframe
+    here. No supported checkpoint can tell the two apart, because every one that
+    declares either family declares both.
+    """
+    return tuple(
+        "image" if is_first_position(image.frame_index) else "keyframe" for image in request.images
+    )
+
+
+def _requested_frame_count(request: LTX2Request) -> int | None:
     return request.frames
 
 
-def effective_sampler_policy(sampler: str, declared_policy: str) -> str:
-    """Map public sampler intent to one concrete two-stage policy."""
-    if sampler == "auto":
-        return declared_policy
-    if sampler == "deterministic":
-        return "deterministic-euler-two-stage"
-    if sampler == "ancestral":
-        return "ancestral-stage1-deterministic-stage2"
-    raise ValueError(f"unsupported sampler override {sampler!r}")
+def effective_stage_samplers(
+    requested: tuple[LTX2StageSampler, LTX2StageSampler],
+    published: tuple[LTX2StageSampler, LTX2StageSampler],
+) -> tuple[LTX2StageSampler, LTX2StageSampler]:
+    """Resolve each stage's ``auto`` to the sampler the checkpoint generation publishes."""
+    effective = []
+    for stage, (wanted, default) in enumerate(zip(requested, published, strict=True), start=1):
+        if default == LTX2StageSampler.AUTO:
+            raise ValueError(f"the checkpoint publishes no concrete stage-{stage} sampler")
+        effective.append(default if wanted == LTX2StageSampler.AUTO else LTX2StageSampler(wanted))
+    return (effective[0], effective[1])
 
 
-def sampling_facts(request: DistilledRequest, declared_policy: str) -> dict[str, object]:
+def resolve_stage_samplers(
+    requested: tuple[LTX2StageSampler, LTX2StageSampler],
+    published: tuple[LTX2StageSampler, LTX2StageSampler],
+    *,
+    seed: int,
+) -> DistilledSamplerPlan:
+    """Resolve both stages' samplers and derive each ancestral stage's noise seed."""
+    stages = []
+    for stage, (wanted, effective) in enumerate(
+        zip(requested, effective_stage_samplers(requested, published), strict=True), start=1
+    ):
+        noise_seed = None
+        if effective == LTX2StageSampler.ANCESTRAL:
+            offset = ANCESTRAL_SEED_OFFSETS[stage - 1]
+            noise_seed = seed + offset
+            if noise_seed >= 2**64:
+                raise ValueError(
+                    f"the stage-{stage} ancestral noise seed is seed + {offset}, which must "
+                    "fit an unsigned 64-bit integer"
+                )
+        stages.append(
+            DistilledStageSampler(
+                stage=stage,
+                requested=LTX2StageSampler(wanted),
+                effective=effective,
+                noise_seed=noise_seed,
+            )
+        )
+    return DistilledSamplerPlan(stage_1=stages[0], stage_2=stages[1])
+
+
+def stage_sampler_choices(
+    request: LTX2Request,
+    published: tuple[LTX2StageSampler, LTX2StageSampler],
+) -> dict[str, dict[str, str]]:
+    """Each stage's requested and effective sampler, keyed as the run record keys them."""
+    requested = request.stage_samplers()
+    effective = effective_stage_samplers(requested, published)
+    return {
+        f"stage_{stage}": {"requested": wanted.value, "effective": chosen.value}
+        for stage, (wanted, chosen) in enumerate(zip(requested, effective, strict=True), start=1)
+    }
+
+
+def sampling_facts(
+    request: LTX2Request,
+    published: tuple[LTX2StageSampler, LTX2StageSampler],
+) -> dict[str, object]:
     """Resolve the sampler facts a run announces and records; nothing here needs weights."""
     first, second = stage_sigmas(request.stage_1_sigmas, request.stage_2_sigmas)
     return {
-        "sampler_override": None if request.sampler == "auto" else request.sampler,
-        "sampler_policy": effective_sampler_policy(request.sampler, declared_policy),
+        "samplers": stage_sampler_choices(request, published),
         "noise_backend": request.noise_backend,
         "noise_compatibility_profile": noise_compatibility_profile(request.noise_backend),
         "stage_1_sigmas": list(first),
@@ -199,45 +341,21 @@ def sampling_facts(request: DistilledRequest, declared_policy: str) -> dict[str,
     }
 
 
-def _effective_sampler_policy(
-    request: DistilledRequest,
-    resources: LTX2Resources,
-) -> str:
-    return effective_sampler_policy(request.sampler, resources.capabilities.sampler_policy)
-
-
 def resolve_distilled_sampler_plan(
-    request: DistilledRequest,
+    request: LTX2Request,
     resources: LTX2Resources,
 ) -> DistilledSamplerPlan:
-    """Resolve checkpoint-default or explicitly overridden stage behavior."""
-    policy = _effective_sampler_policy(request, resources)
-    if policy == "deterministic-euler-two-stage":
-        return DistilledSamplerPlan(
-            policy=policy,
-            stage_1="deterministic-euler",
-            stage_2="deterministic-euler",
-            ancestral_seed=None,
-        )
-    if policy == "ancestral-stage1-deterministic-stage2":
-        ancestral_seed = request.seed + 10_000
-        if ancestral_seed >= 2**64:
-            raise ValueError(
-                "ancestral seed derivation requires seed + 10000 to fit an unsigned 64-bit integer"
-            )
-        return DistilledSamplerPlan(
-            policy=policy,
-            stage_1="ancestral-rf",
-            stage_2="deterministic-euler",
-            ancestral_seed=ancestral_seed,
-        )
-    raise ValueError(f"checkpoint declares unsupported sampler policy {policy!r}")
+    """Resolve each stage against the samplers the checkpoint generation publishes."""
+    return resolve_stage_samplers(
+        request.stage_samplers(),
+        resources.capabilities.stage_samplers,
+        seed=request.seed,
+    )
 
 
 def validate_distilled_request(
-    request: DistilledRequest,
+    request: LTX2Request,
     resources: LTX2Resources,
-    sources: Sequence[RawConditionSource],
 ) -> None:
     """Fail before model loading when resources cannot run this request."""
     capabilities = resources.capabilities
@@ -251,26 +369,28 @@ def validate_distilled_request(
             "generated_keyframes_available": capabilities.generated_keyframes,
             "generates_audio": capabilities.generates_audio,
             "condition_families": capabilities.condition_families,
-            "requested_condition_families": tuple(
-                source.family
-                for source in sources
-                if not isinstance(source, HDRReferenceConditionSource)
-            ),
+            "requested_condition_families": requested_condition_families(request),
         },
         location="[generate]",
     )
     resolve_hdr_recipe(request, resources)
+    if resources.dtype_policy.transformer == mx.float32 and any(
+        schedule.active for schedule in request.sparse_attention_schedules()
+    ):
+        raise ValueError("sparse attention needs a bfloat16 or float16 transformer_dtype")
 
 
 def prepare_distilled_recipe(
-    request: DistilledRequest,
+    request: LTX2Request,
     resources: LTX2Resources,
 ) -> PreparedDistilledRecipe:
     """Validate one request and prepare its stage policies."""
     request.validate_for_generation()
-    sources = condition_sources(request)
-    validate_distilled_request(request, resources, sources)
+    validate_distilled_request(request, resources)
     frame_count = _requested_frame_count(request)
+    # An auto-duration run has no frame count to resolve positions against yet,
+    # so its sources are built after the duration head runs.
+    sources = None if frame_count is None else condition_sources(request, frames=frame_count)
     sampler = resolve_distilled_sampler_plan(request, resources)
     return PreparedDistilledRecipe(
         sources=sources,
@@ -280,10 +400,10 @@ def prepare_distilled_recipe(
 
 
 def resolve_auto_frame_count(
-    request: DistilledRequest,
+    request: LTX2Request,
     resources: LTX2Resources,
-    text: EncodedTextConditioning,
-    predictor: DurationPredictorPort,
+    text: LTX2EncodedTextConditioning,
+    predictor: LTX2DurationPredictorPort,
 ) -> int:
     """Resolve one omitted frame count from connector outputs and validate dependents."""
     frames = predictor.predict_num_frames(
@@ -292,25 +412,24 @@ def resolve_auto_frame_count(
         frame_rate=request.fps,
         temporal_compression_ratio=resources.capabilities.video_compression.time,
     )
-    if request.image is not None and request.image.frame_index >= frames:
-        raise ValueError(
-            f"image frame_index {request.image.frame_index} is outside predicted {frames} frames"
-        )
+    resolve_frame_positions(
+        tuple(image.frame_index for image in request.images), frames, predicted=True
+    )
     if request.generated_keyframes:
         generated_keyframe_indices(frames, request.generated_keyframes)
     return frames
 
 
 def prepare_text_conditioning(
-    request: DistilledRequest,
+    request: LTX2Request,
     resources: LTX2Resources,
     *,
-    text_conditioner: TextConditioner | None,
+    text_conditioner: LTX2TextConditionerPort | None,
     reporter: Reporter,
     artifacts: ArtifactSink,
     emit_artifact: bool = True,
-) -> EncodedTextConditioning:
-    selected = text_conditioner if text_conditioner is not None else NativeTextConditioner()
+) -> LTX2EncodedTextConditioning:
+    selected = text_conditioner if text_conditioner is not None else LTX2TextConditioner()
     text = selected(
         request,
         resources,
@@ -339,7 +458,7 @@ def _materialize_state(state: LatentState) -> None:
 
 
 def prepare_stage(
-    request: DistilledRequest,
+    request: LTX2Request,
     geometry: VideoPixelShape,
     *,
     dtype_policy: LTX2DTypePolicy,
@@ -347,7 +466,11 @@ def prepare_stage(
     initial_latents: StageLatents | None = None,
     generated_keyframe_count: int = 0,
 ) -> PreparedStage:
-    """Construct and materialize one conditioned stage state."""
+    """Construct and materialize one conditioned stage state.
+
+    Generated keyframe slots follow the conditions in the token order, and a prior stage's
+    slots in ``initial_latents`` seed them.
+    """
     video_tools = create_video_latent_tools(
         video_latent_shape_from_pixel(geometry),
         fps=request.fps,
@@ -361,11 +484,15 @@ def prepare_stage(
     generated_layout = None
     video_keyframes_mask = None
     if generated_keyframe_count:
+        initial_slots = None if initial_latents is None else initial_latents.generated_keyframes
+        if initial_latents is not None and initial_slots is None:
+            raise RuntimeError("the prior stage returned no generated keyframe slots")
         video_state, generated_layout, video_keyframes_mask = append_generated_keyframe_slots(
             video_state,
             video_tools,
             pixel_frames=geometry.frames,
             count=generated_keyframe_count,
+            initial=initial_slots,
         )
     _materialize_state(video_state)
 
@@ -400,8 +527,8 @@ def prepare_stage(
 
 def run_stage(
     stage: PreparedStage,
-    transformer: TransformerPort,
-    text: EncodedTextConditioning,
+    transformer: LTX2TransformerPort,
+    text: LTX2EncodedTextConditioning,
     sigmas: Sequence[float],
     *,
     noiser: GaussianNoiser | None = None,
@@ -411,7 +538,9 @@ def run_stage(
     phase: str = "denoise",
     step_kind: DenoiseStepKind = "deterministic-euler",
     stage_number: int | None = None,
-    noise_provider: TransitionNoiseProvider | None = None,
+    noise_provider: LTX2TransitionNoiseProvider | None = None,
+    sparse_attention: SparseAttentionSchedule | None = None,
+    transformer_dtype: mx.Dtype | None = None,
 ) -> StageLatents:
     """Noise, denoise, clear conditioning tokens, and materialize a stage."""
     if noiser is not None and seed is not None:
@@ -429,10 +558,23 @@ def run_stage(
     if text.attention_mask.size and bool(mx.all(mx.equal(text.attention_mask, 1)).item()):
         # The encoded-text contract defines this as a binary validity mask.
         # Once every key is proven valid, omitting its additive zero form is
-        # exact and lets supported text cross-attention calls use STEEL.
+        # exact and lets text cross-attention take the dense attention kernel.
         context_mask = None
     else:
         context_mask = text.attention_mask
+    sparse_steps: tuple[SparseAttentionStep | None, ...] = ()
+    if sparse_attention is not None and sparse_attention.active:
+        target = stage.video_tools.target_shape
+        patch_time, patch_height, patch_width = stage.video_tools.patchifier.patch_size
+        sparse_steps = stage_steps(
+            sparse_attention,
+            grid=(
+                target.frames // patch_time,
+                target.height // patch_height,
+                target.width // patch_width,
+            ),
+            tokens=video_state.latent.shape[1],
+        )
     video_state, audio_state = denoise_loop(
         video_state,
         audio_state,
@@ -448,6 +590,15 @@ def run_stage(
         step_kind=step_kind,
         stage=stage_number,
         noise_provider=noise_provider,
+        video_sparse_attention=sparse_steps,
+        transformer_dtype=transformer_dtype,
+    )
+    generated_keyframes = (
+        None
+        if stage.generated_keyframe_layout is None
+        else extract_generated_keyframes(
+            video_state.latent, stage.video_tools, stage.generated_keyframe_layout
+        )
     )
     video_state = stage.video_tools.unpatchify(stage.video_tools.clear_conditioning(video_state))
     video = video_state.latent
@@ -462,36 +613,49 @@ def run_stage(
     mx.eval(
         video,
         *(() if audio is None else (audio,)),
+        *(() if generated_keyframes is None else (generated_keyframes,)),
     )
     return StageLatents(
         video=video,
         audio=audio,
         initial_noise_state=stage_noiser.state,
+        generated_keyframes=generated_keyframes,
     )
 
 
 def upscale_between_stages(
     stage: StageLatents,
-    upscaler: SpatialUpscalerPort,
+    upscaler: LTX2SpatialUpscalerPort,
     *,
     reporter: Reporter | None = None,
 ) -> StageLatents:
-    """Upscale video latents while carrying the materialized audio product."""
+    """Upscale video latents and keyframe slots while carrying the materialized audio.
+
+    The slot planes go through the upsampler as one clip, as ltx-pipelines upsamples them.
+    """
     video = upsample_video(stage.video, upscaler, reporter=reporter)
     mx.eval(video)
+    generated_keyframes = (
+        None
+        if stage.generated_keyframes is None
+        else upsample_video(stage.generated_keyframes, upscaler)
+    )
     return StageLatents(
         video=video,
         audio=stage.audio,
         initial_noise_state=stage.initial_noise_state,
+        generated_keyframes=generated_keyframes,
     )
 
 
 def prepare_stage_conditions(
     resources: LTX2Resources,
-    factory: DistilledComponents,
+    factory: LTX2ComponentsProvider,
     sources: Sequence[RawConditionSource],
     geometry: VideoPixelShape,
     *,
+    stage: int,
+    first_frame_mode: LTX2FirstFrameMode,
     reporter: Reporter,
 ) -> tuple[EncodedCondition, ...]:
     """Encode one stage's conditions inside one bounded video-encoder lease."""
@@ -512,13 +676,15 @@ def prepare_stage_conditions(
             geometry,
             encoder,
             resources.capabilities,
+            stage=stage,
             compute_dtype=encoder_resources.dtype_policy.video_vae,
+            first_frame_mode=first_frame_mode,
             reporter=reporter,
         )
 
 
 def hdr_reference_receipt(
-    request: DistilledRequest,
+    request: LTX2Request,
     geometry: VideoPixelShape,
     conditions: Sequence[EncodedCondition],
     *,
@@ -550,14 +716,14 @@ def hdr_reference_receipt(
 
 
 def release_stage_temporaries() -> None:
-    """Release materialized station products no longer needed downstream."""
+    """Release materialized stage products no longer needed downstream."""
     gc.collect()
     mx.synchronize()
     mx.clear_cache()
 
 
 def build_generation_output(
-    request: DistilledRequest,
+    request: LTX2Request,
     resources: LTX2Resources,
     *,
     frames: VideoFrameStream,
@@ -572,9 +738,12 @@ def build_generation_output(
     source_latent_stage: str | None = None,
     sampler_plan: DistilledSamplerPlan | None = None,
     initial_noise_state: NoiseStreamState | None = None,
-    ancestral_noise_state: NoiseStreamState | None = None,
+    ancestral_noise_states: tuple[NoiseStreamState | None, NoiseStreamState | None] = (
+        None,
+        None,
+    ),
     hdr_reference_receipts: Sequence[Mapping[str, object]] = (),
-) -> GenerationOutput:
+) -> LTX2GenerationOutput:
     """Validate terminal products and attach one reproducibility manifest."""
     if request.generate_audio:
         if waveform is None or sample_rate is None:
@@ -616,15 +785,7 @@ def build_generation_output(
         for component in resources.components
     }
     if sampler_plan is None:
-        sampler_policy = _effective_sampler_policy(request, resources)
-        ancestral_seed = (
-            request.seed + 10_000
-            if sampler_policy == "ancestral-stage1-deterministic-stage2"
-            else None
-        )
-    else:
-        sampler_policy = sampler_plan.policy
-        ancestral_seed = sampler_plan.ancestral_seed
+        sampler_plan = resolve_distilled_sampler_plan(request, resources)
     audio_latent_shape = (
         AudioLatentShape.from_video(
             resolved_geometry,
@@ -654,14 +815,13 @@ def build_generation_output(
         "initial_noise_state": (
             None if initial_noise_state is None else initial_noise_state.to_metadata()
         ),
-        "ancestral_noise_state": (
-            None if ancestral_noise_state is None else ancestral_noise_state.to_metadata()
-        ),
-        "sampler_override": None if request.sampler == "auto" else request.sampler,
-        "sampler_policy": sampler_policy,
+        "samplers": sampler_plan.metadata(ancestral_noise_states),
         "stage_1_sigmas": list(stage_sigmas(request.stage_1_sigmas, request.stage_2_sigmas)[0]),
         "stage_2_sigmas": list(stage_sigmas(request.stage_1_sigmas, request.stage_2_sigmas)[1]),
-        "ancestral_noise_seed": ancestral_seed,
+        "sparse_attention": {
+            f"stage_{stage}": schedule.to_metadata()
+            for stage, schedule in enumerate(request.sparse_attention_schedules(), start=1)
+        },
         "generated_keyframe_indices": generated_keyframe_indices,
         "adapter_receipts": tuple(adapter_receipts),
         "check_adapter_weights": resources.execution_policy.check_adapter_weights,
@@ -706,7 +866,7 @@ def build_generation_output(
         metadata["source_latent_stage"] = source_latent_stage
     if text_conditioning_receipt is not None:
         metadata["text_conditioning_replay"] = dict(text_conditioning_receipt)
-    return GenerationOutput(
+    return LTX2GenerationOutput(
         frames=frames,
         audio_waveform=waveform,
         audio_sample_rate=sample_rate,
@@ -715,13 +875,19 @@ def build_generation_output(
     )
 
 
+def _with_video_vae_dtype(resources: LTX2Resources, dtype: mx.Dtype) -> LTX2Resources:
+    if dtype == resources.dtype_policy.video_vae:
+        return resources
+    return replace(resources, dtype_policy=replace(resources.dtype_policy, video_vae=dtype))
+
+
 def decode_stage_latents(
-    request: DistilledRequest,
+    request: LTX2Request,
     resources: LTX2Resources,
     latents: StageLatents,
     *,
     geometry: VideoPixelShape,
-    components: DistilledComponents,
+    components: LTX2ComponentsProvider,
     reporter: Reporter,
     generated_keyframe_indices: tuple[int, ...] = (),
     adapter_receipts: Sequence[dict[str, object]] = (),
@@ -729,9 +895,12 @@ def decode_stage_latents(
     execution_mode: str | None = None,
     source_latent_stage: str | None = None,
     sampler_plan: DistilledSamplerPlan | None = None,
-    ancestral_noise_state: NoiseStreamState | None = None,
+    ancestral_noise_states: tuple[NoiseStreamState | None, NoiseStreamState | None] = (
+        None,
+        None,
+    ),
     hdr_reference_receipts: Sequence[Mapping[str, object]] = (),
-) -> GenerationOutput:
+) -> LTX2GenerationOutput:
     """Decode one materialized stage product through the common terminal boundary."""
     waveform = None
     sample_rate = None
@@ -751,16 +920,13 @@ def decode_stage_latents(
     initial_noise_state = latents.initial_noise_state
     del latents
     release_stage_temporaries()
-    decode_dtype = resolve_video_vae_decode_dtype(
-        request.vae_decode_dtype,
-        hdr=request.hdr is not None,
-        default=resources.dtype_policy.video_vae,
-    )
-    terminal_resources = resources
-    if decode_dtype != resources.dtype_policy.video_vae:
-        terminal_resources = replace(
-            resources,
-            dtype_policy=replace(resources.dtype_policy, video_vae=decode_dtype),
+    precision = resolve_video_vae_decode_precision(request.vae_decode_dtype)
+    terminal_resources = _with_video_vae_dtype(resources, precision.dtype)
+    overflow_fallback: VideoDecoderProvider | None = None
+    if precision.overflow_fallback is not None:
+        overflow_fallback = partial(
+            components.video_decoder,
+            _with_video_vae_dtype(resources, precision.overflow_fallback),
         )
     if request.hdr is None:
         signal = ltx23_sdr_signal(
@@ -775,10 +941,13 @@ def decode_stage_latents(
             frame_count=geometry.frames,
             tiling_config=request.vae_tiling.to_runtime_config(),
             auto_tiling=request.vae_tiling.mode == "auto",
+            vae_cache_limit_gb=request.vae_cache_limit_gb,
             tiling_mode=request.vae_tiling.mode,
             reporter=reporter,
             decoder_seed=request.seed,
             noise_backend=request.noise_backend,
+            overflow_fallback=overflow_fallback,
+            context_sharpening=request.context_sharpening(),
         )
     else:
         hdr_recipe = resolve_hdr_recipe(request, resources)
@@ -797,10 +966,13 @@ def decode_stage_latents(
             frame_count=geometry.frames,
             tiling_config=request.vae_tiling.to_runtime_config(),
             auto_tiling=request.vae_tiling.mode == "auto",
+            vae_cache_limit_gb=request.vae_cache_limit_gb,
             tiling_mode=request.vae_tiling.mode,
             reporter=reporter,
             decoder_seed=request.seed,
             noise_backend=request.noise_backend,
+            overflow_fallback=overflow_fallback,
+            context_sharpening=request.context_sharpening(),
         )
     return build_generation_output(
         request,
@@ -817,26 +989,26 @@ def decode_stage_latents(
         source_latent_stage=source_latent_stage,
         sampler_plan=sampler_plan,
         initial_noise_state=initial_noise_state,
-        ancestral_noise_state=ancestral_noise_state,
+        ancestral_noise_states=ancestral_noise_states,
         hdr_reference_receipts=hdr_reference_receipts,
     )
 
 
 @memory_managed
-def generate_distilled(
-    request: DistilledRequest,
+def generate_ltx2(
+    request: LTX2Request,
     resources: LTX2Resources,
     *,
-    components: DistilledComponents | None = None,
-    text_conditioner: TextConditioner | None = None,
+    components: LTX2ComponentsProvider | None = None,
+    text_conditioner: LTX2TextConditionerPort | None = None,
     reporter: Reporter | None = None,
     artifact_sink: ArtifactSink | None = None,
     conditioning: DistilledConditioning | None = None,
-) -> GenerationOutput:
+) -> LTX2GenerationOutput:
     """Generate through explicit, bounded component leases."""
     sink = reporter if reporter is not None else NullReporter()
     artifacts = artifact_sink if artifact_sink is not None else NullArtifactSink()
-    factory = components if components is not None else NativeLTX2Components(reporter=sink)
+    factory = components if components is not None else LTX2Components(reporter=sink)
     if len(request.selected_seeds()) != 1:
         raise ValueError("Use LTX2Runner.generate for multiple seeds")
     if request.seeds is not None:
@@ -879,6 +1051,9 @@ def generate_distilled(
                 duration_predictor,
             )
     shared.frames = frame_count
+    if sources is None:
+        # The predicted count is the one every named position resolves against.
+        sources = condition_sources(request, frames=frame_count)
     stage_1_profile, stage_2_profile = resolve_adapter_profiles(request)
     stage_1_geometry = VideoPixelShape(
         batch=1,
@@ -886,15 +1061,17 @@ def generate_distilled(
         height=request.height // 2,
         width=request.width // 2,
     )
-    if stage_1_geometry not in shared.stages:
-        shared.stages[stage_1_geometry] = prepare_stage_conditions(
+    if (1, stage_1_geometry) not in shared.stages:
+        shared.stages[1, stage_1_geometry] = prepare_stage_conditions(
             resources,
             factory,
             sources,
             stage_1_geometry,
+            stage=1,
+            first_frame_mode=request.first_frame_mode,
             reporter=sink,
         )
-    stage_1_conditions = shared.stages[stage_1_geometry]
+    stage_1_conditions = shared.stages[1, stage_1_geometry]
     if stage_1_conditions:
         artifacts.save(
             media_conditioning_artifact(
@@ -903,6 +1080,7 @@ def generate_distilled(
                 conditions=stage_1_conditions,
                 geometry=stage_1_geometry,
                 fps=request.fps,
+                first_frame_mode=request.first_frame_mode,
             )
         )
     hdr_reference_receipts: list[dict[str, object]] = []
@@ -928,17 +1106,18 @@ def generate_distilled(
     )
     del stage_1_conditions
 
-    transformer: ComponentLease[TransformerPort] | None = None
+    transformer: ComponentLease[LTX2TransformerPort] | None = None
     adapter_receipts: list[dict[str, object]] = []
     final_latents: StageLatents
     noiser = GaussianNoiser(request.seed, backend=request.noise_backend)
-    transition_noise = (
-        None
-        if sampler.ancestral_seed is None
-        else SeededGaussianNoise(
-            sampler.ancestral_seed,
-            backend=request.noise_backend,
-        )
+    stage_1_schedule, stage_2_schedule = stage_sigmas(
+        request.stage_1_sigmas, request.stage_2_sigmas
+    )
+    stage_1_noise = sampler.stage_1.transition_noise(
+        transitions=len(stage_1_schedule) - 1, backend=request.noise_backend
+    )
+    stage_2_noise = sampler.stage_2.transition_noise(
+        transitions=len(stage_2_schedule) - 1, backend=request.noise_backend
     )
     try:
         with reported_phase(sink, "load stage 1 transformer"):
@@ -960,13 +1139,15 @@ def generate_distilled(
             stage_1,
             transformer.value,
             text,
-            stage_sigmas(request.stage_1_sigmas, request.stage_2_sigmas)[0],
+            stage_1_schedule,
             noiser=noiser,
             reporter=sink,
             phase="distilled stage 1",
-            step_kind=sampler.stage_1,
+            step_kind=sampler.stage_1.step_kind,
             stage_number=1,
-            noise_provider=transition_noise,
+            noise_provider=stage_1_noise,
+            sparse_attention=request.sparse_attention_schedules()[0],
+            transformer_dtype=resources.dtype_policy.transformer,
         )
         del stage_1
         artifacts.save(
@@ -976,6 +1157,7 @@ def generate_distilled(
                 audio_latent=stage_1_latents.audio,
                 final=False,
                 noise_state=stage_1_latents.initial_noise_state,
+                generated_keyframes=stage_1_latents.generated_keyframes,
             )
         )
 
@@ -998,15 +1180,17 @@ def generate_distilled(
             height=request.height,
             width=request.width,
         )
-        if stage_2_geometry not in shared.stages:
-            shared.stages[stage_2_geometry] = prepare_stage_conditions(
+        if (2, stage_2_geometry) not in shared.stages:
+            shared.stages[2, stage_2_geometry] = prepare_stage_conditions(
                 resources,
                 factory,
                 sources,
                 stage_2_geometry,
+                stage=2,
+                first_frame_mode=request.first_frame_mode,
                 reporter=sink,
             )
-        stage_2_conditions = shared.stages[stage_2_geometry]
+        stage_2_conditions = shared.stages[2, stage_2_geometry]
         if stage_2_conditions:
             artifacts.save(
                 media_conditioning_artifact(
@@ -1015,6 +1199,7 @@ def generate_distilled(
                     conditions=stage_2_conditions,
                     geometry=stage_2_geometry,
                     fps=request.fps,
+                    first_frame_mode=request.first_frame_mode,
                 )
             )
         stage_2_reference_receipt = hdr_reference_receipt(
@@ -1031,6 +1216,7 @@ def generate_distilled(
             dtype_policy=resources.dtype_policy,
             conditions=stage_2_conditions,
             initial_latents=upscaled,
+            generated_keyframe_count=request.generated_keyframes,
         )
         del stage_2_conditions, upscaled
 
@@ -1053,12 +1239,15 @@ def generate_distilled(
             stage_2,
             transformer.value,
             text,
-            stage_sigmas(request.stage_1_sigmas, request.stage_2_sigmas)[1],
+            stage_2_schedule,
             noiser=noiser,
             reporter=sink,
             phase="distilled stage 2",
-            step_kind=sampler.stage_2,
+            step_kind=sampler.stage_2.step_kind,
             stage_number=2,
+            noise_provider=stage_2_noise,
+            sparse_attention=request.sparse_attention_schedules()[1],
+            transformer_dtype=resources.dtype_policy.transformer,
         )
         del stage_2
         artifacts.save(
@@ -1068,6 +1257,7 @@ def generate_distilled(
                 audio_latent=final_latents.audio,
                 final=True,
                 noise_state=final_latents.initial_noise_state,
+                generated_keyframes=final_latents.generated_keyframes,
             )
         )
     finally:
@@ -1093,21 +1283,26 @@ def generate_distilled(
         adapter_receipts=adapter_receipts,
         text_conditioning_receipt=text_conditioning_receipt,
         sampler_plan=sampler,
-        ancestral_noise_state=(None if transition_noise is None else transition_noise.state),
+        ancestral_noise_states=(
+            None if stage_1_noise is None else stage_1_noise.state,
+            None if stage_2_noise is None else stage_2_noise.state,
+        ),
         hdr_reference_receipts=hdr_reference_receipts,
     )
 
 
 __all__ = [
+    "ANCESTRAL_SEED_OFFSETS",
     "DistilledSamplerPlan",
+    "DistilledStageSampler",
     "PreparedDistilledRecipe",
     "PreparedStage",
     "StageLatents",
     "build_generation_output",
     "condition_sources",
     "decode_stage_latents",
-    "effective_sampler_policy",
-    "generate_distilled",
+    "effective_stage_samplers",
+    "generate_ltx2",
     "hdr_reference_receipt",
     "prepare_distilled_recipe",
     "prepare_stage",
@@ -1116,8 +1311,10 @@ __all__ = [
     "release_stage_temporaries",
     "resolve_adapter_profiles",
     "resolve_distilled_sampler_plan",
+    "resolve_stage_samplers",
     "run_stage",
     "sampling_facts",
+    "stage_sampler_choices",
     "upscale_between_stages",
     "validate_distilled_request",
 ]

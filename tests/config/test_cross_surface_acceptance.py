@@ -16,7 +16,8 @@ import pytest
 
 from kinomlx.cli.main import main
 from kinomlx.config.inspection import configuration_inventory
-from kinomlx.model_registry import config_registry, model_choices
+from kinomlx.model_catalog import model_choices
+from kinomlx.model_registry import config_registry
 from kinomlx.models.ltx2.arguments import build_parser as ltx_parser
 from kinomlx.models.ltx2.config import assemble as ltx_assemble
 from kinomlx.settings import Settings
@@ -56,18 +57,18 @@ def test_every_model_classifies_every_registered_configuration_field():
         schema = registry.model(model)
         inventory = configuration_inventory(schema)
         for entry in inventory["fields"]:
-            coverage = entry["station_coverage"]
-            classified = coverage == "registered" and bool(entry["station_policies"])
+            coverage = entry["stage_coverage"]
+            classified = coverage == "registered" and bool(entry["stage_policies"])
             if coverage in {"registered", "not_registered"} and not classified:
                 unclassified.append(f"{model}:{entry['path']}")
             if coverage == "no_restart":
-                assert schema.restart_stations == ()
+                assert schema.restart_stages == ()
                 assert inventory["restart"]["unavailable_reason"]
         for entry in inventory["fields"]:
-            for policy in entry["station_policies"]:
+            for policy in entry["stage_policies"]:
                 assert policy["reason"].strip(), (model, entry["path"])
     assert unclassified == []
-    assert configuration_inventory(registry.model("gmnet"))["restart"]["stations"] == []
+    assert configuration_inventory(registry.model("gmnet"))["restart"]["restart_stages"] == []
 
 
 @pytest.mark.parametrize("model", tuple(_REQUIRED_INPUT))
@@ -289,9 +290,9 @@ def test_product_and_example_python_keep_one_runtime_import_graph(parsed_project
     [
         (
             "ltx2",
-            "KINO_LTX2_SAMPLER",
+            "KINO_LTX2_STAGE_2_SAMPLER",
             "bogus",
-            "config error: environment KINO_LTX2_SAMPLER [generate].sampler: "
+            "config error: environment KINO_LTX2_STAGE_2_SAMPLER [generate].stage_2_sampler: "
             "expected one of 'auto', 'deterministic', 'ancestral', got 'bogus'",
         ),
         (

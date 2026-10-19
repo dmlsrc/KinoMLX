@@ -7,7 +7,7 @@ from kinomlx.config_constraints import NumberConstraint
 from kinomlx.config_records import supplied_fields
 from kinomlx.models.ltx2.arguments import build_parser
 from kinomlx.models.ltx2.config import assemble
-from kinomlx.models.ltx2.types import DistilledRequest
+from kinomlx.models.ltx2.types import LTX2Request
 
 
 @pytest.mark.parametrize(
@@ -31,11 +31,11 @@ from kinomlx.models.ltx2.types import DistilledRequest
 )
 def test_invalid_scalar_geometry_fails_at_constructor_admission(name, value):
     with pytest.raises(ValueError, match=name):
-        DistilledRequest(**{name: value})
+        LTX2Request(**{name: value})
 
 
 def test_valid_duration_derivation_keeps_intent_and_frame_grid():
-    request = DistilledRequest(duration=6, fps=24, width=64, height=64, seed=2**64 - 1)
+    request = LTX2Request(duration=6, fps=24, width=64, height=64, seed=2**64 - 1)
     assert request.frames == 145
     assert supplied_fields(request) == frozenset({"duration", "fps", "width", "height", "seed"})
 
@@ -51,7 +51,7 @@ def test_malformed_lower_geometry_cannot_be_hidden_by_cli(tmp_path):
 
 
 def test_common_constructor_keeps_ltx_nested_adapter_presence():
-    request = DistilledRequest(adapters=[{"path": "adapter.safetensors", "strength": 1.0}])
+    request = LTX2Request(adapters=[{"path": "adapter.safetensors", "strength": 1.0}])
     assert request.adapters[0].path.name == "adapter.safetensors"
     assert supplied_fields(request.adapters[0]) == frozenset({"path", "strength"})
 

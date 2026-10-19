@@ -12,32 +12,32 @@ from kinomlx.config_constraints import (
     NumberSequenceConstraint,
 )
 from kinomlx.config_records import config_record, derive_config
+from kinomlx.modeling.dtypes import FLOAT_DTYPE_CHOICES, FloatDType
 from kinomlx.settings import EnvironmentSettings
 
 from .settings_rules import (
     ADAPTER_PRECISION,
-    ATTENTION_PROBE,
     AUDIO_LAYOUT,
     COMPILE_GROUPS,
     QUANTIZATION,
     RETENTION,
-    TEXT_SOURCES,
 )
+from .video_vae.kinds import VIDEO_VAE_KIND_CHOICES
+from .vocabularies import (
+    ADAPTER_ACCUMULATION_CHOICES,
+    GEMMA_VARIANT_CHOICES,
+    MODEL_GENERATION_CHOICES,
+    GemmaVariant,
+    LTX2AdapterAccumulation,
+    LTX2ModelGeneration,
+)
+from .weights.schema import TRANSFORMER_QUANTIZE_MODES, TransformerQuantize
 
 _FF_LAYOUT_TARGETS = frozenset({"project_in", "project_out"})
 _ATTN_LAYOUT_TARGETS = frozenset({"to_q", "to_k", "to_v", "to_out", "to_gate_logits"})
 _LAYOUT_MODES = frozenset({"pretranspose"})
 _FF_QUANTIZATION_MODES = frozenset({"affine", "mxfp4", "mxfp8", "nvfp4"})
-GEMMA_VARIANT_CHOICES = ("qat", "plain")
-MODEL_GENERATION_CHOICES = ("2.3", "2.5")
-VIDEO_VAE_CHOICES = ("conv", "diffusion")
-TRANSFORMER_DTYPE_CHOICES = ("bfloat16", "float16", "float32")
-ADAPTER_ACCUMULATION_CHOICES = ("auto", "float32", "float16")
-TRANSFORMER_QUANTIZE_CHOICES = (
-    "off",
-    "mxfp8-blocks",
-    "mxfp8-blocks-pretranspose",
-)
+VIDEO_VAE_CHOICES = VIDEO_VAE_KIND_CHOICES
 # Two groups of four resident: one group's source reads overlap the other's
 # computation. More resident blocks only add memory once reads are overlapped.
 # The groups stay uncompiled: compiled block groups measured no faster and round
@@ -190,7 +190,7 @@ class LTX2Settings(EnvironmentSettings):
 
     # Discovery intent is independent of declared checkpoint metadata. When no
     # primary path is supplied, None preserves the established 2.3 default.
-    model_generation: str | None = field(
+    model_generation: LTX2ModelGeneration | None = field(
         default=None,
         metadata={
             "cli": ("--model-generation", "--ltx-generation"),
@@ -202,13 +202,13 @@ class LTX2Settings(EnvironmentSettings):
     # retaining compatible baseline parts. Components may also be selected
     # directly without a baseline for either generation.
     weights_path: Path | None = None
-    gemma_path: Path | None = field(default=None, metadata={"config_rules": (TEXT_SOURCES,)})
     # Gemma-3 source for LTX-2.3 cache discovery. The official 2.3 release
     # pairs the QAT-unquantized encoder, so "qat" is the default; "plain"
-    # selects the vanilla instruction-tuned release. Explicit gemma_path /
-    # text_encoder_path selections bypass discovery and win outright.
-    gemma_variant: str = field(
-        default="qat", metadata={"config_constraints": (ChoiceConstraint(GEMMA_VARIANT_CHOICES),)}
+    # selects the vanilla instruction-tuned release. An explicit
+    # text_encoder_path bypasses discovery and wins outright.
+    gemma_variant: GemmaVariant = field(
+        default=GemmaVariant.QAT,
+        metadata={"config_constraints": (ChoiceConstraint(GEMMA_VARIANT_CHOICES),)},
     )
     spatial_upscaler_path: Path | None = None
     # ``transformer_path`` selects a componentized primary source or replaces
@@ -227,23 +227,22 @@ class LTX2Settings(EnvironmentSettings):
 
     # Lets all 48 transformer blocks accumulate in one lazy graph.
     fast_mode: bool = True
-    transformer_dtype: str = field(
-        default="bfloat16",
-        metadata={"config_constraints": (ChoiceConstraint(TRANSFORMER_DTYPE_CHOICES),)},
+    # Measured against an FP32 reference, FP16 forwards came 3 to 16 times closer than BF16
+    # on LTX-2.3 and LTX-2.5, and faster; the largest hidden state, about 23,600 on LTX-2.3,
+    # stays 2.8 times below FP16's range, and the step check stops a run that overflows.
+    transformer_dtype: FloatDType = field(
+        default=FloatDType.FLOAT16,
+        metadata={"config_constraints": (ChoiceConstraint(FLOAT_DTYPE_CHOICES),)},
     )
-    adapter_accumulation: str = field(
-        default="auto",
+    adapter_accumulation: LTX2AdapterAccumulation = field(
+        default=LTX2AdapterAccumulation.AUTO,
         metadata={
             "config_constraints": (ChoiceConstraint(ADAPTER_ACCUMULATION_CHOICES),),
             "config_rules": (ADAPTER_PRECISION,),
         },
     )
-    steel_attention: bool = True
-    steel_attention_d64: bool = True
-    steel_attention_probe: bool = field(
-        default=False, metadata={"config_rules": (ATTENTION_PROBE,)}
-    )
     compile_attention: bool = True
+    dense_attention_kernel: bool = True
 
     video_ff_layout_specs: tuple[str, ...] = _specs_field(
         ("project_out:pretranspose",),
@@ -267,10 +266,10 @@ class LTX2Settings(EnvironmentSettings):
     audio_attn_layout_layers: tuple[int, ...] = _layer_indices_field()
     adaln_pretranspose: bool = False
 
-    transformer_quantize: str = field(
-        default="off",
+    transformer_quantize: TransformerQuantize = field(
+        default=TransformerQuantize.OFF,
         metadata={
-            "config_constraints": (ChoiceConstraint(TRANSFORMER_QUANTIZE_CHOICES),),
+            "config_constraints": (ChoiceConstraint(TRANSFORMER_QUANTIZE_MODES),),
             "config_rules": (QUANTIZATION,),
         },
     )
@@ -307,7 +306,7 @@ class LTX2Settings(EnvironmentSettings):
             "config_rules": (COMPILE_GROUPS,),
         },
     )
-    compile_block_groups: int | None = field(
+    compile_block_group_size: int | None = field(
         default=None, metadata={"config_constraints": (IntegerConstraint(minimum=1, maximum=48),)}
     )
 
@@ -316,17 +315,17 @@ class LTX2Settings(EnvironmentSettings):
         """Whether the primary transformer is selected as a component."""
         return self.transformer_path is not None
 
-    def resolved_adapter_accumulation(self) -> str:
+    def resolved_adapter_accumulation(self) -> FloatDType:
         """Return the dtype adapter fusion accumulates in on this transformer.
 
-        ``auto`` selects float16 only for a streamed float16 transformer, where
-        every reload repeats the fusion; a resident transformer fuses once and
-        keeps float32 even at float16.
+        ``auto`` resolves here, so every consumer downstream holds a dtype
+        rather than a vocabulary that still contains an instruction.
         """
-        if self.adapter_accumulation != "auto":
-            return self.adapter_accumulation
+        if self.adapter_accumulation != LTX2AdapterAccumulation.AUTO:
+            return FloatDType(self.adapter_accumulation)
         streamed = self.resolve_presets().transformer_resident_blocks is not None
-        return "float16" if streamed and self.transformer_dtype == "float16" else "float32"
+        streamed_fp16 = streamed and self.transformer_dtype == FloatDType.FLOAT16
+        return FloatDType.FLOAT16 if streamed_fp16 else FloatDType.FLOAT32
 
     def resolve_presets(self) -> LTX2Settings:
         """Expand the constrained-memory preset into low-level values."""
@@ -349,8 +348,6 @@ __all__ = [
     "GEMMA_VARIANT_CHOICES",
     "MODEL_GENERATION_CHOICES",
     "STREAM_TRANSFORMER_RESIDENT_BLOCKS",
-    "TRANSFORMER_DTYPE_CHOICES",
-    "TRANSFORMER_QUANTIZE_CHOICES",
     "VIDEO_VAE_CHOICES",
     "LTX2Settings",
     "parse_attention_layout_specs",

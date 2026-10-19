@@ -3,7 +3,7 @@
 from ._contracts import (
     AdapterSpec,
     ContractResources,
-    DistilledRequest,
+    LTX2Request,
     RecordingComponents,
     RecordingProgressReporter,
     RecordingTextConditioner,
@@ -29,25 +29,25 @@ def test_injected_factory_records_load_use_close_and_active_sets() -> None:
 
 
 def test_text_conditioner_returns_a_product_without_loading_a_component() -> None:
-    station = RecordingTextConditioner()
+    stage = RecordingTextConditioner()
     components = RecordingComponents()
 
     output = run_distilled_contract(
-        DistilledRequest(image_conditioned=False, generate_audio=False),
+        LTX2Request(image_conditioned=False, generate_audio=False),
         ContractResources(),
         components=components,
-        text_conditioner=station,
+        text_conditioner=stage,
     )
 
     assert output.text_conditioning.value == "encoded prompt"
-    assert station.events == [("start", "prompt"), ("return", "encoded prompt")]
+    assert stage.events == [("start", "prompt"), ("return", "encoded prompt")]
     assert all(event.component != "text_encoder" for event in components.events)
     output.close()
     assert_balanced(components)
 
 
 def test_default_and_injected_components_follow_the_same_recipe_call_graph() -> None:
-    request = DistilledRequest(
+    request = LTX2Request(
         stage_1_profile=effective_profile(AdapterSpec("adapter-a", 0.5)),
         stage_2_profile=effective_profile(AdapterSpec("adapter-b", 1.0)),
     )
@@ -71,10 +71,10 @@ def test_default_and_injected_components_follow_the_same_recipe_call_graph() -> 
     assert_balanced(injected)
 
 
-def test_recipe_reports_the_same_station_boundaries_as_the_component_trace() -> None:
+def test_recipe_reports_the_same_stage_boundaries_as_the_component_trace() -> None:
     reporter = RecordingProgressReporter()
     output = run_distilled_contract(
-        DistilledRequest(),
+        LTX2Request(),
         ContractResources(),
         reporter=reporter,
     )

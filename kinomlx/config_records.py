@@ -5,8 +5,7 @@ import inspect
 from functools import wraps
 from typing import cast, get_type_hints
 
-from kinomlx.config_constraints import field_constraints, validate_field_constraints
-from kinomlx.config_record_state import (
+from kinomlx._config_record_state import (
     _CONSTRUCTOR,
     _PRESENCE,
     _Constructor,
@@ -18,6 +17,7 @@ from kinomlx.config_record_state import (
     supplied_fields,
     tracks_presence,
 )
+from kinomlx.config_constraints import field_constraints, validate_field_constraints
 from kinomlx.config_rules import record_rules
 from kinomlx.config_values import coerce_record_fields
 

@@ -140,6 +140,24 @@ def test_gemma4_rejects_missing_consumed_tokenizer_with_generation_label(monkeyp
         )
 
 
+def test_gemma4_rejects_a_directory_with_generation_label(tmp_path: Path) -> None:
+    with pytest.raises(
+        ValueError,
+        match="LTX-2.5 text encoder compatibility: expected a prepared text-encoder safetensors",
+    ):
+        metadata_module.inspect_text_encoder(tmp_path, model_generation="2.5")
+
+
+def test_gemma3_rejects_a_single_file_with_generation_label(tmp_path: Path) -> None:
+    weights = tmp_path / "model.safetensors"
+    weights.touch()
+
+    with pytest.raises(
+        ValueError, match="LTX-2.3 text encoder compatibility: expected a Gemma 3 directory"
+    ):
+        metadata_module.inspect_text_encoder(weights, model_generation="2.3")
+
+
 def test_gemma3_directory_uses_the_same_consumed_config_policy(tmp_path: Path) -> None:
     root = tmp_path / "gemma-community"
     root.mkdir()

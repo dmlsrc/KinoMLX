@@ -11,11 +11,12 @@ import mlx.core as mx
 import kinomlx._mlx_nn as nn
 from kinomlx.io.safetensors import load_weights
 from kinomlx.kernels import silu
+from kinomlx.kernels.winograd_conv3d import WinogradConv3d
 from kinomlx.reporting import NullReporter, Reporter
 
 from .blocks import (
-    NativeConv3dBlock,
-    NativeResBlockGroup,
+    Conv3dBlock,
+    ResBlockGroup,
     lookup_weight,
     pixel_norm_bfhwc,
     to_native_conv3d_layout,
@@ -27,12 +28,13 @@ from .config import (
     compression_strides,
     is_compression_block,
 )
+from .kinds import VideoVAEKind
 from .ops import PerChannelStatistics
 
 _log = logging.getLogger(__name__)
 
 
-class NativeDepthToSpaceUpsample3d(nn.Module):
+class DepthToSpaceUpsample3d(nn.Module):
     """Conv3d followed by depth-to-space in BFHWC layout."""
 
     def __init__(
@@ -43,6 +45,7 @@ class NativeDepthToSpaceUpsample3d(nn.Module):
         residual: bool = False,
         out_channels_reduction_factor: int = 1,
         spatial_padding_mode: str = "conv",
+        winograd: bool = False,
     ) -> None:
         super().__init__()
         if len(stride) != 3 or any(value not in (1, 2) for value in stride):
@@ -67,10 +70,11 @@ class NativeDepthToSpaceUpsample3d(nn.Module):
         self.residual = residual
         self.out_channels_reduction_factor = out_channels_reduction_factor
         self.final_out_channels = in_channels // out_channels_reduction_factor
-        self.conv = NativeConv3dBlock(
+        self.conv = Conv3dBlock(
             in_channels,
             stride_product * self.final_out_channels,
             spatial_padding_mode=spatial_padding_mode,
+            winograd=winograd,
         )
 
     def _depth_to_space(self, x: mx.array, out_channels: int) -> mx.array:
@@ -124,7 +128,7 @@ def _decoder_bottleneck_channels(config: VideoVAEConfig) -> int:
     return config.decoder_base_channels * multiplier
 
 
-class NativeConv3dVideoDecoder(nn.Module):
+class Conv3dVideoDecoder(nn.Module):
     """Decode normalized LTX BCFHW latents into RGB video in [-1, 1]."""
 
     def __init__(
@@ -141,28 +145,40 @@ class NativeConv3dVideoDecoder(nn.Module):
         self.per_channel_statistics = PerChannelStatistics(latent_channels=config.latent_channels)
 
         feature_channels = _decoder_bottleneck_channels(config)
-        self.conv_in = NativeConv3dBlock(
+        self.conv_in = Conv3dBlock(
             config.latent_channels,
             feature_channels,
             causal=self.causal,
             spatial_padding_mode="conv",
         )
-        self.up_blocks: list[NativeResBlockGroup | NativeDepthToSpaceUpsample3d] = []
+        self.up_blocks: list[ResBlockGroup | DepthToSpaceUpsample3d] = []
 
         for block_config in reversed(config.decoder_blocks):
             if block_config.name == "res_x":
-                block: NativeResBlockGroup | NativeDepthToSpaceUpsample3d = NativeResBlockGroup(
+                block: ResBlockGroup | DepthToSpaceUpsample3d = ResBlockGroup(
                     feature_channels,
                     num_blocks=block_config.num_layers or 0,
                     spatial_padding_mode="conv",
+                    winograd=(
+                        compute_dtype == mx.float16
+                        and not self.causal
+                        and feature_channels
+                        in (
+                            config.decoder_base_channels,
+                            2 * config.decoder_base_channels,
+                            4 * config.decoder_base_channels,
+                            8 * config.decoder_base_channels,
+                        )
+                    ),
                 )
             else:
-                block = NativeDepthToSpaceUpsample3d(
+                block = DepthToSpaceUpsample3d(
                     feature_channels,
                     stride=compression_strides(block_config.name),
                     residual=block_config.residual,
                     out_channels_reduction_factor=block_config.multiplier,
                     spatial_padding_mode="conv",
+                    winograd=compute_dtype == mx.float16 and not self.causal,
                 )
                 feature_channels //= block_config.multiplier
             self.up_blocks.append(block)
@@ -172,12 +188,27 @@ class NativeConv3dVideoDecoder(nn.Module):
                 f"decoder blocks end at {feature_channels} channels; expected "
                 f"base width {config.decoder_base_channels}"
             )
-        self.conv_out = NativeConv3dBlock(
+        self.conv_out = Conv3dBlock(
             feature_channels,
             config.out_channels * config.patch_size**2,
             causal=self.causal,
             spatial_padding_mode="conv",
         )
+        if compute_dtype == mx.float16 and not self.causal:
+            # Release each convolution's scratch before the next one builds its graph.
+            for _, conv in self._iter_convs():
+                object.__setattr__(conv, "_eager_eval", True)
+                if (conv.in_channels, conv.out_channels) in (
+                    (1024, 4096),
+                    (512, 4096),
+                    (1024, 1024),
+                ):
+                    # Keep only one output-channel slab of these large transforms live.
+                    object.__setattr__(
+                        conv,
+                        "_winograd",
+                        WinogradConv3d(transient_output_block=512),
+                    )
 
     def __call__(
         self,
@@ -236,11 +267,11 @@ class NativeConv3dVideoDecoder(nn.Module):
         if any(dimension <= 0 for dimension in latent.shape):
             raise ValueError(f"latent dimensions must be positive, got {latent.shape}")
 
-    def _iter_convs(self) -> Iterator[tuple[str, NativeConv3dBlock]]:
+    def _iter_convs(self) -> Iterator[tuple[str, Conv3dBlock]]:
         """Yield checkpoint key prefixes and their native Conv3d blocks."""
         yield "conv_in.conv", self.conv_in
         for index, block in enumerate(self.up_blocks):
-            if isinstance(block, NativeResBlockGroup):
+            if isinstance(block, ResBlockGroup):
                 for residual_index, residual in enumerate(block.res_blocks):
                     prefix = f"up_blocks.{index}.res_blocks.{residual_index}"
                     yield f"{prefix}.conv1.conv", residual.conv1
@@ -263,7 +294,7 @@ class Conv3dDecoderLoadReceipt:
 
     def to_dict(self) -> dict[str, object]:
         return {
-            "decoder_kind": "native-conv3d",
+            "decoder_kind": VideoVAEKind.CONV,
             "loaded_tensors": self.loaded_tensors,
             "folded_gate_tensors": 0,
             "ignored_decoder_tensors": list(self.ignored_decoder_tensors),
@@ -302,8 +333,8 @@ def _stat_weight(
     return lookup_weight(weights, *aliases[name])
 
 
-def load_native_vae_decoder_weights(
-    decoder: NativeConv3dVideoDecoder,
+def load_vae_decoder_weights(
+    decoder: Conv3dVideoDecoder,
     source: WeightSource,
 ) -> int:
     """Load a complete decoder from source or prepared tensors."""
@@ -338,6 +369,8 @@ def load_native_vae_decoder_weights(
                 value = to_native_conv3d_layout(value, expected)
             elif tuple(value.shape) != expected:
                 raise ValueError(f"{local_key} has shape {tuple(value.shape)}; expected {expected}")
+            if decoder.compute_dtype == mx.float16:
+                value = value.astype(mx.float16)
             assignments.append((conv_block.conv, suffix, value))
 
     if missing:
@@ -375,7 +408,7 @@ def load_native_vae_decoder_weights(
 
 __all__ = [
     "Conv3dDecoderLoadReceipt",
-    "NativeConv3dVideoDecoder",
-    "NativeDepthToSpaceUpsample3d",
-    "load_native_vae_decoder_weights",
+    "Conv3dVideoDecoder",
+    "DepthToSpaceUpsample3d",
+    "load_vae_decoder_weights",
 ]

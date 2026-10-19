@@ -9,6 +9,7 @@ import mlx.core as mx
 from mlx.utils import tree_flatten
 
 import kinomlx._mlx_nn as nn
+from kinomlx.modeling.dtypes import FloatDType
 from kinomlx.models.ltx2.weights.dtypes import (
     resolve_transformer_dtype,
 )
@@ -22,7 +23,7 @@ from kinomlx.models.ltx2.weights.quantization import (
 from kinomlx.models.ltx2.weights.schema import (
     LAYOUT_KEY_PREFIX,
     QUANT_KEY_PREFIX,
-    TRANSFORMER_QUANTIZE_OFF,
+    TransformerQuantize,
 )
 from kinomlx.models.ltx2.weights.validation import validate_model_weight_graph
 
@@ -50,7 +51,7 @@ def _parameter_schema(block: nn.Module) -> frozenset[str]:
 
 def _validate_model_compute_dtype(
     model: nn.Module,
-    transformer_dtype: str | mx.Dtype | None,
+    transformer_dtype: FloatDType | mx.Dtype | None,
 ) -> None:
     actual = resolve_transformer_dtype(getattr(model, "compute_dtype", None))
     if actual is None:
@@ -67,7 +68,7 @@ def bind_transformer_weights(
     weights: dict[str, mx.array],
     *,
     include_audio: bool | None = None,
-    transformer_quantize: str = TRANSFORMER_QUANTIZE_OFF,
+    transformer_quantize: TransformerQuantize = TransformerQuantize.OFF,
     video_ff_quantize_specs: tuple[tuple[str, str], ...] = (),
     video_ff_quantize_group_size: int | None = None,
     video_ff_quantize_bits: int | None = None,
@@ -163,10 +164,10 @@ def bind_transformer(
     model: nn.Module,
     *,
     weight_loader: Callable[[int | None], dict[str, mx.array]],
-    transformer_dtype: str | mx.Dtype | None = None,
+    transformer_dtype: FloatDType | mx.Dtype | None = None,
     include_audio: bool | None = None,
     resident_blocks: int | None = None,
-    transformer_quantize: str = TRANSFORMER_QUANTIZE_OFF,
+    transformer_quantize: TransformerQuantize = TransformerQuantize.OFF,
     video_ff_quantize_specs: tuple[tuple[str, str], ...] = (),
     video_ff_quantize_group_size: int | None = None,
     video_ff_quantize_bits: int | None = None,

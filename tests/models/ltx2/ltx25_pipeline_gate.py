@@ -32,18 +32,19 @@ from kinomlx.models.ltx2.artifacts import (
     TEXT_CONDITIONING,
     sidecar_paths,
 )
-from kinomlx.models.ltx2.components import NativeLTX2Components
+from kinomlx.models.ltx2.components import LTX2Components
 from kinomlx.models.ltx2.config import assemble
-from kinomlx.models.ltx2.generation import GenerationOutput
+from kinomlx.models.ltx2.generation import LTX2GenerationOutput
 from kinomlx.models.ltx2.output import write_generation
 from kinomlx.models.ltx2.output_config import OutputConfig
-from kinomlx.models.ltx2.pipelines.distilled import generate_distilled
+from kinomlx.models.ltx2.pipelines.distilled import generate_ltx2
 from kinomlx.models.ltx2.resources import LTX2Resources, prepare_resources
 from kinomlx.models.ltx2.runner import LTX2Runner
 from kinomlx.models.ltx2.types import (
-    DistilledRequest,
-    ImageConditioningConfig,
+    LTX2ImageConditioningConfig,
+    LTX2Request,
 )
+from kinomlx.models.ltx2.video_vae.kinds import VideoVAEKind
 from kinomlx.reporting import TimingReporter
 
 _WIDTH = 64
@@ -60,7 +61,6 @@ _CASE_NAMES = (
 )
 _MODEL_SOURCE_FIELDS = (
     "weights_path",
-    "gemma_path",
     "spatial_upscaler_path",
     "transformer_path",
     "text_encoder_path",
@@ -136,7 +136,7 @@ def _assert_vae_runtime_diagnostics(
     *,
     case_name: str,
 ) -> None:
-    """Reject heavyweight predecessor residency at the LTX-2.5 VAE station."""
+    """Reject heavyweight predecessor residency at the LTX-2.5 VAE stage."""
     vae_decode = diagnostics.get("vae_decode")
     if not isinstance(vae_decode, Mapping):
         raise AssertionError(f"LTX-2.5 {case_name}: missing VAE runtime diagnostics")
@@ -158,9 +158,9 @@ def _assert_vae_runtime_diagnostics(
 
 
 class _RecordingComponents:
-    """Decorate native leases with balanced station and memory evidence."""
+    """Decorate native leases with balanced stage and memory evidence."""
 
-    def __init__(self, inner: NativeLTX2Components) -> None:
+    def __init__(self, inner: LTX2Components) -> None:
         self._inner = inner
         self._started = time.perf_counter()
         self._serials: Counter[str] = Counter()
@@ -548,7 +548,7 @@ def _assert_geometry_is_metadata_derived(resources: LTX2Resources) -> dict[str, 
         raise AssertionError(
             f"LTX-2.5 pipeline selected LTX-{resources.capabilities.model_generation}, expected 2.5"
         )
-    if resources.capabilities.video_vae_kind != "native-conv3d":
+    if resources.capabilities.video_vae_kind != VideoVAEKind.CONV:
         raise AssertionError(
             f"LTX-2.5 pipeline requires the convolutional VAE, got {resources.capabilities.video_vae_kind}"
         )
@@ -586,7 +586,7 @@ def _assert_geometry_is_metadata_derived(resources: LTX2Resources) -> dict[str, 
     }
 
 
-def _assert_balanced_stations(events: Sequence[dict[str, Any]], case: _Case) -> None:
+def _assert_balanced_stages(events: Sequence[dict[str, Any]], case: _Case) -> None:
     loaded = Counter(event["component"] for event in events if event["action"] == "load_complete")
     closed = Counter(event["component"] for event in events if event["action"] == "close")
     expected = Counter(
@@ -633,17 +633,19 @@ def _case_request(
     *,
     image_path: Path,
     text_conditioning: Path | None,
-) -> DistilledRequest:
-    image = (
-        None
+) -> LTX2Request:
+    images = (
+        ()
         if case.image_frame_index is None
-        else ImageConditioningConfig(
-            path=image_path,
-            frame_index=case.image_frame_index,
-            strength=0.95,
+        else (
+            LTX2ImageConditioningConfig(
+                path=image_path,
+                frame_index=case.image_frame_index,
+                strength=0.95,
+            ),
         )
     )
-    return DistilledRequest(
+    return LTX2Request(
         prompt=_PROMPT if text_conditioning is None else "",
         text_conditioning=text_conditioning,
         width=_WIDTH,
@@ -652,7 +654,7 @@ def _case_request(
         fps=_FPS,
         seed=case.seed,
         generate_audio=case.generate_audio,
-        image=image,
+        images=images,
     )
 
 
@@ -750,7 +752,7 @@ def run_ltx25_pipeline(
             enabled=enabled,
             reporter=timing,
         )
-        components = _RecordingComponents(NativeLTX2Components(reporter=timing))
+        components = _RecordingComponents(LTX2Components(reporter=timing))
         runner = LTX2Runner(
             resources=resources,
             components=components,
@@ -760,7 +762,7 @@ def run_ltx25_pipeline(
         peak_reset = _reset_peak_memory()
         memory_before = _memory_snapshot()
         started = time.perf_counter()
-        output = runner.run(generate_distilled, request)
+        output = runner.run(generate_ltx2, request)
         source_frames = output.frames
         inspected = _InspectingFrameStream(source_frames)
         audio_samples = None
@@ -791,7 +793,7 @@ def run_ltx25_pipeline(
             output.close()
             raise AssertionError(f"{case.name}: audio-off request returned audio")
 
-        wrapped = GenerationOutput(
+        wrapped = LTX2GenerationOutput(
             frames=inspected,
             audio_waveform=output.audio_waveform,
             audio_sample_rate=output.audio_sample_rate,
@@ -816,7 +818,7 @@ def run_ltx25_pipeline(
             raise AssertionError(f"{case.name}: incomplete or zero source frame stream")
         if components.active:
             raise AssertionError(f"{case.name}: live component leases remain: {components.active}")
-        _assert_balanced_stations(components.events, case)
+        _assert_balanced_stages(components.events, case)
         phase_snapshot = timing.to_dict()
         active_phases = [
             phase["phase"] for phase in phase_snapshot["phases"] if phase["status"] != "completed"
@@ -840,7 +842,7 @@ def run_ltx25_pipeline(
             "peak_memory_reset": peak_reset,
             "memory_before": memory_before,
             "memory_after": _memory_snapshot(),
-            "station_events": components.events,
+            "stage_events": components.events,
             "timing": phase_snapshot,
             "reporter_events": reporter_events.events,
             "frame_stream": inspected.to_dict(),

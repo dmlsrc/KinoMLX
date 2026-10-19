@@ -2,18 +2,18 @@
 
 import mlx.core as mx
 
-from kinomlx.modeling.dtypes import resolve_float_dtype
+from kinomlx.modeling.dtypes import FloatDType, resolve_float_dtype
 
 
-def resolve_transformer_dtype(dtype: str | mx.Dtype | None) -> mx.Dtype | None:
+def resolve_transformer_dtype(dtype: FloatDType | mx.Dtype | None) -> mx.Dtype | None:
     """Resolve an optional transformer weight override."""
     return None if dtype is None else resolve_float_dtype(dtype, owner="LTX transformer")
 
 
 def normalize_transformer_dtypes(
-    transformer_dtype: str | mx.Dtype | None,
-    video_ff_dtype: str | mx.Dtype | None,
-    audio_ff_dtype: str | mx.Dtype | None,
+    transformer_dtype: FloatDType | mx.Dtype | None,
+    video_ff_dtype: FloatDType | mx.Dtype | None,
+    audio_ff_dtype: FloatDType | mx.Dtype | None,
 ) -> tuple[mx.Dtype | None, mx.Dtype | None, mx.Dtype | None]:
     """Canonicalize global and targeted transformer weight dtype requests."""
     resolved_transformer = resolve_transformer_dtype(transformer_dtype)

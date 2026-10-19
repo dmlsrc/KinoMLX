@@ -14,7 +14,7 @@ from kinomlx.media.signals import (
     ExrDeliverySpec,
     UnsupportedSignalError,
 )
-from kinomlx.models.ltx2.generation import GenerationOutput
+from kinomlx.models.ltx2.generation import LTX2GenerationOutput
 from kinomlx.models.ltx2.output import write_generation
 from kinomlx.models.ltx2.output_config import OutputConfig
 from kinomlx.models.ltx2.signals import (
@@ -31,7 +31,7 @@ def _generation(
     frame: object | None = None,
     audio_waveform: object | None = None,
     audio_sample_rate: int | None = None,
-) -> GenerationOutput:
+) -> LTX2GenerationOutput:
     signal = ltx23_sdr_signal(width=64, height=64, fps=24.0)
     resolved_frame = mx.zeros((64, 64, 3), dtype=mx.float16) if frame is None else frame
     frames = VideoFrameStream(
@@ -39,7 +39,7 @@ def _generation(
         spec=signal,
         frame_count=1,
     )
-    return GenerationOutput(
+    return LTX2GenerationOutput(
         frames=frames,
         audio_waveform=audio_waveform,
         audio_sample_rate=audio_sample_rate,
@@ -177,7 +177,7 @@ def test_writer_failure_closes_partly_consumed_stream(tmp_path: Path) -> None:
 
     with pytest.raises(OutputError, match="writer failed"):
         write_generation(
-            GenerationOutput(frames=stream),
+            LTX2GenerationOutput(frames=stream),
             OutputConfig(path=tmp_path / "out.mp4"),
             fps=24.0,
             encoder=fail,
@@ -206,7 +206,7 @@ def test_write_generation_rejects_hdr_before_pulling_or_loading_encoder(tmp_path
 
     with pytest.raises(UnsupportedSignalError, match="SDR terminal cannot consume"):
         write_generation(
-            GenerationOutput(frames=stream),
+            LTX2GenerationOutput(frames=stream),
             OutputConfig(path=tmp_path / "out.mp4"),
             fps=24.0,
             encoder=lambda *_args, **_kwargs: pytest.fail("encoder must not open"),
@@ -239,7 +239,7 @@ def test_write_generation_maps_hdr_authoring_to_dual_sink_plan(
         height=64,
         fps=24.0,
     )
-    generation = GenerationOutput(
+    generation = LTX2GenerationOutput(
         frames=VideoFrameStream(
             lambda: iter((mx.zeros((64, 64, 3), dtype=mx.float32),)),
             spec=signal,

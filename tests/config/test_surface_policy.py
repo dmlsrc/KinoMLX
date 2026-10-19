@@ -9,7 +9,8 @@ from kinomlx.cli.config_arguments import add_config_arguments
 from kinomlx.config import ConfigFieldSpec
 from kinomlx.config.inspection import configuration_inventory
 from kinomlx.config_surfaces import CONFIG_SURFACES, STRUCTURED_SURFACES, SURFACES, SurfacePolicy
-from kinomlx.model_registry import config_registry, model_choices
+from kinomlx.model_catalog import model_choices
+from kinomlx.model_registry import config_registry
 from tests.config.test_bindings import sensor_schema
 
 

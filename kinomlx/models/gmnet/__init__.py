@@ -16,7 +16,7 @@ from .catalog import (
     resolve_variant_weights,
     variant_spec,
 )
-from .components import GMNetComponents, NativeGMNetComponents
+from .components import GMNetComponents, GMNetComponentsProvider
 from .expand import (
     ExpansionResult,
     expand_image,
@@ -33,7 +33,7 @@ from .output import (
     plan_gmnet_output,
     write_gmnet_output,
 )
-from .pipeline import expand_gmnet
+from .pipelines import expand_gmnet
 from .resources import GMNetResources, prepare_resources
 from .runner import GMNetError, GMNetRunner
 from .settings import GMNetSettings
@@ -44,6 +44,7 @@ __all__ = [
     "GMNet",
     "GMNetArtifactSet",
     "GMNetComponents",
+    "GMNetComponentsProvider",
     "GMNetError",
     "GMNetOutputConfig",
     "GMNetOutputError",
@@ -56,7 +57,6 @@ __all__ = [
     "GMNetSettings",
     "GMNetVariant",
     "GMNetVariantSpec",
-    "NativeGMNetComponents",
     "expand_gmnet",
     "expand_image",
     "load_gmnet_weights",

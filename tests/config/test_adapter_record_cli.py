@@ -37,8 +37,9 @@ def configuration(field):
         model="fixture",
         title="Adapter contribution test",
         introduction=("Test only.",),
-        restart_stations=(),
-        no_restart_reason="The adapter contribution fixture has no saved station.",
+        stages=("process",),
+        restart_stages=(),
+        no_restart_reason="The adapter contribution fixture has no saved stage.",
         root_fields=(
             ConfigFieldSpec(
                 "model",

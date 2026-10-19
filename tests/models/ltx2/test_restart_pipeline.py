@@ -1,4 +1,4 @@
-"""Shared public/CLI recipe gates for distilled station restart."""
+"""Shared public/CLI recipe gates for distilled stage restart."""
 
 import math
 from dataclasses import replace
@@ -7,22 +7,30 @@ from pathlib import Path
 import mlx.core as mx
 import pytest
 
+import kinomlx.models.ltx2.conditioning.preparation as condition_preparation
 import kinomlx.models.ltx2.pipelines.distilled as distilled
 import kinomlx.models.ltx2.pipelines.restart as restart_pipeline
 from kinomlx.io.fingerprints import file_sha256
 from kinomlx.io.safetensors import save_weights
 from kinomlx.media.frames import VideoFrameStream
-from kinomlx.models.ltx2.artifacts import FINAL_LATENTS, STAGE_1_LATENTS, TEXT_CONDITIONING
-from kinomlx.models.ltx2.restart import DistilledRestart
-from kinomlx.models.ltx2.text_conditioning import NativeTextConditioner
+from kinomlx.models.ltx2.artifacts import (
+    FINAL_LATENTS,
+    STAGE_1_LATENTS,
+    STAGE_2_CONDITIONING,
+    TEXT_CONDITIONING,
+)
+from kinomlx.models.ltx2.restart import LTX2Restart
+from kinomlx.models.ltx2.text_conditioning import LTX2TextConditioner
 from kinomlx.models.ltx2.types import (
     AudioLatentShape,
-    DistilledRequest,
+    LTX2ImageConditioningConfig,
+    LTX2Request,
     video_latent_shape_from_pixel,
 )
 from kinomlx.types import VideoPixelShape
 from tests._reporting import RecordingReporter
 from tests.models.ltx2.test_distilled_pipeline import (
+    _X0,
     _patch_operations,
     _RecordingComponents,
     _RecordingTextConditioner,
@@ -85,7 +93,7 @@ def _consume(output) -> tuple[mx.array, mx.array | None]:
 
 
 class _RecordingArtifacts:
-    """Accept every offered artifact so a station's own output can be read back."""
+    """Accept every offered artifact so a stage's own output can be read back."""
 
     def __init__(self) -> None:
         self.tensors: dict[str, dict[str, mx.array]] = {}
@@ -108,22 +116,22 @@ def test_decode_restart_re_emits_the_latent_product_it_consumed(
     )
     monkeypatch.setattr(distilled, "decode_ltx23_sdr_frames", _seeded_decode)
     monkeypatch.setattr(distilled, "release_stage_temporaries", lambda: None)
-    request = DistilledRequest(prompt="", width=64, height=64, frames=9, seed=42)
+    request = LTX2Request(prompt="", width=64, height=64, frames=9, seed=42)
 
     final_saved = _RecordingArtifacts()
-    restart_pipeline.restart_distilled(
+    restart_pipeline.restart_ltx2(
         request,
         _Resources(),
-        restart=DistilledRestart.decode(final_path),
+        restart=LTX2Restart.decode(final_path),
         components=_RecordingComponents(),
         artifact_sink=final_saved,
     ).close()
 
     stage_1_saved = _RecordingArtifacts()
-    restart_pipeline.restart_distilled(
+    restart_pipeline.restart_ltx2(
         request,
         _Resources(),
-        restart=DistilledRestart.decode(stage_1_path, latent_stage="stage-1"),
+        restart=LTX2Restart.decode(stage_1_path, latent_stage="stage-1"),
         components=_RecordingComponents(),
         artifact_sink=stage_1_saved,
     ).close()
@@ -152,10 +160,10 @@ def test_stage_2_restart_re_emits_the_text_and_stage_1_latent_it_consumed(
     monkeypatch.setattr(restart_pipeline, "release_stage_temporaries", lambda: None)
     saved = _RecordingArtifacts()
 
-    output = restart_pipeline.restart_distilled(
-        DistilledRequest(prompt="ignored", width=64, height=64, frames=9, seed=42),
+    output = restart_pipeline.restart_ltx2(
+        LTX2Request(prompt="ignored", width=64, height=64, frames=9, seed=42),
         _Resources(),
-        restart=DistilledRestart.stage_2(latent_path, text_conditioning=text_path),
+        restart=LTX2Restart.stage_2(latent_path, text_conditioning=text_path),
         components=_RecordingComponents(),
         text_conditioner=_RestartTextConditioner(),
         artifact_sink=saved,
@@ -167,19 +175,19 @@ def test_stage_2_restart_re_emits_the_text_and_stage_1_latent_it_consumed(
 
 
 def test_public_restart_constructors_keep_the_call_site_small(tmp_path: Path) -> None:
-    final = DistilledRestart.decode(tmp_path / "final.safetensors")
-    stage_1 = DistilledRestart.decode(
+    final = LTX2Restart.decode(tmp_path / "final.safetensors")
+    stage_1 = LTX2Restart.decode(
         tmp_path / "stage1.safetensors",
         latent_stage="stage-1",
     )
-    stage_2 = DistilledRestart.stage_2(
+    stage_2 = LTX2Restart.stage_2(
         tmp_path / "stage1.safetensors",
         text_conditioning=tmp_path / "text.safetensors",
     )
 
-    assert (final.phase, final.latent_stage) == ("decode", "final")
-    assert (stage_1.phase, stage_1.latent_stage) == ("decode", "stage-1")
-    assert (stage_2.phase, stage_2.latent_stage) == ("stage-2", "stage-1")
+    assert (final.stage, final.latent_stage) == ("decode", "stage-2")
+    assert (stage_1.stage, stage_1.latent_stage) == ("decode", "stage-1")
+    assert (stage_2.stage, stage_2.selected_latent_stage) == ("stage-2", "stage-1")
 
 
 def test_stage_2_restart_selects_observational_identity_policy_by_default(
@@ -199,10 +207,10 @@ def test_stage_2_restart_selects_observational_identity_policy_by_default(
 
     monkeypatch.setattr(restart_pipeline, "_restart_stage_2", fake_stage_2)
 
-    output = restart_pipeline.restart_distilled(
-        DistilledRequest(prompt="", width=64, height=64, frames=9),
+    output = restart_pipeline.restart_ltx2(
+        LTX2Request(prompt="", width=64, height=64, frames=9),
         _Resources(),
-        restart=DistilledRestart.stage_2(
+        restart=LTX2Restart.stage_2(
             latent_path,
             text_conditioning=text_path,
         ),
@@ -211,7 +219,7 @@ def test_stage_2_restart_selects_observational_identity_policy_by_default(
 
     text_conditioner = captured["text_conditioner"]
     assert output is expected
-    assert isinstance(text_conditioner, NativeTextConditioner)
+    assert isinstance(text_conditioner, LTX2TextConditioner)
     assert text_conditioner.replay_identity_policy == "observe"
 
 
@@ -232,7 +240,7 @@ def test_restart_metadata_labels_are_advisory_when_tensor_structure_fits(
 
     loaded = restart_pipeline.load_stage_latents(
         path,
-        stage="final",
+        stage="stage-2",
         geometry=geometry,
         fps=24.0,
         generate_audio=False,
@@ -254,10 +262,10 @@ def test_restart_wrong_latent_shape_fails_before_any_component_opens(
     components = _RecordingComponents()
 
     with pytest.raises(ValueError, match=r"LTX-2\.5 stage-1 video latent shape.*does not match"):
-        restart_pipeline.restart_distilled(
-            DistilledRequest(prompt="", width=64, height=64, frames=9),
+        restart_pipeline.restart_ltx2(
+            LTX2Request(prompt="", width=64, height=64, frames=9),
             _Resources(generation="2.5"),
-            restart=DistilledRestart.stage_2(
+            restart=LTX2Restart.stage_2(
                 latent_path,
                 text_conditioning=text_path,
                 source_model_generation="2.5",
@@ -293,10 +301,10 @@ def test_restart_latent_value_checks_are_shared_by_both_generations(
     components = _RecordingComponents()
 
     with pytest.raises(ValueError, match=message):
-        restart_pipeline.restart_distilled(
-            DistilledRequest(prompt="", width=64, height=64, frames=9),
+        restart_pipeline.restart_ltx2(
+            LTX2Request(prompt="", width=64, height=64, frames=9),
             _Resources(generation=generation),
-            restart=DistilledRestart.decode(
+            restart=LTX2Restart.decode(
                 latent_path,
                 source_model_generation=generation,
             ),
@@ -307,7 +315,7 @@ def test_restart_latent_value_checks_are_shared_by_both_generations(
 
 
 @pytest.mark.parametrize("generation", ["2.3", "2.5"])
-def test_stage_2_restart_runs_only_the_shared_downstream_stations(
+def test_stage_2_restart_runs_only_the_shared_downstream_stages(
     generation: str,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -331,10 +339,10 @@ def test_stage_2_restart_runs_only_the_shared_downstream_stations(
             if artifact.name == FINAL_LATENTS:
                 captured.update(dict(artifact.tensors))
 
-    output = restart_pipeline.restart_distilled(
-        DistilledRequest(prompt="ignored", width=64, height=64, frames=9, seed=42),
+    output = restart_pipeline.restart_ltx2(
+        LTX2Request(prompt="ignored", width=64, height=64, frames=9, seed=42),
         _Resources(generation=generation),
-        restart=DistilledRestart.stage_2(
+        restart=LTX2Restart.stage_2(
             latent_path,
             text_conditioning=text_path,
             source_model_generation=generation,
@@ -360,6 +368,162 @@ def test_stage_2_restart_runs_only_the_shared_downstream_stations(
     assert components.active == set()
 
 
+def test_stage_2_restart_re_prepares_every_saved_image_condition(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    latent_path = tmp_path / "two-condition-stage1.safetensors"
+    text_path = tmp_path / "two-condition-text.safetensors"
+    text_path.touch()
+    _stage_latents(
+        latent_path,
+        VideoPixelShape(batch=1, frames=9, height=32, width=32),
+        metadata={"pipeline": "distilled_two_stage", "stage": "1", "final": "false"},
+    )
+    _patch_operations(monkeypatch)
+    monkeypatch.setattr(restart_pipeline, "release_stage_temporaries", lambda: None)
+
+    def encode_image(_path, _encoder, *, width, height, compute_dtype, **_kwargs):
+        return mx.ones((1, 128, 1, height // 32, width // 32), dtype=compute_dtype)
+
+    monkeypatch.setattr(condition_preparation, "encode_image", encode_image)
+    saved: dict[str, dict[str, str]] = {}
+
+    class _Artifacts:
+        def save(self, artifact) -> None:
+            if artifact.name == STAGE_2_CONDITIONING:
+                saved[artifact.name] = dict(artifact.metadata)
+
+    output = restart_pipeline.restart_ltx2(
+        LTX2Request(
+            prompt="ignored",
+            width=64,
+            height=64,
+            frames=9,
+            seed=42,
+            images=(
+                LTX2ImageConditioningConfig(tmp_path / "first.png"),
+                LTX2ImageConditioningConfig(tmp_path / "last.png", frame_index=8),
+            ),
+        ),
+        _Resources(),
+        restart=LTX2Restart.stage_2(latent_path, text_conditioning=text_path),
+        components=_RecordingComponents(),
+        text_conditioner=_RestartTextConditioner(),
+        artifact_sink=_Artifacts(),
+    )
+    output.close()
+
+    metadata = saved[STAGE_2_CONDITIONING]
+    assert metadata["condition_count"] == "2"
+    assert metadata["condition_0_family"] == "image"
+    assert metadata["condition_0_frame_index"] == "0"
+    assert metadata["condition_1_family"] == "keyframe"
+    assert metadata["condition_1_frame_index"] == "8"
+
+
+def test_stage_2_restart_re_prepares_conditions_at_their_stage_2_strengths(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The restarted stage applies its own strengths, not the common intent."""
+    latent_path = tmp_path / "staged-stage1.safetensors"
+    text_path = tmp_path / "staged-text.safetensors"
+    text_path.touch()
+    _stage_latents(
+        latent_path,
+        VideoPixelShape(batch=1, frames=9, height=32, width=32),
+        metadata={"pipeline": "distilled_two_stage", "stage": "1", "final": "false"},
+    )
+    _patch_operations(monkeypatch)
+    monkeypatch.setattr(restart_pipeline, "release_stage_temporaries", lambda: None)
+
+    def encode_image(_path, _encoder, *, width, height, compute_dtype, **_kwargs):
+        return mx.ones((1, 128, 1, height // 32, width // 32), dtype=compute_dtype)
+
+    monkeypatch.setattr(condition_preparation, "encode_image", encode_image)
+    saved: dict[str, dict[str, str]] = {}
+
+    class _Artifacts:
+        def save(self, artifact) -> None:
+            if artifact.name == STAGE_2_CONDITIONING:
+                saved[artifact.name] = dict(artifact.metadata)
+
+    output = restart_pipeline.restart_ltx2(
+        LTX2Request(
+            prompt="ignored",
+            width=64,
+            height=64,
+            frames=9,
+            seed=42,
+            images=(
+                LTX2ImageConditioningConfig(
+                    tmp_path / "first.png", strength=1.0, stage2_strength=0.6
+                ),
+                LTX2ImageConditioningConfig(tmp_path / "last.png", frame_index=8, strength=0.9),
+            ),
+        ),
+        _Resources(),
+        restart=LTX2Restart.stage_2(latent_path, text_conditioning=text_path),
+        components=_RecordingComponents(),
+        text_conditioner=_RestartTextConditioner(),
+        artifact_sink=_Artifacts(),
+    )
+    output.close()
+
+    metadata = saved[STAGE_2_CONDITIONING]
+    assert metadata["condition_0_strength"] == "0.6"
+    assert metadata["condition_1_strength"] == "0.9"
+
+
+def test_stage_2_restart_re_prepares_conditions_in_the_requested_frame_zero_mode(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The restarted stage applies frame 0 the way the request asks."""
+    latent_path = tmp_path / "staged-stage1.safetensors"
+    text_path = tmp_path / "staged-text.safetensors"
+    text_path.touch()
+    _stage_latents(
+        latent_path,
+        VideoPixelShape(batch=1, frames=9, height=32, width=32),
+        metadata={"pipeline": "distilled_two_stage", "stage": "1", "final": "false"},
+    )
+    _patch_operations(monkeypatch)
+    monkeypatch.setattr(restart_pipeline, "release_stage_temporaries", lambda: None)
+
+    def encode_image(_path, _encoder, *, width, height, compute_dtype, **_kwargs):
+        return mx.ones((1, 128, 1, height // 32, width // 32), dtype=compute_dtype)
+
+    monkeypatch.setattr(condition_preparation, "encode_image", encode_image)
+    saved: dict[str, dict[str, str]] = {}
+
+    class _Artifacts:
+        def save(self, artifact) -> None:
+            if artifact.name == STAGE_2_CONDITIONING:
+                saved[artifact.name] = dict(artifact.metadata)
+
+    output = restart_pipeline.restart_ltx2(
+        LTX2Request(
+            prompt="ignored",
+            width=64,
+            height=64,
+            frames=9,
+            seed=42,
+            first_frame_mode="guide",
+            images=(LTX2ImageConditioningConfig(tmp_path / "first.png"),),
+        ),
+        _Resources(),
+        restart=LTX2Restart.stage_2(latent_path, text_conditioning=text_path),
+        components=_RecordingComponents(),
+        text_conditioner=_RestartTextConditioner(),
+        artifact_sink=_Artifacts(),
+    )
+    output.close()
+
+    assert saved[STAGE_2_CONDITIONING]["first_frame_mode"] == "guide"
+
+
 def test_legacy_stage_1_artifact_requires_legacy_mlx_noise_for_stage_2(
     tmp_path: Path,
 ) -> None:
@@ -373,8 +537,8 @@ def test_legacy_stage_1_artifact_requires_legacy_mlx_noise_for_stage_2(
     )
 
     with pytest.raises(ValueError, match="legacy stage-1 latents have no Torch-MPS"):
-        restart_pipeline.restart_distilled(
-            DistilledRequest(
+        restart_pipeline.restart_ltx2(
+            LTX2Request(
                 prompt="ignored",
                 width=64,
                 height=64,
@@ -382,7 +546,7 @@ def test_legacy_stage_1_artifact_requires_legacy_mlx_noise_for_stage_2(
                 noise_backend="torch-mps",
             ),
             _Resources(),
-            restart=DistilledRestart.stage_2(
+            restart=LTX2Restart.stage_2(
                 latent_path,
                 text_conditioning=text_path,
             ),
@@ -399,7 +563,7 @@ def test_stage_2_restart_reproduces_the_uninterrupted_final_latent_exactly(
 ) -> None:
     _patch_operations(monkeypatch)
     monkeypatch.setattr(restart_pipeline, "release_stage_temporaries", lambda: None)
-    request = DistilledRequest(prompt="test", width=64, height=64, frames=9, seed=42)
+    request = LTX2Request(prompt="test", width=64, height=64, frames=9, seed=42)
     uninterrupted_artifacts = {}
 
     class _UninterruptedArtifacts:
@@ -407,7 +571,7 @@ def test_stage_2_restart_reproduces_the_uninterrupted_final_latent_exactly(
             if artifact.name in {STAGE_1_LATENTS, FINAL_LATENTS}:
                 uninterrupted_artifacts[artifact.name] = dict(artifact.tensors)
 
-    uninterrupted = distilled.generate_distilled(
+    uninterrupted = distilled.generate_ltx2(
         request,
         _Resources(generation=generation),
         components=_RecordingComponents(),
@@ -427,10 +591,10 @@ def test_stage_2_restart_reproduces_the_uninterrupted_final_latent_exactly(
             if artifact.name == FINAL_LATENTS:
                 restarted_artifacts.update(dict(artifact.tensors))
 
-    restarted = restart_pipeline.restart_distilled(
+    restarted = restart_pipeline.restart_ltx2(
         request,
         _Resources(generation=generation),
-        restart=DistilledRestart.stage_2(
+        restart=LTX2Restart.stage_2(
             latent_path,
             text_conditioning=text_path,
             source_model_generation=generation,
@@ -447,13 +611,91 @@ def test_stage_2_restart_reproduces_the_uninterrupted_final_latent_exactly(
     ).item()
 
 
+def test_stage_2_restart_reseeds_generated_keyframes_from_the_saved_stage_1_slots(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Stage 2 refines the stage-1 slots, so its restart needs them to reproduce the run."""
+    _patch_operations(monkeypatch)
+    monkeypatch.setattr(restart_pipeline, "release_stage_temporaries", lambda: None)
+    record = _X0.__call__
+
+    def halving(self, video, audio=None):
+        # Predictions that follow the input give the slots content worth seeding.
+        record(self, video, audio)
+        return video.latent * 0.5, None if audio is None else audio.latent * 0.5
+
+    monkeypatch.setattr(_X0, "__call__", halving)
+    request = LTX2Request(
+        prompt="test", width=64, height=64, frames=17, seed=42, generated_keyframes=2
+    )
+    uninterrupted = _RecordingArtifacts()
+    output = distilled.generate_ltx2(
+        request,
+        _Resources(generation="2.5"),
+        components=_RecordingComponents(),
+        text_conditioner=_RecordingTextConditioner(),
+        artifact_sink=uninterrupted,
+    )
+    indices = output.metadata["generated_keyframe_indices"]
+    output.close()
+    assert len(indices) == 2
+    stage_1 = uninterrupted.tensors[STAGE_1_LATENTS]
+    assert mx.any(stage_1["generated_keyframes"]).item()
+    text_path = tmp_path / "text.safetensors"
+    text_path.touch()
+
+    def restarted_final(tensors: dict[str, mx.array]) -> dict[str, mx.array]:
+        latent_path = tmp_path / "stage1.safetensors"
+        save_weights(latent_path, tensors)
+        artifacts = _RecordingArtifacts()
+        restarted = restart_pipeline.restart_ltx2(
+            request,
+            _Resources(generation="2.5"),
+            restart=LTX2Restart.stage_2(
+                latent_path,
+                text_conditioning=text_path,
+                source_model_generation="2.5",
+            ),
+            components=_RecordingComponents(),
+            text_conditioner=_RecordingTextConditioner(),
+            artifact_sink=artifacts,
+        )
+        assert restarted.metadata["generated_keyframe_indices"] == indices
+        restarted.close()
+        return artifacts.tensors[FINAL_LATENTS]
+
+    final = uninterrupted.tensors[FINAL_LATENTS]
+    restarted = restarted_final(stage_1)
+    for name in ("video_latent", "generated_keyframes"):
+        assert mx.array_equal(restarted[name], final[name]).item()
+    # The fake predicts each token from itself alone, so the seed shows in stage 2's slots.
+    zeroed = {**stage_1, "generated_keyframes": mx.zeros_like(stage_1["generated_keyframes"])}
+    reseeded = restarted_final(zeroed)["generated_keyframes"]
+    assert not mx.array_equal(reseeded, final["generated_keyframes"]).item()
+    without = {name: value for name, value in stage_1.items() if name != "generated_keyframes"}
+    with pytest.raises(ValueError, match="has no generated_keyframes tensor"):
+        restarted_final(without)
+
+    final_path = tmp_path / "final.safetensors"
+    save_weights(final_path, final)
+    decoded = restart_pipeline.restart_ltx2(
+        request,
+        _Resources(generation="2.5"),
+        restart=LTX2Restart.decode(final_path, source_model_generation="2.5"),
+        components=_RecordingComponents(),
+    )
+    assert decoded.metadata["generated_keyframe_indices"] == indices
+    decoded.close()
+
+
 def test_torch_mps_stage_2_restart_resumes_recorded_noise_position_exactly(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _patch_operations(monkeypatch)
     monkeypatch.setattr(restart_pipeline, "release_stage_temporaries", lambda: None)
-    request = DistilledRequest(
+    request = LTX2Request(
         prompt="test",
         width=64,
         height=64,
@@ -468,7 +710,7 @@ def test_torch_mps_stage_2_restart_resumes_recorded_noise_position_exactly(
             if artifact.name in {STAGE_1_LATENTS, FINAL_LATENTS}:
                 uninterrupted_artifacts[artifact.name] = artifact
 
-    uninterrupted = distilled.generate_distilled(
+    uninterrupted = distilled.generate_ltx2(
         request,
         _Resources(generation="2.3"),
         components=_RecordingComponents(),
@@ -492,10 +734,10 @@ def test_torch_mps_stage_2_restart_resumes_recorded_noise_position_exactly(
             if artifact.name == FINAL_LATENTS:
                 restarted_artifacts.update(dict(artifact.tensors))
 
-    restarted = restart_pipeline.restart_distilled(
+    restarted = restart_pipeline.restart_ltx2(
         request,
         _Resources(generation="2.3"),
-        restart=DistilledRestart.stage_2(
+        restart=LTX2Restart.stage_2(
             latent_path,
             text_conditioning=text_path,
             source_model_generation="2.3",
@@ -524,10 +766,10 @@ def test_stage_1_decode_reports_half_resolution(
     )
     monkeypatch.setattr(distilled, "decode_ltx23_sdr_frames", _seeded_decode)
     monkeypatch.setattr(distilled, "release_stage_temporaries", lambda: None)
-    output = restart_pipeline.restart_distilled(
-        DistilledRequest(prompt="", width=64, height=64, frames=9),
+    output = restart_pipeline.restart_ltx2(
+        LTX2Request(prompt="", width=64, height=64, frames=9),
         _Resources(),
-        restart=DistilledRestart.decode(latent_path, latent_stage="stage-1"),
+        restart=LTX2Restart.decode(latent_path, latent_stage="stage-1"),
         components=_RecordingComponents(),
     )
 
@@ -547,7 +789,7 @@ def test_decode_restart_is_bit_exact_before_encoding_and_seed_can_reroll_diffvae
     monkeypatch.setattr(distilled, "decode_ltx23_sdr_frames", _seeded_decode)
     monkeypatch.setattr(distilled, "release_stage_temporaries", lambda: None)
     components = _RecordingComponents()
-    request = DistilledRequest(
+    request = LTX2Request(
         prompt="",
         width=64,
         height=64,
@@ -566,18 +808,18 @@ def test_decode_restart_is_bit_exact_before_encoding_and_seed_can_reroll_diffvae
     )
     normal_frames, normal_audio = _consume(normal)
 
-    restarted = restart_pipeline.restart_distilled(
+    restarted = restart_pipeline.restart_ltx2(
         request,
         _Resources(),
-        restart=DistilledRestart.decode(latent_path),
+        restart=LTX2Restart.decode(latent_path),
         components=_RecordingComponents(),
     )
     restart_frames, restart_audio = _consume(restarted)
     assert mx.array_equal(restart_frames, normal_frames).item()
     assert mx.array_equal(restart_audio, normal_audio).item()
 
-    rerolled = restart_pipeline.restart_distilled(
-        DistilledRequest(
+    rerolled = restart_pipeline.restart_ltx2(
+        LTX2Request(
             prompt="",
             width=64,
             height=64,
@@ -586,7 +828,7 @@ def test_decode_restart_is_bit_exact_before_encoding_and_seed_can_reroll_diffvae
             generate_audio=True,
         ),
         _Resources(),
-        restart=DistilledRestart.decode(latent_path),
+        restart=LTX2Restart.decode(latent_path),
         components=_RecordingComponents(),
     )
     rerolled_frames, rerolled_audio = _consume(rerolled)

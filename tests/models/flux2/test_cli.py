@@ -1,6 +1,7 @@
-"""Common image command behavior, precedence, and saved-station execution."""
+"""Common image command behavior, precedence, and saved-stage execution."""
 
 import json
+import logging
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
@@ -8,26 +9,28 @@ from types import SimpleNamespace
 import mlx.core as mx
 import pytest
 
-import kinomlx.models.flux2.pipeline as pipeline
 from kinomlx.cli.main import main
 from kinomlx.config import ConfigError
 from kinomlx.io.image import save_image
 from kinomlx.io.output_bundle import BundleOutputError
 from kinomlx.io.output_config import ImageOutputConfig
 from kinomlx.memory_policy import MLXMemoryPolicy
+from kinomlx.model_registry import config_registry
 from kinomlx.models.flux2 import command
 from kinomlx.models.flux2.arguments import build_parser
 from kinomlx.models.flux2.catalog import Flux2Variant
 from kinomlx.models.flux2.config import assemble
 from kinomlx.models.flux2.generation import Flux2ImageResult
 from kinomlx.models.flux2.output import Flux2OutputSink, plan_output
+from kinomlx.models.flux2.pipelines import restart as restart_pipeline
+from kinomlx.models.flux2.pipelines import text_to_image as pipeline
 from kinomlx.models.flux2.restart import RestartManifest
 from kinomlx.models.flux2.sampling import SamplingRecipe, schedule
 from kinomlx.models.flux2.types import Flux2RestartConfig
 from kinomlx.models.krea2.arguments import build_parser as krea_parser
 from kinomlx.restart_selection import fingerprint_key
 from tests.config.saved_records import saved_run_configuration
-from tests.models.flux2.test_stations import conditioning
+from tests.models.flux2.test_text_conditioning import conditioning
 
 
 @dataclass
@@ -40,6 +43,27 @@ class _Resources:
     recipe_identity: str = "fixture"
     components: tuple = ()
     component: object = None
+
+
+def test_dry_run_prints_for_a_human_unless_json_is_selected(monkeypatch, capsys, caplog):
+    """A resource-only run honors the switch every other command honors."""
+    report = {"model": "flux2", "variant": "distilled", "components": []}
+    monkeypatch.setattr(
+        command,
+        "prepare_resources",
+        lambda *a, **k: _Resources(
+            describe=lambda: report,
+            profile=SimpleNamespace(variant=Flux2Variant.DISTILLED, kv=False),
+        ),
+    )
+
+    with caplog.at_level(logging.INFO, logger="kinomlx"):
+        assert main(["--model", "flux2", "--dry-run"]) == 0
+    assert "Resources" in caplog.text
+    assert capsys.readouterr().out == ""
+
+    assert main(["--model", "flux2", "--dry-run", "--json"]) == 0
+    assert json.loads(capsys.readouterr().out) == report
 
 
 def test_common_non_adapter_image_flags_have_identical_parser_behavior():
@@ -133,10 +157,10 @@ def test_ineffective_controls_fail_before_model_loading(arguments, message):
 
 
 def _result(*, base=False):
-    station = conditioning(base=base)
+    stage = conditioning(base=base)
     latent = mx.zeros((1, 16, 128), dtype=mx.float16)
     return Flux2ImageResult(
-        mx.full((64, 64, 3), 0.5), latent, 64, 64, (), (), station, latent, schedule(16, 4)
+        mx.full((64, 64, 3), 0.5), latent, 64, 64, (), (), stage, latent, schedule(16, 4)
     )
 
 
@@ -144,7 +168,7 @@ def _fake_generation(monkeypatch, *, base=False):
     calls = []
     monkeypatch.setattr(
         command,
-        "inspect_resources",
+        "prepare_resources",
         lambda *a, **k: _Resources(
             memory_policy=MLXMemoryPolicy(),
             describe=lambda: {"variant": "base" if base else "distilled", "components": []},
@@ -164,7 +188,7 @@ def _fake_generation(monkeypatch, *, base=False):
         yield None
         return _result(base=base)
 
-    monkeypatch.setattr(pipeline, "image_stations", generate)
+    monkeypatch.setattr(pipeline, "image_stages", generate)
     return calls
 
 
@@ -177,7 +201,7 @@ def _fake_generation(monkeypatch, *, base=False):
         ["--negative-prompt", "blurry", "--reference-fit", "fit"],
     ],
 )
-def test_restart_optional_changes_report_earlier_station(tmp_path, monkeypatch, changes):
+def test_restart_optional_changes_report_earlier_stage(tmp_path, monkeypatch, changes):
     _fake_generation(monkeypatch)
     assert (
         command.run_flux2_command(
@@ -196,7 +220,7 @@ def test_restart_optional_changes_report_earlier_station(tmp_path, monkeypatch, 
         )
         == 0
     )
-    with pytest.raises(ValueError, match="earlier station"):
+    with pytest.raises(ValueError, match="earlier stage"):
         assemble(
             build_parser().parse_args(
                 [
@@ -216,7 +240,7 @@ def test_arithmetic_failure_is_rendered_as_json(tmp_path, monkeypatch, capsys):
     def fail(*args, **kwargs):
         raise FloatingPointError("nonfinite latents at step 1")
 
-    monkeypatch.setattr(pipeline, "image_stations", fail)
+    monkeypatch.setattr(pipeline, "image_stages", fail)
     assert (
         command.run_flux2_command(
             [
@@ -279,7 +303,7 @@ def test_cli_publishes_complete_bundle_and_restarts_without_encoders(tmp_path, m
     assert data["generation"]["images"][0]["schedule"][-1] == 0
     monkeypatch.setattr(
         command,
-        "inspect_resources",
+        "prepare_resources",
         lambda *a, **k: pytest.fail("restart reopens source resources"),
     )
     monkeypatch.setattr(
@@ -305,7 +329,7 @@ def test_cli_publishes_complete_bundle_and_restarts_without_encoders(tmp_path, m
         == 0
     )
     assert calls[-1]["conditioning"].negative is not None
-    monkeypatch.setattr(pipeline, "decode_latents", lambda *a, **k: mx.zeros((64, 64, 3)))
+    monkeypatch.setattr(restart_pipeline, "decode_latents", lambda *a, **k: mx.zeros((64, 64, 3)))
     assert (
         command.run_flux2_command(
             ["--restart", str(run), "--output", str(tmp_path / "decode.png"), "--quiet"]
@@ -370,7 +394,7 @@ def test_documented_downloads_skip_only_duplicate_monoliths():
     from kinomlx.models.flux2.catalog import PROFILES
 
     root = Path(__file__).resolve().parents[3]
-    guide = (root / "docs/FLUX2.md").read_text()
+    guide = (root / "docs/flux2/downloads.md").read_text()
     for profile in PROFILES:
         assert f'hf download {profile.repo_id} --exclude "flux-2-klein-*.safetensors"' in guide
     assert "--include" not in guide
@@ -409,7 +433,7 @@ def test_cancel_marks_run_aborted_and_preserves_primaries(tmp_path, monkeypatch)
     def cancel(*args, **kwargs):
         raise KeyboardInterrupt
 
-    monkeypatch.setattr(pipeline, "image_stations", cancel)
+    monkeypatch.setattr(pipeline, "image_stages", cancel)
     output = tmp_path / "image.png"
     output.write_bytes(b"prior image")
     # Cancellation is rendered once at the CLI boundary, as it is for every model.
@@ -476,7 +500,7 @@ def test_replacement_conditioning_does_not_reopen_missing_original(tmp_path, mon
 
 
 def test_saved_conditioning_cannot_silently_replace_explicit_sources(tmp_path):
-    from kinomlx.models.flux2.stations import save_conditioning
+    from kinomlx.models.flux2.text_conditioning import save_conditioning
 
     path = tmp_path / "text.safetensors"
     save_conditioning(path, conditioning(), SamplingRecipe())
@@ -495,7 +519,7 @@ def test_saved_conditioning_cannot_silently_replace_explicit_sources(tmp_path):
 
 def test_explicit_matching_negative_without_prompt_uses_saved_prompt(tmp_path):
     from kinomlx.models.flux2.catalog import Flux2Variant
-    from kinomlx.models.flux2.stations import save_conditioning
+    from kinomlx.models.flux2.text_conditioning import save_conditioning
 
     path = tmp_path / "text.safetensors"
     save_conditioning(path, conditioning(base=True), SamplingRecipe(Flux2Variant.BASE))
@@ -527,7 +551,7 @@ def test_no_generation_selection_requires_a_prompt_or_inspection():
 
 
 def test_decode_after_text_replay_does_not_reopen_original_text(tmp_path, monkeypatch):
-    from kinomlx.models.flux2.stations import save_conditioning
+    from kinomlx.models.flux2.text_conditioning import save_conditioning
 
     _fake_generation(monkeypatch)
     text = tmp_path / "input.safetensors"
@@ -554,7 +578,7 @@ def test_decode_after_text_replay_does_not_reopen_original_text(tmp_path, monkey
     )
     run.write_text(json.dumps(payload))
     monkeypatch.setattr(
-        command, "inspect_resources", lambda *a, **k: pytest.fail("decode reopens sources")
+        command, "prepare_resources", lambda *a, **k: pytest.fail("decode reopens sources")
     )
     monkeypatch.setattr(
         "kinomlx.models.flux2.restart.RestartManifest.resources",
@@ -564,7 +588,7 @@ def test_decode_after_text_replay_does_not_reopen_original_text(tmp_path, monkey
             component=lambda kind: SimpleNamespace(source_path=tmp_path),
         ),
     )
-    monkeypatch.setattr(pipeline, "decode_latents", lambda *a, **k: mx.zeros((64, 64, 3)))
+    monkeypatch.setattr(restart_pipeline, "decode_latents", lambda *a, **k: mx.zeros((64, 64, 3)))
     assert (
         command.run_flux2_command(
             [
@@ -659,7 +683,7 @@ def test_restart_without_current_image_metadata_reports_error(tmp_path, capsys, 
         assert isinstance(json.loads(output.out), dict)
 
 
-@pytest.mark.parametrize("mode", ["sequential", "station", "resident"])
+@pytest.mark.parametrize("mode", ["sequential", "stage", "resident"])
 @pytest.mark.parametrize("failure", [KeyboardInterrupt, RuntimeError])
 def test_finished_seed_files_survive_next_seed_failure(tmp_path, monkeypatch, mode, failure):
     from kinomlx.io.fingerprints import file_sha256
@@ -682,7 +706,7 @@ def test_finished_seed_files_survive_next_seed_failure(tmp_path, monkeypatch, mo
             raise failure("stop remaining seeds")
         return _result()
 
-    monkeypatch.setattr(pipeline, "image_stations", generate)
+    monkeypatch.setattr(pipeline, "image_stages", generate)
     assert main(
         [
             "--model",
@@ -724,20 +748,29 @@ def test_finished_seed_files_survive_next_seed_failure(tmp_path, monkeypatch, mo
     if failure is KeyboardInterrupt:
         # A canceled run is restartable for the image it finished. Its digests
         # were keyed by the planned count, so the artifact still resolves.
-        manifest = RestartManifest.load(Flux2RestartConfig(run=source, index=1))
+        manifest = RestartManifest.load(
+            Flux2RestartConfig(run=source, index=1), schema=config_registry().model("flux2")
+        )
         assert manifest.source_image_count == 2
         assert manifest.artifact("final_latents") == (
             tmp_path / "result-001-seed9_final_latents.safetensors"
         )
-        assert manifest.base_config().values["generate"]["seed"] == 9
+        assert (
+            manifest.base_config(schema=config_registry().model("flux2")).values["generate"]["seed"]
+            == 9
+        )
         # Image 2 was planned and never written.
         with pytest.raises(ValueError, match="image 2 of 2 was not published before cancellation"):
-            RestartManifest.load(Flux2RestartConfig(run=source, index=2))
+            RestartManifest.load(
+                Flux2RestartConfig(run=source, index=2), schema=config_registry().model("flux2")
+            )
     else:
         # A failed run stopped for a reason it cannot describe; the record is
         # not offered to a restart at all.
         with pytest.raises(ValueError, match="completed or canceled"):
-            RestartManifest.load(Flux2RestartConfig(run=source, index=1))
+            RestartManifest.load(
+                Flux2RestartConfig(run=source, index=1), schema=config_registry().model("flux2")
+            )
 
 
 @pytest.mark.parametrize("count", [1, 3])
@@ -815,7 +848,7 @@ def test_klein_internal_failure_is_presented_as_a_model_failure(tmp_path, monkey
     def fail(*args, **kwargs):
         raise RuntimeError("injected internal defect")
 
-    monkeypatch.setattr(pipeline, "image_stations", fail)
+    monkeypatch.setattr(pipeline, "image_stages", fail)
     with caplog.at_level(logging.ERROR, logger="kinomlx"):
         exit_code = command.run_flux2_command(
             [

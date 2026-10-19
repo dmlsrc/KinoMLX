@@ -9,7 +9,12 @@ import objc
 import Quartz
 
 from kinomlx.io.buffer import mlx_array_from_buffer
-from kinomlx.media.signals import ColorPrimaries, ColorTransfer, ExrDeliverySpec
+from kinomlx.media.signals import (
+    ColorPrimaries,
+    ColorTransfer,
+    ExrDeliverySpec,
+    SampleDType,
+)
 
 _OPENEXR_UTI = "com.ilm.openexr-image"
 
@@ -73,7 +78,7 @@ def save_exr_frame(
     delivery: ExrDeliverySpec,
 ) -> Path:
     """Write one finite RGB frame as a native half-float OpenEXR image."""
-    if delivery.sample_type.value != "float16":
+    if delivery.sample_type != SampleDType.FLOAT16:
         raise ValueError("native EXR terminal currently requires float16 samples")
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)

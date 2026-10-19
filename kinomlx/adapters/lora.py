@@ -26,7 +26,7 @@ in SD-pipeline community LoRAs) live in
 
 import math
 from collections.abc import Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import mlx.core as mx
@@ -57,15 +57,23 @@ class LoRAConfig:
     intrinsic ``alpha/rank``. It must be finite; negative and unusually
     large finite values remain available for adapters whose authors call
     for them. The model-specific loader interprets ``exclude`` category names.
+
+    ``source`` keeps the path as selected. Resolution can replace a linked
+    ``adapter_model.safetensors`` with a digest-named blob, and only the selected
+    path and its links still lead to the export's ``adapter_config.json``.
     """
 
     path: Path
     strength: float = 1.0
     exclude: tuple[str, ...] = ()
+    source: Path | None = field(default=None, compare=False)
 
     def __post_init__(self) -> None:
+        selected = Path(self.path).expanduser()
+        if self.source is None:
+            object.__setattr__(self, "source", selected.absolute())
         # Canonical profiles compare resolved file identity, not path spelling.
-        object.__setattr__(self, "path", Path(self.path).expanduser().resolve())
+        object.__setattr__(self, "path", selected.resolve())
         if not math.isfinite(self.strength):
             raise ValueError(f"LoRA strength must be finite, got {self.strength}")
         exclusions = tuple(self.exclude)

@@ -8,6 +8,7 @@ import mlx.core as mx
 
 from kinomlx.adapters.receipt import AdapterReceipt
 from kinomlx.components import ComponentLease
+from kinomlx.modeling.dtypes import resolve_bound_dtype
 from kinomlx.reporting import NullReporter, Reporter, reported_phase
 from kinomlx.seed_execution import SeedModels
 
@@ -81,7 +82,7 @@ class Krea2ImageDecoderProvider(Protocol):
     ) -> ComponentLease[Krea2ImageDecoderPort]: ...
 
 
-class Krea2Components(Krea2TransformerProvider, Krea2ImageDecoderProvider, Protocol):
+class Krea2ComponentsProvider(Krea2TransformerProvider, Krea2ImageDecoderProvider, Protocol):
     """Component surface required by the current Krea implementation phase."""
 
 
@@ -109,7 +110,9 @@ def load_transformer(
             load_krea2_transformer_weights(
                 model,
                 source_bindings=resources.transformer.bindings,
-                expected_dtype=resources.transformer.dtype_policy,
+                expected_dtype=resolve_bound_dtype(
+                    resources.transformer.dtype_policy, owner="Krea 2 transformer"
+                ),
             )
         if adapter_plan is not None and adapter_plan.adapters:
             with reported_phase(sink, "fuse adapters"):
@@ -137,15 +140,16 @@ def load_image_decoder(
     try:
         sink = reporter if reporter is not None else NullReporter()
         with reported_phase(sink, "load VAE"):
+            vae_dtype = resolve_bound_dtype(resources.vae.dtype_policy, owner="Krea 2 VAE")
             model = Krea2ImageDecoder(
                 resources.vae_config,
-                compute_dtype=resources.vae.dtype_policy,
+                compute_dtype=vae_dtype,
                 output_scale=resources.vae_decoder.output_scale,
             )
             load_krea2_vae_weights(
                 model,
                 source_bindings=resources.vae.bindings,
-                expected_dtype=resources.vae.dtype_policy,
+                expected_dtype=vae_dtype,
             )
             mx.eval(model.parameters())
         port: Krea2ImageDecoderPort = model
@@ -157,7 +161,7 @@ def load_image_decoder(
 
 
 @dataclass(frozen=True)
-class NativeKrea2Components:
+class Krea2Components:
     """Default native provider with no retained heavyweight component."""
 
     reporter: Reporter | None = None
@@ -179,21 +183,21 @@ class NativeKrea2Components:
 
 __all__ = [
     "Krea2Components",
+    "Krea2ComponentsProvider",
     "Krea2ImageDecoderPort",
     "Krea2ImageDecoderProvider",
     "Krea2TransformerPort",
     "Krea2TransformerProvider",
-    "NativeKrea2Components",
     "load_image_decoder",
     "load_transformer",
 ]
 
 
 @dataclass(frozen=True)
-class SeedKrea2Components:
-    """Borrow request-owned components while preserving the normal station ports."""
+class Krea2SeedComponents:
+    """Borrow request-owned components while preserving the normal stage ports."""
 
-    base: Krea2Components
+    base: Krea2ComponentsProvider
     models: SeedModels
 
     def transformer(

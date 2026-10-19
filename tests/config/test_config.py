@@ -21,19 +21,19 @@ from kinomlx.config import (
 
 def test_recursive_merge_preserves_tables_and_replaces_arrays() -> None:
     base = {
-        "generate": {"width": 1024, "image": {"path": "a.png", "strength": 0.5}},
+        "generate": {"width": 1024, "hdr_reference": {"path": "a.mov", "strength": 0.5}},
         "items": [1, 2],
     }
     overlay = {
-        "generate": {"image": {"strength": 0.9}},
+        "generate": {"hdr_reference": {"strength": 0.9}},
         "items": [3],
     }
     merged = merge_configs(base, overlay)
     assert merged == {
-        "generate": {"width": 1024, "image": {"path": "a.png", "strength": 0.9}},
+        "generate": {"width": 1024, "hdr_reference": {"path": "a.mov", "strength": 0.9}},
         "items": [3],
     }
-    assert base["generate"]["image"]["strength"] == 0.5
+    assert base["generate"]["hdr_reference"]["strength"] == 0.5
 
 
 def test_load_config_wraps_file_and_toml_errors(tmp_path: Path) -> None:
@@ -64,13 +64,13 @@ def test_set_values_use_toml_types(raw: str, expected: tuple[list[str], object])
 
 
 def test_set_applies_in_order_and_copies_nested_tables() -> None:
-    base = {"generate": {"image": {"path": "a.png", "strength": 0.5}}}
+    base = {"generate": {"hdr_reference": {"path": "a.mov", "strength": 0.5}}}
     final = apply_set_overrides(
         base,
-        ["generate.image.strength=0.7", "generate.image.strength=0.9"],
+        ["generate.hdr_reference.strength=0.7", "generate.hdr_reference.strength=0.9"],
     )
-    assert final["generate"]["image"]["strength"] == 0.9
-    assert base["generate"]["image"]["strength"] == 0.5
+    assert final["generate"]["hdr_reference"]["strength"] == 0.9
+    assert base["generate"]["hdr_reference"]["strength"] == 0.5
 
 
 def test_set_can_replace_a_root_scalar() -> None:
@@ -89,19 +89,19 @@ def test_dump_round_trips_nested_values_and_paths() -> None:
         "model": "ltx2",
         "generate": {
             "prompt": "line one\nline two",
-            "image": {"path": Path("frame.png"), "strength": 0.9},
+            "hdr_reference": {"path": Path("reference.mov"), "strength": 0.9},
         },
         "output": {"path": Path("out.mp4"), "quality": 0.65},
     }
     rendered = dump_config(config)
-    assert "[generate.image]" in rendered
-    assert "image = {" not in rendered
+    assert "[generate.hdr_reference]" in rendered
+    assert "hdr_reference = {" not in rendered
     parsed = tomllib.loads(rendered)
     assert parsed == {
         "model": "ltx2",
         "generate": {
             "prompt": "line one\nline two",
-            "image": {"path": "frame.png", "strength": 0.9},
+            "hdr_reference": {"path": "reference.mov", "strength": 0.9},
         },
         "output": {"path": "out.mp4", "quality": 0.65},
     }
@@ -111,13 +111,13 @@ def test_dump_omits_empty_tables_instead_of_looking_truncated() -> None:
     rendered = dump_config(
         {
             "model": "ltx2",
-            "generate": {"prompt": "test", "image": {}},
+            "generate": {"prompt": "test", "hdr_reference": {}},
             "model_artifacts": {},
         }
     )
 
     assert "[generate]" in rendered
-    assert "[generate.image]" not in rendered
+    assert "[generate.hdr_reference]" not in rendered
     assert "[model_artifacts]" not in rendered
 
 

@@ -3,6 +3,7 @@
 from dataclasses import dataclass
 from pathlib import Path
 
+from kinomlx._json import JsonObject
 from kinomlx.memory_policy import MLXMemoryPolicy
 from kinomlx.reporting import NullReporter, Reporter
 from kinomlx.settings import Settings
@@ -18,6 +19,28 @@ class GMNetResources:
     weights_path: Path
     spec: GMNetVariantSpec
     memory_policy: MLXMemoryPolicy = MLXMemoryPolicy()
+
+    def describe(self) -> JsonObject:
+        """Report the resolved checkpoint and its numeric contract.
+
+        One checkpoint with no per-component records has nothing to say about
+        bindings, graph identities or tensor accounting, so this report stays
+        the resolved path, the variant facts and the memory policy rather than
+        inventing structure to resemble a multi-component family.
+        """
+        return {
+            "model": "gmnet",
+            "variant": self.spec.variant.value,
+            "weights": str(self.weights_path),
+            "network_scale": self.spec.network_scale,
+            "peak_over_sdr_white": self.spec.peak_over_sdr_white,
+            "gain_stops": self.spec.gain_stops,
+            "sdr_reference_white_nits": self.spec.sdr_reference_white_nits,
+            "memory_policy": {
+                "cache_limit_gb": self.memory_policy.cache_limit_gb,
+                "wired_limit_gb": self.memory_policy.wired_limit_gb,
+            },
+        }
 
 
 def prepare_resources(

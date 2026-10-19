@@ -178,7 +178,7 @@ def test_prepared_edit_reuses_fixed_products_and_matches_unprepared(
     from kinomlx.models.krea2.transformer import Krea2Transformer
     from kinomlx.models.krea2.transformer.loading import transformer_weight_targets
 
-    from ._transformer_fixtures import populate_transformer, tiny_transformer_config
+    from .transformer._fixtures import populate_transformer, tiny_transformer_config
 
     model = Krea2Transformer(tiny_transformer_config())
     populate_transformer(model, transformer_weight_targets(model), dtype=dtype)

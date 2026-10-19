@@ -9,13 +9,13 @@ from collections.abc import Callable
 from dataclasses import dataclass, replace
 from pathlib import Path
 from types import TracebackType
-from typing import Literal
 
 import mlx.core as mx
 
 from kinomlx.config_records import supplied_fields
 from kinomlx.config_rules import validate_record
 from kinomlx.debug.metadata import selected_execution_sidecar_paths
+from kinomlx.image_restart_config import ImageStage
 from kinomlx.io.atomic import atomic_output_path
 from kinomlx.io.fingerprints import file_sha256
 from kinomlx.io.image import save_image
@@ -274,7 +274,7 @@ def plan_krea2_output(
     config: ImageOutputConfig,
     *,
     base: Path | None = None,
-    station: Literal["generate", "decode", "denoise"] = "generate",
+    stage: ImageStage = ImageStage.TEXT,
 ) -> Krea2OutputPlan:
     """Resolve a bundle, optionally using an app-selected generated run stem."""
     validate_record(config, location="[output]")
@@ -312,7 +312,7 @@ def plan_krea2_output(
     save_initial_noise = OUTPUT_POLICIES["save_initial_noise"].selected_for_recipe(
         config.save_initial_noise,
         save_all=config.save_all_sidecars,
-        station=station,
+        stage=stage,
         field="save_initial_noise",
         recipe_mode=recipe_mode,
         explicitly_supplied="save_initial_noise" in explicit_output,
@@ -320,7 +320,7 @@ def plan_krea2_output(
     save_final_latents = OUTPUT_POLICIES["save_final_latents"].selected_for_recipe(
         config.save_final_latents,
         save_all=config.save_all_sidecars,
-        station=station,
+        stage=stage,
         field="save_final_latents",
         recipe_mode=recipe_mode,
         explicitly_supplied="save_final_latents" in explicit_output,
@@ -328,7 +328,7 @@ def plan_krea2_output(
     save_text_conditioning = OUTPUT_POLICIES["save_text_conditioning"].selected_for_recipe(
         config.save_text_conditioning,
         save_all=config.save_all_sidecars,
-        station=station,
+        stage=stage,
         field="save_text_conditioning",
         recipe_mode=recipe_mode,
         explicitly_supplied="save_text_conditioning" in explicit_output,
@@ -394,7 +394,7 @@ class Krea2OutputSink:
         *,
         reservation: BundleReservation[Krea2OutputPlan],
     ) -> None:
-        """Publish one image and its requested tensor stations before the next seed."""
+        """Publish one image and its requested tensor stages before the next seed."""
         if index in self.completed:
             raise ValueError("Seed output was already published")
         child = replace(self.plan, artifacts=self.plan.seed_artifacts(index), execution_sidecars=())

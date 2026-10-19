@@ -8,7 +8,7 @@ import pytest
 
 from kinomlx.cli.main import main
 from kinomlx.config.inspection import configuration_inventory
-from kinomlx.config.stations import StationPolicy
+from kinomlx.config.stages import StagePolicy
 from kinomlx.config_surfaces import STRUCTURED_SURFACES
 from kinomlx.model_registry import config_registry
 
@@ -33,40 +33,41 @@ def test_inspection_covers_every_registered_field_without_source_resolution(mode
     json.dumps(result)
 
 
-def test_inspection_has_real_boolean_flags_rules_and_station_projection():
+def test_inspection_has_real_boolean_flags_rules_and_stage_projection():
     schema = config_registry().model("krea2")
     fields = {field["path"]: field for field in configuration_inventory(schema)["fields"]}
     assert fields["settings.verbose"]["cli"]["flags"] == ["--verbose", "--no-verbose"]
     assert fields["settings.verbose"]["environment"] == ["KINO_VERBOSE"]
-    assert fields["generate.prompt"]["station_policies"] == [
+    assert fields["generate.prompt"]["stage_policies"] == [
         {
-            "station": station,
+            "stage": stage,
             "mode": "locked",
             "projection": "prompts",
             "reason": policy.reason,
             "irrelevant_action": None,
         }
-        for station, policy in zip(
+        for stage, policy in zip(
             ("denoise", "decode"),
-            schema.field(("generate", "prompt")).station_policies,
+            schema.field(("generate", "prompt")).stage_policies,
             strict=True,
         )
     ]
-    assert fields["generate.prompt"]["station_coverage"] == "registered"
-    assert fields["output.prefix"]["station_coverage"] == "registered"
+    assert fields["generate.prompt"]["stage_coverage"] == "registered"
+    assert fields["output.prefix"]["stage_coverage"] == "registered"
     assert fields["generate.seed"]["persistence_policy"] == "intent"
     assert any(
         rule["phase"] == "source" for rule in fields["generate.prompt_file"]["normalization"]
     )
 
 
-def test_inspection_states_when_a_model_has_no_restart_station():
+def test_inspection_states_when_a_model_has_no_restart_stage():
     inventory = configuration_inventory(config_registry().model("gmnet"))
-    assert inventory["restart"]["stations"] == []
-    assert "no saved restart station" in inventory["restart"]["unavailable_reason"]
-    coverage = {field["station_coverage"] for field in inventory["fields"]}
+    assert inventory["restart"]["stages"] == ["expand"]
+    assert inventory["restart"]["restart_stages"] == []
+    assert "no saved restart stage" in inventory["restart"]["unavailable_reason"]
+    coverage = {field["stage_coverage"] for field in inventory["fields"]}
     assert coverage == {"no_restart", "source_virtual"}
-    assert all(field["station_policies"] == [] for field in inventory["fields"])
+    assert all(field["stage_policies"] == [] for field in inventory["fields"])
 
 
 def test_policy_change_appears_without_editing_inventory_consumer():
@@ -77,9 +78,9 @@ def test_policy_change_appears_without_editing_inventory_consumer():
             fields=tuple(
                 replace(
                     field,
-                    station_policies=(
-                        StationPolicy("denoise", "locked", reason="An edited policy still locks."),
-                        StationPolicy("decode", "locked", reason="An edited policy still locks."),
+                    stage_policies=(
+                        StagePolicy("denoise", "locked", reason="An edited policy still locks."),
+                        StagePolicy("decode", "locked", reason="An edited policy still locks."),
                     ),
                 )
                 if field.name == "width"
@@ -92,7 +93,7 @@ def test_policy_change_appears_without_editing_inventory_consumer():
         for table in schema.tables
     )
     changed = configuration_inventory(replace(schema, tables=tables), field="generate.width")
-    assert changed["fields"][0]["station_policies"][0]["mode"] == "locked"
+    assert changed["fields"][0]["stage_policies"][0]["mode"] == "locked"
 
 
 def test_inspect_cli_filters_and_reports_unknown_field(capsys):
@@ -107,7 +108,7 @@ def test_inspect_cli_filters_and_reports_unknown_field(capsys):
 def test_inspection_distinguishes_required_none_and_factory_defaults():
     schema = config_registry().model("ltx2")
     fields = {item["path"]: item for item in configuration_inventory(schema)["fields"]}
-    required = fields["generate.image.path"]
+    required = fields["generate.hdr_reference.path"]
     optional = fields["settings.profile_signpost_log"]
     factory = fields["settings.app_cache_dir"]
     assert required["default_kind"] == "required"

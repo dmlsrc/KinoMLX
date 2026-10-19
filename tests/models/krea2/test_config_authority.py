@@ -1,4 +1,4 @@
-"""Krea station, source, and public recipe configuration decisions."""
+"""Krea stage, source, and public recipe configuration decisions."""
 
 import json
 from pathlib import Path
@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from kinomlx.api_boundaries import ConfigurationOwner
+from kinomlx.cli.resource_operation import Operation
 from kinomlx.config import ConfigError
 from kinomlx.io.output_config import ImageOutputConfig
 from kinomlx.models.krea2.arguments import build_parser
@@ -19,12 +20,13 @@ from kinomlx.settings import Settings
 from .test_restart import _write_latents, _write_run, _write_text_conditioning
 
 
-def _station_records(
+def _stage_records(
     *, model_settings: Krea2Settings | None = None, restart: RestartConfig | None = None
 ) -> dict[str, object]:
     return {
         "settings": Settings(),
         "model_settings": model_settings or Krea2Settings(),
+        "operation": Operation(),
         "generate": Krea2Request(prompt="scene"),
         "output": ImageOutputConfig(),
         "restart": restart or RestartConfig(run=Path("source.json")),
@@ -32,7 +34,7 @@ def _station_records(
 
 
 @pytest.mark.parametrize(
-    ("station", "model_settings", "expected"),
+    ("stage", "model_settings", "expected"),
     [
         ("denoise", Krea2Settings(source_path=Path("other")), (("model_settings", "source_path"),)),
         ("decode", Krea2Settings(source_path=Path("other")), (("model_settings", "source_path"),)),
@@ -46,30 +48,28 @@ def _station_records(
         ("decode", Krea2Settings(vae_dtype="float16"), ()),
     ],
 )
-def test_model_settings_follow_the_consumer_station(
-    station: str, model_settings: Krea2Settings, expected: tuple[tuple[str, str], ...]
+def test_model_settings_follow_the_consumer_stage(
+    stage: str, model_settings: Krea2Settings, expected: tuple[tuple[str, str], ...]
 ) -> None:
-    changed = CONFIG_SCHEMA.station_changes(
-        _station_records(model_settings=model_settings),
-        _station_records(),
-        station=station,
+    changed = CONFIG_SCHEMA.stage_changes(
+        _stage_records(model_settings=model_settings),
+        _stage_records(),
+        stage=stage,
         active_explicit=frozenset({("model_settings", field) for _, field in expected}),
     )
     assert changed == expected
 
 
 def test_restart_latent_selector_rejects_same_valued_explicit_denoise_input() -> None:
-    parent = _station_records(restart=RestartConfig(run=Path("source.json"), phase="denoise"))
+    parent = _stage_records(restart=RestartConfig(run=Path("source.json"), stage="denoise"))
     assert (
-        CONFIG_SCHEMA.station_changes(
-            parent, parent, station="denoise", active_explicit=frozenset()
-        )
+        CONFIG_SCHEMA.stage_changes(parent, parent, stage="denoise", active_explicit=frozenset())
         == ()
     )
-    assert CONFIG_SCHEMA.station_changes(
+    assert CONFIG_SCHEMA.stage_changes(
         parent,
         parent,
-        station="denoise",
+        stage="denoise",
         active_explicit=frozenset({("restart", "latents")}),
     ) == (("restart", "latents"),)
 
@@ -84,9 +84,9 @@ def _source_run(tmp_path: Path) -> Path:
     return run
 
 
-def _assemble_restart(run: Path, phase: str, *args: str):
+def _assemble_restart(run: Path, stage: str, *args: str):
     return assemble(
-        build_parser().parse_args(["--restart", str(run), "--restart-from", phase, *args]),
+        build_parser().parse_args(["--restart", str(run), "--restart-from", stage, *args]),
         base_settings=Settings(),
     )
 

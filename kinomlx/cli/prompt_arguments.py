@@ -1,6 +1,7 @@
 """Shared prompt controls and prompt-file resolution at the invocation boundary."""
 
 from kinomlx.config import CliBinding, ConfigFieldSpec
+from kinomlx.config_bindings import CliAction
 from kinomlx.config_surfaces import CONFIG_SURFACES
 
 
@@ -13,7 +14,7 @@ def prompt_unconditional_field(*, groups: frozenset[str] = frozenset()) -> Confi
         valid="boolean; exclusive with nonempty prompt or prompt_file",
         example=True,
         cli_dest="prompt_unconditional",
-        cli=CliBinding("Generation", action="boolean"),
+        cli=CliBinding("Generation", action=CliAction.BOOLEAN),
         groups=groups,
         surfaces=CONFIG_SURFACES,
     )

@@ -8,7 +8,8 @@ from pathlib import Path
 from kinomlx.config import ConfigError
 from kinomlx.config.inspection import configuration_inventory
 from kinomlx.io.atomic import write_text_exclusive
-from kinomlx.model_registry import DEFAULT_MODEL, config_registry
+from kinomlx.model_catalog import DEFAULT_MODEL
+from kinomlx.model_registry import config_registry
 from kinomlx.ui import configure_machine_output
 
 from .config_templates import config_template, template_models

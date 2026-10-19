@@ -14,15 +14,13 @@ from kinomlx.models.ltx2.arguments import build_parser
 from kinomlx.weights.cli import build_generic_convert_parser, build_weights_parser
 
 _ROOT = Path(__file__).resolve().parents[2]
+# Every user guide; the contributor documents describe the code, not the command line.
+_CONTRIBUTOR_DOCUMENTS = frozenset({"CONVENTIONS.md", "STRUCTURE.md"})
 _PUBLIC_DOCUMENTS = (
     _ROOT / "README.md",
-    _ROOT / "docs" / "WEIGHTS.md",
-    _ROOT / "docs" / "PERFORMANCE.md",
-    _ROOT / "docs" / "ADAPTERS.md",
-    _ROOT / "docs" / "LTX2.md",
-    _ROOT / "docs" / "GMNET.md",
-    _ROOT / "docs" / "KREA2.md",
-    _ROOT / "docs" / "FLUX2.md",
+    *sorted(
+        path for path in (_ROOT / "docs").rglob("*.md") if path.name not in _CONTRIBUTOR_DOCUMENTS
+    ),
 )
 _LONG_FLAG = re.compile(r"--[a-z0-9][a-z0-9-]*")
 _FENCED_BLOCK = re.compile(r"```[^\n]*\n(.*?)```", re.DOTALL)
@@ -38,7 +36,8 @@ def _option_strings(parser: argparse.ArgumentParser) -> set[str]:
 
 
 def _documented_flags(readme: str) -> set[str]:
-    flags = set(re.findall(r"`(--[a-z0-9][a-z0-9-]*)", readme))
+    # Markdown code spans and the HTML <code> cells of the argument catalogs.
+    flags = set(re.findall(r"(?:`|<code>)(--[a-z0-9][a-z0-9-]*)", readme))
     for block in _FENCED_BLOCK.findall(readme):
         logical_lines = re.sub(r"\\[ \t]*\n[ \t]*", " ", block)
         for line in logical_lines.splitlines():
@@ -55,7 +54,9 @@ def _public_documentation() -> str:
 def test_documented_flags_and_environment_names_are_executable() -> None:
     documentation = _public_documentation()
     documented_flags = _documented_flags(documentation)
-    documented_environment = set(re.findall(r"`((?:KINO_[A-Z0-9_]+|HF_HOME))`", documentation))
+    documented_environment = set(
+        re.findall(r"(?:`|<code>)((?:KINO_[A-Z0-9_]+|HF_HOME))(?:`|</code>)", documentation)
+    )
     parsers = (
         build_parser(),
         build_gmnet_parser(),

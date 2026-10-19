@@ -9,18 +9,16 @@ from kinomlx.cli.config_arguments import add_config_arguments
 from kinomlx.config import dataclass_from_mapping
 from kinomlx.config_records import record_intent, supplied_fields, tracks_presence
 from kinomlx.models.gmnet.config_schema import CONFIG_SCHEMA
-from kinomlx.models.gmnet.pipeline import expand_gmnet
+from kinomlx.models.gmnet.pipelines import expand_gmnet
 from kinomlx.models.gmnet.resources import prepare_resources
 from kinomlx.models.gmnet.types import GMNetExpandConfig, GMNetRequest
 
 
-def test_gmnet_explicitly_has_no_saved_restart_station():
-    assert CONFIG_SCHEMA.restart_stations == ()
+def test_gmnet_explicitly_has_no_saved_restart_stage():
+    assert CONFIG_SCHEMA.restart_stages == ()
     assert CONFIG_SCHEMA.no_restart_reason
-    assert all(not table.stations for table in CONFIG_SCHEMA.tables)
-    assert all(
-        not field.station_policies for table in CONFIG_SCHEMA.tables for field in table.fields
-    )
+    assert all(not table.stages for table in CONFIG_SCHEMA.tables)
+    assert all(not field.stage_policies for table in CONFIG_SCHEMA.tables for field in table.fields)
     variables = CONFIG_SCHEMA.environment_variables()
     assert variables[("output", "path")][0] == "KINO_GMNET_OUTPUT_PATH"
     assert variables[("output", "directory")][0] == "KINO_GMNET_OUTPUT_DIR"

@@ -28,13 +28,12 @@ def field_paths(
 ) -> frozenset[tuple[str, ...]]:
     """Return present leaf identities; an empty group supplies no member assignment."""
     return frozenset(
-        path
-        for name, value in config.items()
-        for path in (
+        *(
             field_paths(cast(Mapping[str, object], value), (*prefix, name))
             if isinstance(value, Mapping)
             else ((*prefix, name),)
         )
+        for name, value in config.items()
     )
 
 

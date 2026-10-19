@@ -74,7 +74,7 @@ def configuration_inventory(
                 )
             )
             cli = {
-                "flags": [flag for action in actions for flag in action.option_strings],
+                "flags": [*action.option_strings for action in actions],
                 "destination": declaration.cli_dest,
                 "item_member": declaration.cli_item,
                 "action": "record_items"
@@ -139,22 +139,22 @@ def configuration_inventory(
                     for implication in schema.implications
                     if path == implication.trigger or path in dict(implication.implied)
                 ],
-                "station_policies": [
+                "stage_policies": [
                     {
-                        "station": policy.station,
+                        "stage": policy.stage,
                         "mode": policy.mode,
                         "reason": policy.reason,
                         "irrelevant_action": policy.irrelevant_action,
                         "projection": policy.attribute or declaration.name,
                     }
-                    for policy in declaration.station_policies
+                    for policy in declaration.stage_policies
                 ],
-                "station_coverage": "source_virtual"
+                "stage_coverage": "source_virtual"
                 if declaration.virtual
                 else "registered"
-                if table is not None and table.stations
+                if table is not None and table.stages
                 else "no_restart"
-                if schema.restart_stations == ()
+                if schema.restart_stages == ()
                 else "not_registered",
                 "serialization": {
                     "strip": declaration.strip,
@@ -174,7 +174,8 @@ def configuration_inventory(
     return {
         "model": schema.model,
         "restart": {
-            "stations": list(schema.restart_stations),
+            "stages": list(schema.stages),
+            "restart_stages": list(schema.restart_stages),
             "unavailable_reason": schema.no_restart_reason,
         },
         "api_boundaries": [boundary.describe() for boundary in schema.api_boundaries],

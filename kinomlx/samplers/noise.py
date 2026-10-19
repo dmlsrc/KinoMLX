@@ -130,7 +130,7 @@ def _validate_backend(backend: str) -> NoiseBackend:
 def noise_compatibility_profile(backend: NoiseBackend) -> str:
     """Return the stable implementation identity recorded in run receipts."""
     selected = _validate_backend(backend)
-    if selected == "torch-mps":
+    if selected == NoiseBackend.TORCH_MPS:
         return TORCH_MPS_COMPATIBILITY_PROFILE
     return MLX_COMPATIBILITY_PROFILE
 
@@ -275,7 +275,7 @@ class MLXNormalNoiseStream:
     @property
     def state(self) -> NoiseStreamState:
         return NoiseStreamState(
-            backend="mlx",
+            backend=NoiseBackend.MLX,
             compatibility_profile=MLX_COMPATIBILITY_PROFILE,
             seed=self._seed,
             draws=self._position.draws,
@@ -328,7 +328,7 @@ class TorchMPSNormalNoiseStream:
     @property
     def state(self) -> NoiseStreamState:
         return NoiseStreamState(
-            backend="torch-mps",
+            backend=NoiseBackend.TORCH_MPS,
             compatibility_profile=TORCH_MPS_COMPATIBILITY_PROFILE,
             seed=self._seed,
             draws=self._position.draws,
@@ -373,7 +373,7 @@ def create_normal_noise_stream(
 ) -> NormalNoiseStream:
     """Create one seeded stream, optionally at a saved draw boundary."""
     selected = _validate_backend(backend)
-    if selected == "torch-mps":
+    if selected == NoiseBackend.TORCH_MPS:
         return TorchMPSNormalNoiseStream(seed, position=position)
     return MLXNormalNoiseStream(seed, position=position)
 

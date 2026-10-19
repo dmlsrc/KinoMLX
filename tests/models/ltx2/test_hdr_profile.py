@@ -16,9 +16,9 @@ from kinomlx.models.ltx2.hdr_profile import (
     validate_hdr_adapter_placement,
 )
 from kinomlx.models.ltx2.types import (
-    DistilledRequest,
-    HDRReferenceConditioningConfig,
-    ImageConditioningConfig,
+    LTX2HDRReferenceConditioningConfig,
+    LTX2ImageConditioningConfig,
+    LTX2Request,
 )
 
 
@@ -49,6 +49,7 @@ def _receipt(path: Path, *, placed: int, complete: int) -> LTX2AdapterReceipt:
         complete_targets=complete,
         placed_targets=placed,
         structural_coverage=placed / complete if complete else 0.0,
+        bare_parameter_targets=0,
         target_categories=(),
         skipped_reasons=(),
         effective=placed > 0,
@@ -59,13 +60,13 @@ def _receipt(path: Path, *, placed: int, complete: int) -> LTX2AdapterReceipt:
 
 def test_ltx25_native_hdr_resolves_acescct_without_adapter() -> None:
     facts = resolve_hdr_recipe(
-        DistilledRequest(
+        LTX2Request(
             prompt="test",
             width=64,
             height=64,
             frames=9,
             hdr="ACESCG",
-            image=ImageConditioningConfig(Path("condition.exr")),
+            images=(LTX2ImageConditioningConfig(Path("condition.exr")),),
         ),
         _resources("2.5", native_hdr=True),
     )
@@ -80,18 +81,18 @@ def test_ltx25_native_hdr_rejects_unanchored_t2v_and_sdr_condition() -> None:
     resources = _resources("2.5", native_hdr=True)
     with pytest.raises(ValueError, match="image-to-video from an HDR EXR condition"):
         resolve_hdr_recipe(
-            DistilledRequest(prompt="test", width=64, height=64, frames=9, hdr="ACESCG"),
+            LTX2Request(prompt="test", width=64, height=64, frames=9, hdr="ACESCG"),
             resources,
         )
     with pytest.raises(ValueError, match="SDR-only generation remain SDR"):
         resolve_hdr_recipe(
-            DistilledRequest(
+            LTX2Request(
                 prompt="test",
                 width=64,
                 height=64,
                 frames=9,
                 hdr="ACESCG",
-                image=ImageConditioningConfig(Path("condition.png")),
+                images=(LTX2ImageConditioningConfig(Path("condition.png")),),
             ),
             resources,
         )
@@ -104,14 +105,14 @@ def test_ltx23_hdr_uses_declared_facts_not_filename_or_hash(tmp_path: Path) -> N
         reference_downscale_factor="1",
     )
     facts = resolve_hdr_recipe(
-        DistilledRequest(
+        LTX2Request(
             prompt="test",
             width=64,
             height=64,
             frames=9,
             hdr="SRGB_LINEAR",
             adapters=(LTX2AdapterConfig(path=adapter),),
-            hdr_reference=HDRReferenceConditioningConfig(Path("reference.mp4")),
+            hdr_reference=LTX2HDRReferenceConditioningConfig(Path("reference.mp4")),
         ),
         _resources("2.3"),
     )
@@ -140,7 +141,7 @@ def test_ltx23_hdr_rejects_missing_or_unsupported_recipe_facts(
     message: str,
 ) -> None:
     adapter = _adapter(tmp_path / "adapter.safetensors", **metadata)
-    request = DistilledRequest(
+    request = LTX2Request(
         prompt="test",
         width=64,
         height=64,
@@ -160,7 +161,7 @@ def test_ltx23_hdr_rejects_text_only_until_real_generation_is_validated(
         hdr_transform="logc3",
         reference_downscale_factor="1",
     )
-    request = DistilledRequest(
+    request = LTX2Request(
         prompt="test",
         width=64,
         height=64,
@@ -180,7 +181,7 @@ def test_generic_companion_lora_does_not_change_hdr_profile_selection(tmp_path: 
     )
     style = _adapter(tmp_path / "style.safetensors")
     facts = resolve_hdr_recipe(
-        DistilledRequest(
+        LTX2Request(
             prompt="test",
             width=64,
             height=64,
@@ -190,7 +191,7 @@ def test_generic_companion_lora_does_not_change_hdr_profile_selection(tmp_path: 
                 LTX2AdapterConfig(path=style),
                 LTX2AdapterConfig(path=hdr),
             ),
-            hdr_reference=HDRReferenceConditioningConfig(Path("reference.mp4")),
+            hdr_reference=LTX2HDRReferenceConditioningConfig(Path("reference.mp4")),
         ),
         _resources("2.3"),
     )
@@ -205,14 +206,14 @@ def test_hdr_adapter_requires_complete_structural_placement(tmp_path: Path) -> N
         reference_downscale_factor="1",
     )
     facts = resolve_hdr_recipe(
-        DistilledRequest(
+        LTX2Request(
             prompt="test",
             width=64,
             height=64,
             frames=9,
             hdr="ACESCG",
             adapters=(LTX2AdapterConfig(path=adapter),),
-            hdr_reference=HDRReferenceConditioningConfig(Path("reference.mp4")),
+            hdr_reference=LTX2HDRReferenceConditioningConfig(Path("reference.mp4")),
         ),
         _resources("2.3"),
     )

@@ -6,8 +6,8 @@ from ._contracts import (
     EMPTY_PROFILE,
     AdapterSpec,
     ContractResources,
-    DistilledRequest,
     LoraProfile,
+    LTX2Request,
     RecordingComponents,
     assert_balanced,
     effective_profile,
@@ -35,7 +35,7 @@ def test_lora_profile_transition_table(
 ) -> None:
     components = RecordingComponents()
     output = run_distilled_contract(
-        DistilledRequest(
+        LTX2Request(
             stage_1_profile=stage_1,
             stage_2_profile=stage_2,
             generate_audio=False,

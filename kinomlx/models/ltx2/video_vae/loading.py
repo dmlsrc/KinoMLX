@@ -10,21 +10,22 @@ from kinomlx.io.safetensors import load_weights, read_metadata
 from kinomlx.reporting import NullReporter, Reporter
 
 from .config import VideoVAEConfig
-from .decoder import NativeConv3dVideoDecoder, load_native_vae_decoder_weights
+from .decoder import Conv3dVideoDecoder, load_vae_decoder_weights
 from .diffusion_decoder import (
-    NativeDiffusionVideoDecoder,
+    DiffusionVideoDecoder,
     load_diffusion_video_decoder_weights,
 )
-from .encoder import NativeConv3dVideoEncoder, load_native_vae_encoder_weights
+from .encoder import Conv3dVideoEncoder, load_vae_encoder_weights
+from .kinds import VideoVAEKind
 
 
 @dataclass(frozen=True)
-class NativeVideoVAE:
+class VideoVAE:
     """A matched native encoder/decoder pair and its checkpoint config."""
 
     config: VideoVAEConfig
-    encoder: NativeConv3dVideoEncoder
-    decoder: NativeConv3dVideoDecoder | NativeDiffusionVideoDecoder
+    encoder: Conv3dVideoEncoder
+    decoder: Conv3dVideoDecoder | DiffusionVideoDecoder
 
 
 def _config_for_artifact(
@@ -46,13 +47,13 @@ def _config_for_artifact(
     )
 
 
-def load_native_video_vae(
+def load_video_vae(
     path: Path | str,
     *,
     config: VideoVAEConfig | None = None,
     compute_dtype: mx.Dtype = mx.bfloat16,
     reporter: Reporter | None = None,
-) -> NativeVideoVAE:
+) -> VideoVAE:
     """Build a complete VAE from a checkpoint with constructor metadata or an explicit config."""
     checkpoint = Path(path)
     sink = reporter if reporter is not None else NullReporter()
@@ -65,29 +66,29 @@ def load_native_video_vae(
         weights = load_weights(checkpoint)
         sink.phase_advance(phase)
         try:
-            encoder = NativeConv3dVideoEncoder(
+            encoder = Conv3dVideoEncoder(
                 resolved_config,
                 compute_dtype=compute_dtype,
             )
-            load_native_vae_encoder_weights(encoder, weights)
+            load_vae_encoder_weights(encoder, weights)
             sink.phase_advance(phase)
 
-            decoder: NativeConv3dVideoDecoder | NativeDiffusionVideoDecoder
-            if resolved_config.decoder_kind == "diffusion-na":
-                decoder = NativeDiffusionVideoDecoder(
+            decoder: Conv3dVideoDecoder | DiffusionVideoDecoder
+            if resolved_config.decoder_kind == VideoVAEKind.DIFFUSION:
+                decoder = DiffusionVideoDecoder(
                     resolved_config,
                     compute_dtype=compute_dtype,
                 )
                 load_diffusion_video_decoder_weights(decoder, weights)
             else:
-                decoder = NativeConv3dVideoDecoder(
+                decoder = Conv3dVideoDecoder(
                     resolved_config,
                     compute_dtype=compute_dtype,
                 )
-                load_native_vae_decoder_weights(decoder, weights)
+                load_vae_decoder_weights(decoder, weights)
             sink.phase_advance(phase)
 
-            return NativeVideoVAE(
+            return VideoVAE(
                 config=resolved_config,
                 encoder=encoder,
                 decoder=decoder,
@@ -100,4 +101,4 @@ def load_native_video_vae(
         sink.phase_end(phase)
 
 
-__all__ = ["NativeVideoVAE", "load_native_video_vae"]
+__all__ = ["VideoVAE", "load_video_vae"]

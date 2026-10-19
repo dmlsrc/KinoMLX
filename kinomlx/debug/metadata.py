@@ -7,6 +7,7 @@ from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 
+from kinomlx.config import ModelConfigSpec
 from kinomlx.config.persistence import RUN_SCHEMA_VERSION, configuration_payload
 from kinomlx.config.provenance import PreparedConfig
 from kinomlx.errors import KinoMLXError
@@ -178,7 +179,7 @@ class RunRecord:
         self,
         path: Path,
         *,
-        model: str,
+        schema: ModelConfigSpec,
         effective_config: Mapping[str, object],
         config_intent: PreparedConfig,
         argv: list[str],
@@ -197,9 +198,9 @@ class RunRecord:
             "schema_version": RUN_SCHEMA_VERSION,
             "status": "started",
             "started_at": datetime.now(UTC).isoformat(),
-            "model": model,
+            "model": schema.model,
             "argv": list(argv),
-            "configuration": configuration_payload(model, config_intent),
+            "configuration": configuration_payload(schema, config_intent),
             "effective_config": dict(effective_config),
             "planned_outputs": dict(planned_outputs),
             "preexisting_sidecars": dict(preexisting_sidecars or {}),

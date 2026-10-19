@@ -6,7 +6,7 @@ import mlx.core as mx
 
 from kinomlx._json import JsonObject
 from kinomlx.io.identity import payload_digest
-from kinomlx.modeling.dtypes import resolve_float_dtype
+from kinomlx.modeling.dtypes import FloatDType, resolve_float_dtype
 from kinomlx.modeling.loading import (
     WeightTarget,
 )
@@ -291,7 +291,7 @@ def transformer_weight_targets(model: Krea2Transformer) -> dict[str, WeightTarge
 def load_krea2_transformer_weights(
     model: Krea2Transformer,
     *,
-    expected_dtype: str | mx.Dtype | None = None,
+    expected_dtype: FloatDType | mx.Dtype | None = None,
     source_bindings: tuple[Krea2TensorBinding, ...],
     reporter: Reporter | None = None,
 ) -> Krea2TransformerLoadReceipt:
@@ -315,7 +315,9 @@ def load_krea2_transformer_weights(
     bound, files = bind_source_weights(
         physical_targets,
         source_bindings,
-        dtype=resolve_float_dtype(expected_dtype or "bfloat16", owner="Krea 2 transformer"),
+        dtype=resolve_float_dtype(
+            expected_dtype or FloatDType.BFLOAT16, owner="Krea 2 transformer"
+        ),
         phase="bind transformer weights",
         reporter=reporter,
     )

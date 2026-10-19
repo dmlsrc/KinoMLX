@@ -10,9 +10,9 @@ from kinomlx.recipe_host import execute_recipe
 from kinomlx.reporting import NullReporter, Reporter
 from kinomlx.settings import Settings
 
-from .components import GMNetComponents, NativeGMNetComponents
+from .components import GMNetComponents, GMNetComponentsProvider
 from .expand import ExpansionResult
-from .pipeline import expand_gmnet
+from .pipelines import expand_gmnet
 from .resources import GMNetResources, prepare_resources
 from .settings import GMNetSettings
 from .types import GMNetExpandConfig, GMNetRequest
@@ -32,7 +32,7 @@ class Recipe[RequestT](Protocol):
         request: RequestT,
         resources: GMNetResources,
         *,
-        components: GMNetComponents | None = None,
+        components: GMNetComponentsProvider | None = None,
         reporter: Reporter | None = None,
     ) -> ExpansionResult: ...
 
@@ -46,7 +46,7 @@ class GMNetRunner:
         *,
         infrastructure: Settings | None = None,
         resources: GMNetResources | None = None,
-        components: GMNetComponents | None = None,
+        components: GMNetComponentsProvider | None = None,
         reporter: Reporter | None = None,
     ) -> None:
         self.reporter = reporter if reporter is not None else NullReporter()
@@ -66,9 +66,7 @@ class GMNetRunner:
         elif model_settings is not None or infrastructure is not None:
             raise ValueError("pass settings or prepared resources, not both")
         self.resources = resources
-        self.components = (
-            components if components is not None else NativeGMNetComponents(self.reporter)
-        )
+        self.components = components if components is not None else GMNetComponents(self.reporter)
 
     def run[RequestT](self, recipe: Recipe[RequestT], request: RequestT) -> ExpansionResult:
         """Run any GMNet recipe that accepts the standard stateless host ports."""

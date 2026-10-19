@@ -65,9 +65,9 @@ def test_reference_denoising_reads_namespaced_environment(monkeypatch) -> None:
 def test_krea_settings_reject_invalid_variant_and_dtype() -> None:
     with pytest.raises(ValueError, match="variant: must be one of"):
         Krea2Settings(variant="fast")
-    with pytest.raises(ValueError, match="transformer_dtype: must be one of"):
+    with pytest.raises(ValueError, match="transformer_dtype: expected one of"):
         Krea2Settings(transformer_dtype="float8")
-    with pytest.raises(ValueError, match="vae_dtype: must be one of"):
+    with pytest.raises(ValueError, match="vae_dtype: expected one of"):
         Krea2Settings(vae_dtype="float8")
     with pytest.raises(ValueError, match="vae_decoder: must be one of"):
         Krea2Settings(vae_decoder="sharpen")

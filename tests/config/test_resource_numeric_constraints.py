@@ -27,7 +27,7 @@ def test_memory_limit_absence_zero_and_fractional_gib_remain_distinct(value):
     assert settings.mlx_wired_limit_gb == value
 
 
-@pytest.mark.parametrize("name", ["transformer_resident_blocks", "compile_block_groups"])
+@pytest.mark.parametrize("name", ["transformer_resident_blocks", "compile_block_group_size"])
 @pytest.mark.parametrize("value", [0, 49, 1.5, True])
 def test_bounded_block_counts_reject_invalid_api_values(name, value):
     with pytest.raises(ValueError, match=name):

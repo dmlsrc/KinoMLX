@@ -37,7 +37,7 @@ class ReferenceKV:
         self.closed = False
 
     def tensors(self) -> tuple[mx.array, ...]:
-        return tuple(tensor for layer in self.layers for tensor in layer.tensors())
+        return tuple(*layer.tensors() for layer in self.layers)
 
     def clear(self) -> None:
         for layer in self.layers:

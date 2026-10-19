@@ -4,6 +4,7 @@ from pathlib import Path
 
 from kinomlx.api_boundaries import APIBoundary, configuration, runtime
 from kinomlx.cli.config_schema import settings_table
+from kinomlx.cli.resource_operation import operation_table
 from kinomlx.config import (
     CliBinding,
     ConfigFieldSpec,
@@ -13,6 +14,7 @@ from kinomlx.config import (
     ModelConfigSpec,
 )
 from kinomlx.config.layer_rules import OUTPUT_SELECTION
+from kinomlx.config_bindings import CliAction
 from kinomlx.config_constraints import field_choices
 from kinomlx.config_surfaces import CONFIG_SURFACES, MODEL_SURFACES
 from kinomlx.invocation_controls import MODEL_CONTROL
@@ -21,11 +23,12 @@ from kinomlx.models.gmnet.settings import GMNetSettings
 from kinomlx.models.gmnet.types import GMNetExpandConfig, GMNetOutputConfig
 from kinomlx.settings import Settings
 
-from .pipeline import expand_gmnet
+from .pipelines import expand_gmnet
 from .resources import prepare_resources
 from .runner import API_BOUNDARIES as RUNNER_API_BOUNDARIES
 
 F = ConfigFieldSpec
+
 
 DIRECT_API_BOUNDARIES = (
     APIBoundary(
@@ -53,8 +56,9 @@ DIRECT_API_BOUNDARIES = (
 CONFIG_SCHEMA = ModelConfigSpec(
     model="gmnet",
     title="KinoMLX GMNet starter configuration",
-    restart_stations=(),
-    no_restart_reason="GMNet exposes one still-expansion pass and has no saved restart station.",
+    stages=("expand",),
+    restart_stages=(),
+    no_restart_reason="GMNet exposes one still-expansion pass and has no saved restart stage.",
     api_boundaries=(*RUNNER_API_BOUNDARIES, *DIRECT_API_BOUNDARIES),
     introduction=(
         "The input image below is the only non-default starter value.",
@@ -100,6 +104,7 @@ CONFIG_SCHEMA = ModelConfigSpec(
                 ),
             ),
         ),
+        operation_table(cli_group="GMNet execution", stages=()),
         ConfigTableSpec(
             path=("output",),
             cli_generated=True,
@@ -147,7 +152,7 @@ CONFIG_SCHEMA = ModelConfigSpec(
                     valid="true or false",
                     example=True,
                     cli_dest="exr",
-                    cli=CliBinding("Output", action="boolean"),
+                    cli=CliBinding("Output", action=CliAction.BOOLEAN),
                     default_text="selected from the exact path suffix, or true",
                     surfaces=CONFIG_SURFACES,
                 ),
@@ -158,7 +163,7 @@ CONFIG_SCHEMA = ModelConfigSpec(
                     valid="true or false",
                     example=True,
                     cli_dest="heic",
-                    cli=CliBinding("Output", action="boolean"),
+                    cli=CliBinding("Output", action=CliAction.BOOLEAN),
                     default_text="selected from the exact path suffix, or true",
                     surfaces=CONFIG_SURFACES,
                 ),
@@ -169,7 +174,7 @@ CONFIG_SCHEMA = ModelConfigSpec(
                     valid="true or false",
                     example=False,
                     cli_dest="save_gain_map",
-                    cli=CliBinding("Output", action="boolean"),
+                    cli=CliBinding("Output", action=CliAction.BOOLEAN),
                     default_text="unset, which inherits the save-all setting",
                     groups=frozenset({ConfigGroup.SAVE_ALL_CANDIDATE}),
                     surfaces=CONFIG_SURFACES,
@@ -181,7 +186,7 @@ CONFIG_SCHEMA = ModelConfigSpec(
                     valid="true or false",
                     example=False,
                     cli_dest="save_run_log",
-                    cli=CliBinding("Output", action="boolean"),
+                    cli=CliBinding("Output", action=CliAction.BOOLEAN),
                     default_text="unset, which inherits the save-all setting",
                     groups=frozenset({ConfigGroup.SAVE_ALL_CANDIDATE}),
                     surfaces=CONFIG_SURFACES,
@@ -193,7 +198,7 @@ CONFIG_SCHEMA = ModelConfigSpec(
                     valid="true or false",
                     example=False,
                     cli_dest="save_console_log",
-                    cli=CliBinding("Output", action="boolean"),
+                    cli=CliBinding("Output", action=CliAction.BOOLEAN),
                     default_text="unset, which inherits the save-all setting",
                     groups=frozenset({ConfigGroup.SAVE_ALL_CANDIDATE}),
                     surfaces=CONFIG_SURFACES,
@@ -205,7 +210,7 @@ CONFIG_SCHEMA = ModelConfigSpec(
                     valid="true or false",
                     example=False,
                     cli_dest="save_effective_config",
-                    cli=CliBinding("Output", action="boolean"),
+                    cli=CliBinding("Output", action=CliAction.BOOLEAN),
                     default_text="unset, which inherits the save-all setting",
                     groups=frozenset({ConfigGroup.SAVE_ALL_CANDIDATE}),
                     surfaces=CONFIG_SURFACES,
@@ -217,7 +222,7 @@ CONFIG_SCHEMA = ModelConfigSpec(
                     valid="true or false",
                     example=False,
                     cli_dest="save_all_sidecars",
-                    cli=CliBinding("Output", action="boolean"),
+                    cli=CliBinding("Output", action=CliAction.BOOLEAN),
                     surfaces=CONFIG_SURFACES,
                 ),
                 F(
@@ -227,12 +232,12 @@ CONFIG_SCHEMA = ModelConfigSpec(
                     valid="true or false",
                     example=False,
                     cli_dest="force",
-                    cli=CliBinding("Output", action="boolean"),
+                    cli=CliBinding("Output", action=CliAction.BOOLEAN),
                     surfaces=CONFIG_SURFACES,
                 ),
             ),
         ),
-        settings_table(stations=(), adapter_weight_check_stations=frozenset()),
+        settings_table(stages=(), adapter_weight_check_stages=frozenset()),
         ConfigTableSpec(
             path=("model_settings",),
             cli_generated=True,

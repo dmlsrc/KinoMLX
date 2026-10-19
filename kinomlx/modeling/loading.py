@@ -9,6 +9,7 @@ import mlx.core as mx
 
 from kinomlx._json import JsonValue
 from kinomlx.io.safetensors import load_weights, read_header
+from kinomlx.modeling.dtypes import FloatDType
 from kinomlx.reporting import NullReporter, Reporter
 
 from .dtypes import safetensors_float_dtype
@@ -67,7 +68,7 @@ def resolve_weight_bindings(
     source_suffixes: Callable[[str], tuple[str, ...]],
     *,
     component: str,
-    expected_dtype: str | mx.Dtype | None = None,
+    expected_dtype: FloatDType | mx.Dtype | None = None,
 ) -> tuple[WeightBinding, ...]:
     """Resolve every consumed target exactly once without policing source baggage."""
     headers = tuple((path, read_header(path)) for path in paths)
@@ -131,7 +132,7 @@ def bind_weight_targets(
     *,
     component: str,
     phase: str,
-    expected_dtype: str | mx.Dtype | None = None,
+    expected_dtype: FloatDType | mx.Dtype | None = None,
     reporter: Reporter | None = None,
     prepare: PrepareWeight | None = None,
 ) -> int:

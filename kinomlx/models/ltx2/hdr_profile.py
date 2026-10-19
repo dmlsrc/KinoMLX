@@ -9,8 +9,9 @@ from kinomlx.media.signals import ColorTransfer
 
 from .adapters.receipt import LTX2AdapterReceipt
 from .adapters.selection import LTX2AdapterSelection
+from .frame_position import is_first_position
 from .resources import LTX2Resources
-from .types import DistilledRequest
+from .types import LTX2Request
 
 
 @dataclass(frozen=True)
@@ -42,14 +43,14 @@ def _effective_stage_strength(selection: LTX2AdapterSelection, stage: int) -> fl
     return selection.strength_for_stage(stage)
 
 
-def _resolve_ltx23_hdr_adapter(request: DistilledRequest) -> HDRRecipeFacts:
+def _resolve_ltx23_hdr_adapter(request: LTX2Request) -> HDRRecipeFacts:
     matches: list[tuple[LTX2AdapterSelection, int]] = []
     for selection in request.resolved_adapters():
         metadata = read_metadata(selection.path)
         transform = metadata.get("hdr_transform", "").strip().lower()
         if not transform:
             continue
-        if transform != "logc3":
+        if transform != ColorTransfer.LOGC3:
             raise ValueError(
                 f"HDR adapter {selection.path} declares unsupported hdr_transform={transform!r}"
             )
@@ -79,7 +80,7 @@ def _resolve_ltx23_hdr_adapter(request: DistilledRequest) -> HDRRecipeFacts:
         raise ValueError("the supported LTX-2.3 HDR IC-LoRA recipe is video-only")
     if request.generated_keyframes:
         raise ValueError("the LTX-2.3 HDR IC-LoRA recipe does not support generated keyframes")
-    if request.image is not None:
+    if request.images:
         raise ValueError(
             "LTX-2.3 HDR reference conditioning uses hdr_reference, not image/keyframe conditioning"
         )
@@ -101,7 +102,7 @@ def _resolve_ltx23_hdr_adapter(request: DistilledRequest) -> HDRRecipeFacts:
 
 
 def resolve_hdr_recipe(
-    request: DistilledRequest,
+    request: LTX2Request,
     resources: LTX2Resources,
 ) -> HDRRecipeFacts | None:
     """Resolve output HDR semantics from generation plus explicit recipe facts."""
@@ -109,7 +110,11 @@ def resolve_hdr_recipe(
         return None
     generation = resources.capabilities.model_generation
     if generation == "2.5" and resources.capabilities.native_hdr:
-        if request.image is None or request.image.path.suffix.lower() != ".exr":
+        first_frame = next(
+            (image for image in request.images if is_first_position(image.frame_index)),
+            None,
+        )
+        if first_frame is None or first_frame.path.suffix.lower() != ".exr":
             raise ValueError(
                 "LTX-2.5 native HDR is image-to-video from an HDR EXR condition, "
                 "which establishes the ACEScct working signal; text-only and "

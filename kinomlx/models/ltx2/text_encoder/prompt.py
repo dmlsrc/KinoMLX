@@ -8,6 +8,7 @@ import mlx.core as mx
 
 from kinomlx.reporting import NullReporter, Reporter
 
+from ..vocabularies import LTX2ModelGeneration
 from . import loading as _loading
 from .encoder import (
     AudioVideoGemmaEncoderOutput,
@@ -51,27 +52,27 @@ def _trim_left_padding(
 def encode_prompt(
     prompt: str,
     *,
-    gemma_path: Path | str,
+    text_encoder_path: Path | str,
     connector_path: Path | str,
     config_path: Path | str,
-    model_generation: str = "2.3",
+    model_generation: LTX2ModelGeneration = LTX2ModelGeneration.LTX23,
     projection_path: Path | str | None = None,
     tokenizer: TokenizerDerivation | None = None,
     max_length: int = 1024,
     pad_prompt_to_max: bool = True,
     reporter: Reporter | None = None,
 ) -> AudioVideoGemmaEncoderOutput:
-    """Run the selected Gemma and packaged AV station with bounded residency.
+    """Run the selected Gemma and packaged AV stage with bounded residency.
 
     The default runs Gemma on the reference's left-padded 1,024-token sequence,
     then retains only real-token states before loading the connectors. Set
     ``pad_prompt_to_max=False`` for the faster variable-length path, which can
     introduce small BF16 drift relative to stock prompt conditioning.
     """
-    if model_generation not in {"2.3", "2.5"}:
+    if model_generation not in {LTX2ModelGeneration.LTX23, LTX2ModelGeneration.LTX25}:
         raise ValueError(f"unsupported LTX text generation {model_generation!r}")
-    if model_generation == "2.5" and projection_path is None:
-        projection_path = gemma_path
+    if model_generation == LTX2ModelGeneration.LTX25 and projection_path is None:
+        projection_path = text_encoder_path
     sink = reporter if reporter is not None else NullReporter()
     encoder_tokenizer = None
     gemma: _GemmaModel | None = None
@@ -79,18 +80,18 @@ def encode_prompt(
     last_hidden = None
     raw_hidden_states = None
     try:
-        encoder_tokenizer = GemmaTokenizer(gemma_path if tokenizer is None else tokenizer)
+        encoder_tokenizer = GemmaTokenizer(text_encoder_path if tokenizer is None else tokenizer)
         input_ids, attention_mask = encoder_tokenizer.encode(
             prompt,
             max_length=max_length,
             pad_to_max=pad_prompt_to_max,
         )
-        if model_generation == "2.5":
+        if model_generation == LTX2ModelGeneration.LTX25:
             gemma = Gemma4Model(Gemma4Config())
-            load_gemma4_weights(gemma, gemma_path, reporter=sink)
+            load_gemma4_weights(gemma, text_encoder_path, reporter=sink)
         else:
             gemma = Gemma3Model(Gemma3Config())
-            load_gemma3_weights(gemma, gemma_path, reporter=sink)
+            load_gemma3_weights(gemma, text_encoder_path, reporter=sink)
         last_hidden, raw_hidden_states = gemma(
             input_ids,
             attention_mask=attention_mask,

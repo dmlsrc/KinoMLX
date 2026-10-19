@@ -5,7 +5,7 @@ import pytest
 
 import kinomlx.models.ltx2.encode as encode
 from kinomlx.media.hdr import scene_linear_to_acescct
-from kinomlx.models.ltx2.types import HDRAuthoring
+from kinomlx.models.ltx2.types import LTX2HDRAuthoring
 from tests._reporting import RecordingReporter
 
 
@@ -156,7 +156,7 @@ def test_load_text_conditioning_rejects_zero_tokens(monkeypatch) -> None:
 @pytest.mark.parametrize("authoring", ["SRGB_LINEAR", "ACESCG", "ACESCCT"])
 def test_encode_image_converts_explicit_exr_signal_to_acescct_working_codes(
     monkeypatch: pytest.MonkeyPatch,
-    authoring: HDRAuthoring,
+    authoring: LTX2HDRAuthoring,
 ) -> None:
     if authoring == "ACESCCT":
         source = mx.array([[[0.1, 0.5, 0.9]]], dtype=mx.float32)
@@ -265,7 +265,7 @@ def _stub_video_encoder(video: mx.array, *, reporter=None) -> mx.array:
 def test_encode_image_warns_when_the_exr_condition_carries_no_hdr_content(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
-    authoring: HDRAuthoring,
+    authoring: LTX2HDRAuthoring,
     source: mx.array,
 ) -> None:
     # Native HDR preserves the condition's exposure distribution; a plate
@@ -294,7 +294,7 @@ def test_encode_image_warns_when_the_exr_condition_carries_no_hdr_content(
 def test_encode_image_stays_quiet_for_genuine_hdr_exr_conditions(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
-    authoring: HDRAuthoring,
+    authoring: LTX2HDRAuthoring,
     source: mx.array,
 ) -> None:
     monkeypatch.setattr(encode, "load_raw_exr", lambda *_args, **_kwargs: source)

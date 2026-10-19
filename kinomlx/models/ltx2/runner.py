@@ -14,14 +14,14 @@ from kinomlx.recipe_host import execute_recipe
 from kinomlx.reporting import NullReporter, Reporter
 from kinomlx.settings import Settings
 
-from .components import DistilledComponents, NativeLTX2Components
-from .generation import GenerationOutput
-from .pipelines.distilled import DistilledConditioning, generate_distilled, prepare_distilled_recipe
+from .components import LTX2Components, LTX2ComponentsProvider
+from .generation import LTX2GenerationOutput
+from .pipelines.distilled import DistilledConditioning, generate_ltx2, prepare_distilled_recipe
 from .resources import LTX2Resources, prepare_resources
-from .restart import DistilledRestart
+from .restart import LTX2Restart
 from .settings import LTX2Settings
-from .text_conditioning import TextConditioner
-from .types import DistilledRequest
+from .text_conditioning import LTX2TextConditionerPort
+from .types import LTX2Request
 
 _log = logging.getLogger(__name__)
 
@@ -38,11 +38,11 @@ class Recipe[RequestT](Protocol):
         request: RequestT,
         resources: LTX2Resources,
         *,
-        components: DistilledComponents | None = None,
-        text_conditioner: TextConditioner | None = None,
+        components: LTX2ComponentsProvider | None = None,
+        text_conditioner: LTX2TextConditionerPort | None = None,
         reporter: Reporter | None = None,
         artifact_sink: ArtifactSink | None = None,
-    ) -> GenerationOutput: ...
+    ) -> LTX2GenerationOutput: ...
 
 
 class LTX2Runner:
@@ -54,8 +54,8 @@ class LTX2Runner:
         *,
         infrastructure: Settings | None = None,
         resources: LTX2Resources | None = None,
-        components: DistilledComponents | None = None,
-        text_conditioner: TextConditioner | None = None,
+        components: LTX2ComponentsProvider | None = None,
+        text_conditioner: LTX2TextConditionerPort | None = None,
         reporter: Reporter | None = None,
         artifact_sink: ArtifactSink | None = None,
     ) -> None:
@@ -78,14 +78,14 @@ class LTX2Runner:
             raise ValueError("pass settings or prepared resources, not both")
         self.resources = resources
         self.components = (
-            components if components is not None else NativeLTX2Components(reporter=self.reporter)
+            components if components is not None else LTX2Components(reporter=self.reporter)
         )
         # Recipes own their default replay policy. Keeping an absent port as
         # None lets ordinary generation select strict saved-text replay while
-        # station restart selects observational identity handling.
+        # stage restart selects observational identity handling.
         self.text_conditioner = text_conditioner
 
-    def run[RequestT](self, recipe: Recipe[RequestT], request: RequestT) -> GenerationOutput:
+    def run[RequestT](self, recipe: Recipe[RequestT], request: RequestT) -> LTX2GenerationOutput:
         """Run any LTX-2 recipe that accepts the standard stateless host ports."""
         return execute_recipe(
             partial(
@@ -98,13 +98,13 @@ class LTX2Runner:
                 artifact_sink=self.artifact_sink,
             ),
             memory_policy=self.resources.memory_policy,
-            result_type=GenerationOutput,
+            result_type=LTX2GenerationOutput,
             error_type=LTX2Error,
             label="LTX-2 generation",
             logger=_log,
         )
 
-    def generate(self, request: DistilledRequest) -> Iterator[GenerationOutput]:
+    def generate(self, request: LTX2Request) -> Iterator[LTX2GenerationOutput]:
         """Yield complete videos sequentially, sharing conditioning across seeds.
 
         Consume and close each output before requesting the next. Close the
@@ -120,7 +120,7 @@ class LTX2Runner:
                 prepare_distilled_recipe(replace(request, seed=seed, seeds=None), self.resources)
             for index, seed in enumerate(seeds):
                 output = self.run(
-                    partial(generate_distilled, conditioning=shared),
+                    partial(generate_ltx2, conditioning=shared),
                     replace(request, seed=seed, seeds=None),
                 )
                 output.metadata.update(seed=seed, seeds=list(seeds), seed_index=index)
@@ -130,11 +130,11 @@ class LTX2Runner:
 
     def restart(
         self,
-        request: DistilledRequest,
-        restart: DistilledRestart,
-    ) -> GenerationOutput:
-        """Resume the distilled graph from one typed saved-station product."""
-        recipe = partial(_restart_pipeline.restart_distilled, restart=restart)
+        request: LTX2Request,
+        restart: LTX2Restart,
+    ) -> LTX2GenerationOutput:
+        """Resume the distilled graph from one typed saved-stage product."""
+        recipe = partial(_restart_pipeline.restart_ltx2, restart=restart)
         return self.run(recipe, request)
 
 
@@ -163,14 +163,14 @@ API_BOUNDARIES = (
     APIBoundary(
         "ltx2",
         LTX2Runner.generate,
-        (configuration("request", DistilledRequest, "generate"),),
+        (configuration("request", LTX2Request, "generate"),),
     ),
     APIBoundary(
         "ltx2",
         LTX2Runner.restart,
         (
-            configuration("request", DistilledRequest, "generate"),
-            runtime("restart", "prepared station handoff"),
+            configuration("request", LTX2Request, "generate"),
+            runtime("restart", "prepared stage handoff"),
         ),
     ),
 )

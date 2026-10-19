@@ -105,7 +105,7 @@ def run_text_conditioning(
     import kinomlx
     from kinomlx.models.krea2.resources import prepare_resources
     from kinomlx.models.krea2.settings import Krea2Settings
-    from kinomlx.models.krea2.text_conditioning import NativeKrea2TextConditioner
+    from kinomlx.models.krea2.text_conditioning import Krea2TextConditioner
     from kinomlx.models.krea2.tokenizer import (
         KREA_PREFIX_TOKENS,
         load_component_tokenizer,
@@ -173,7 +173,7 @@ def run_text_conditioning(
             pass
     memory_before, memory_before_available = _memory_snapshot(mx)
     started = time.perf_counter()
-    conditioning = NativeKrea2TextConditioner()(
+    conditioning = Krea2TextConditioner()(
         prompts,
         resources,
         reporter=timing,

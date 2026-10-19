@@ -12,11 +12,11 @@ from kinomlx.media.signals import (
     ColorPrimaries,
     ColorTransfer,
     ExrDeliverySpec,
-    ExrSampleType,
     OutputColorPlan,
+    SampleDType,
     UnsupportedSignalError,
 )
-from kinomlx.models.ltx2.generation import GenerationOutput
+from kinomlx.models.ltx2.generation import LTX2GenerationOutput
 from kinomlx.models.ltx2.signals import (
     SCENE_LINEAR_HDR_SIGNAL,
     ltx23_sdr_signal,
@@ -31,9 +31,9 @@ from kinomlx.output import (
 )
 
 
-def _generation() -> GenerationOutput:
+def _generation() -> LTX2GenerationOutput:
     signal = ltx23_sdr_signal(width=2, height=2, fps=24.0)
-    return GenerationOutput(
+    return LTX2GenerationOutput(
         frames=VideoFrameStream(
             lambda: iter((mx.zeros((2, 2, 3), dtype=mx.float16),)),
             spec=signal,
@@ -147,7 +147,7 @@ def test_hdr_sink_fans_one_working_frame_to_exr_and_hlg_transactionally(
         [[[0.5547945, 0.5547945, 0.5547945], [0.7594157, 0.7594157, 0.7594157]]],
         dtype=mx.float32,
     )
-    generation = GenerationOutput(
+    generation = LTX2GenerationOutput(
         frames=VideoFrameStream(lambda: iter((working,)), spec=signal, frame_count=1)
     )
     output = tmp_path / "output.mp4"
@@ -195,7 +195,7 @@ def test_hdr_sink_fans_one_working_frame_to_exr_and_hlg_transactionally(
     exr_delivery = ExrDeliverySpec(
         primaries=ColorPrimaries.ACESCG,
         transfer=ColorTransfer.ACESCCT,
-        sample_type=ExrSampleType.FLOAT16,
+        sample_type=SampleDType.FLOAT16,
         color_space_tag="ACEScct",
     )
     plan = OutputColorPlan(
@@ -238,7 +238,7 @@ def test_hdr_sink_fanout_stays_frame_bounded(
         fps=24.0,
     )
     frames = tuple(mx.full((1, 2, 3), value, dtype=mx.float32) for value in (0.2, 0.4, 0.6))
-    generation = GenerationOutput(
+    generation = LTX2GenerationOutput(
         frames=VideoFrameStream(lambda: iter(frames), spec=signal, frame_count=3)
     )
     events: list[str] = []
@@ -276,7 +276,7 @@ def test_hdr_sink_fanout_stays_frame_bounded(
             ExrDeliverySpec(
                 primaries=ColorPrimaries.REC709,
                 transfer=ColorTransfer.LOGC3,
-                sample_type=ExrSampleType.FLOAT16,
+                sample_type=SampleDType.FLOAT16,
                 color_space_tag="LogC3",
             ),
             BT2020_HLG_DELIVERY,
@@ -313,7 +313,7 @@ def test_hdr_sink_cancels_and_removes_transaction_on_frame_failure(
         fps=24.0,
     )
     working = mx.full((1, 2, 3), 0.5, dtype=mx.float32)
-    generation = GenerationOutput(
+    generation = LTX2GenerationOutput(
         frames=VideoFrameStream(
             lambda: iter((working, working)),
             spec=signal,
@@ -365,7 +365,7 @@ def test_hdr_sink_cancels_and_removes_transaction_on_frame_failure(
             ExrDeliverySpec(
                 primaries=ColorPrimaries.ACESCG,
                 transfer=ColorTransfer.ACESCCT,
-                sample_type=ExrSampleType.FLOAT16,
+                sample_type=SampleDType.FLOAT16,
                 color_space_tag="ACEScct",
             ),
             BT2020_HLG_DELIVERY,
@@ -399,7 +399,7 @@ def test_hdr_sink_refuses_to_overwrite_audio_sidecar_before_opening_writer(
         height=1,
         fps=24.0,
     )
-    generation = GenerationOutput(
+    generation = LTX2GenerationOutput(
         frames=VideoFrameStream(
             lambda: iter((mx.full((1, 2, 3), 0.5, dtype=mx.float32),)),
             spec=signal,
@@ -421,7 +421,7 @@ def test_hdr_sink_refuses_to_overwrite_audio_sidecar_before_opening_writer(
             ExrDeliverySpec(
                 primaries=ColorPrimaries.ACESCG,
                 transfer=ColorTransfer.ACESCCT,
-                sample_type=ExrSampleType.FLOAT16,
+                sample_type=SampleDType.FLOAT16,
                 color_space_tag="ACEScct",
             ),
             BT2020_HLG_DELIVERY,

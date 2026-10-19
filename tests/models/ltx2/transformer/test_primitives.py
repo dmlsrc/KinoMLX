@@ -4,11 +4,16 @@ import mlx.core as mx
 import numpy as np
 import pytest
 
+import kinomlx._mlx_nn as nn
+from kinomlx.kernels import mpp_linear
 from kinomlx.models.ltx2.transformer import (
     apply_rotary_emb,
     precompute_freqs_cis,
 )
-from kinomlx.models.ltx2.transformer.attention import scaled_dot_product_attention
+from kinomlx.models.ltx2.transformer.attention import (
+    _mpp_projection,
+    scaled_dot_product_attention,
+)
 from kinomlx.models.ltx2.weights.layout import (
     install_block_layout_weight,
     install_top_level_layout_weight,
@@ -92,7 +97,6 @@ def test_stock_compiled_attention_matches_original_uncompiled_path(dtype: mx.Dty
         value,
         heads=2,
         dim_head=8,
-        use_steel_attention=False,
         compile_attention=False,
     )
     compiled = scaled_dot_product_attention(
@@ -101,7 +105,6 @@ def test_stock_compiled_attention_matches_original_uncompiled_path(dtype: mx.Dty
         value,
         heads=2,
         dim_head=8,
-        use_steel_attention=False,
         compile_attention=True,
     )
     mx.eval(original, compiled)
@@ -173,6 +176,174 @@ def test_attention_pretranspose_releases_sources_without_changing_output() -> No
     assert mx.allclose(actual, expected, rtol=1e-5, atol=1e-5).item()
     assert "weight" not in attention.to_out
     assert attention._to_out_weight_t is not None
+
+
+@pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
+def test_attention_projections_through_mpp_keep_mlx_bits(
+    dtype: mx.Dtype,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not all(
+        mpp_linear.available(transposed=transposed, bias=True, dtype=dtype)
+        for transposed in (True, False)
+    ):
+        pytest.skip("MPP matmul2d does not build or does not match MLX on this GPU")
+    attention = build_shaped_attention(1024, heads=8, dim_head=128, apply_gated_attention=True)
+    for seed, target in enumerate(("to_q", "to_k", "to_v", "to_out")):
+        layer = getattr(attention, target)
+        layer.bias = mx.random.normal(layer.bias.shape, key=mx.random.key(900 + seed)) * 0.1
+    attention.set_dtype(dtype)
+    value = (mx.random.normal((1, 1056, 1024), key=mx.random.key(910)) * 0.5).astype(dtype)
+    assert mpp_linear.applies(value, attention.to_q.weight, attention.to_q.bias, transposed=True)
+
+    def both_paths() -> tuple[mx.array, mx.array]:
+        monkeypatch.setattr(mpp_linear, "_enabled", True)
+        through_mpp = attention(value)
+        monkeypatch.setattr(mpp_linear, "_enabled", False)
+        through_mlx = attention(value)
+        mx.eval(through_mpp, through_mlx)
+        return through_mpp, through_mlx
+
+    through_mpp, through_mlx = both_paths()
+    assert mx.array_equal(through_mpp, through_mlx).item()
+    block = SimpleNamespace(attn1=attention)
+    for target in ("to_q", "to_k", "to_v", "to_out", "to_gate_logits"):
+        install_block_layout_weight(
+            block, f"attn1.{target}.weight_t", mx.contiguous(getattr(attention, target).weight.T)
+        )
+    through_mpp, through_mlx = both_paths()
+    assert mx.array_equal(through_mpp, through_mlx).item()
+
+
+def test_bf16_attention_converts_its_mpp_weights_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not mpp_linear.available(transposed=True, bias=True, dtype=mx.bfloat16):
+        pytest.skip("MPP matmul2d does not build or does not match MLX on this GPU")
+    attention = build_shaped_attention(1024, heads=8, dim_head=128, apply_gated_attention=True)
+    for seed, target in enumerate(("to_q", "to_k", "to_v", "to_out")):
+        layer = getattr(attention, target)
+        layer.bias = mx.random.normal(layer.bias.shape, key=mx.random.key(950 + seed)) * 0.1
+    attention.set_dtype(mx.bfloat16)
+    value = (mx.random.normal((1, 1056, 1024), key=mx.random.key(960)) * 0.5).astype(mx.bfloat16)
+    few_rows = value[:, :512]
+    monkeypatch.setattr(mpp_linear, "_enabled", False)
+    expected, expected_few = attention(value), attention(few_rows)
+    mx.eval(expected, expected_few)
+    source = attention.to_q.weight
+
+    monkeypatch.setattr(mpp_linear, "_enabled", True)
+    attention.convert_mpp_weights = True
+    first = attention(value)
+    mx.eval(first)
+    converted = attention.to_q.weight
+    assert converted is not source
+    assert converted.dtype == mx.float16
+    second = attention(value)
+    mx.eval(second)
+    assert attention.to_q.weight is converted
+    # Calls MPP does not take restore the BF16 weight for MLX's product.
+    below_floor = attention(few_rows)
+    monkeypatch.setattr(mpp_linear, "_enabled", False)
+    switched_off = attention(value)
+    mx.eval(below_floor, switched_off)
+    for actual, wanted in (
+        (first, expected),
+        (second, expected),
+        (below_floor, expected_few),
+        (switched_off, expected),
+    ):
+        assert mx.array_equal(actual, wanted).item()
+
+    # A weight bound again (a fresh load) is converted again, never read through a stale copy.
+    monkeypatch.setattr(mpp_linear, "_enabled", True)
+    attention.to_q.weight = source * 2
+    rebound = attention(value)
+    attention.convert_mpp_weights = False
+    monkeypatch.setattr(mpp_linear, "_enabled", False)
+    attention.to_q.weight = source * 2
+    rebound_expected = attention(value)
+    mx.eval(rebound, rebound_expected)
+    assert mx.array_equal(rebound, rebound_expected).item()
+
+
+def test_feed_forward_converts_its_up_projection(monkeypatch: pytest.MonkeyPatch) -> None:
+    if not mpp_linear.available(transposed=True, bias=True, dtype=mx.bfloat16):
+        pytest.skip("MPP matmul2d does not build or does not match MLX on this GPU")
+    feed_forward = build_shaped_feed_forward(1024)
+    for seed, layer in enumerate((feed_forward.project_in.proj, feed_forward.project_out)):
+        layer.bias = mx.random.normal(layer.bias.shape, key=mx.random.key(970 + seed)) * 0.1
+    feed_forward.set_dtype(mx.bfloat16)
+    value = (mx.random.normal((1, 1056, 1024), key=mx.random.key(980)) * 0.5).astype(mx.bfloat16)
+    monkeypatch.setattr(mpp_linear, "_enabled", False)
+    expected = feed_forward(value)
+    mx.eval(expected)
+    monkeypatch.setattr(mpp_linear, "_enabled", True)
+    feed_forward.convert_mpp_weights = True
+    actual = feed_forward(value)
+    mx.eval(actual)
+    assert feed_forward.project_in.proj.weight.dtype == mx.float16
+    assert mx.array_equal(actual, expected).item()
+
+
+def test_mpp_projection_leaves_linear_subclasses_to_their_own_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Shifted(nn.Linear):
+        def __call__(self, value: mx.array) -> mx.array:
+            return super().__call__(value) + 1.0
+
+    layer = Shifted(1024, 1024)
+    layer.set_dtype(mx.bfloat16)
+    value = mx.random.normal((1, 1056, 1024), key=mx.random.key(940)).astype(mx.bfloat16)
+
+    def refuse(*args: object, **kwargs: object) -> mx.array:
+        raise AssertionError("MPP took a Linear subclass")
+
+    monkeypatch.setattr(mpp_linear, "linear", refuse)
+    actual = _mpp_projection(layer, value, None)
+    expected = layer(value)
+    mx.eval(actual, expected)
+    assert mx.array_equal(actual, expected).item()
+
+
+@pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
+def test_feed_forward_through_mpp_keeps_mlx_bits(
+    dtype: mx.Dtype,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not all(
+        mpp_linear.available(transposed=transposed, bias=True, dtype=dtype)
+        for transposed in (True, False)
+    ):
+        pytest.skip("MPP matmul2d does not build or does not match MLX on this GPU")
+    feed_forward = build_shaped_feed_forward(1024)
+    for seed, layer in enumerate((feed_forward.project_in.proj, feed_forward.project_out)):
+        layer.bias = mx.random.normal(layer.bias.shape, key=mx.random.key(920 + seed)) * 0.1
+    feed_forward.set_dtype(dtype)
+    value = (mx.random.normal((1, 1056, 1024), key=mx.random.key(930)) * 0.5).astype(dtype)
+    project_in = feed_forward.project_in.proj
+    assert mpp_linear.applies(value, project_in.weight, project_in.bias, transposed=True)
+
+    def both_paths() -> tuple[mx.array, mx.array]:
+        monkeypatch.setattr(mpp_linear, "_enabled", True)
+        through_mpp = feed_forward(value)
+        monkeypatch.setattr(mpp_linear, "_enabled", False)
+        through_mlx = feed_forward(value)
+        mx.eval(through_mpp, through_mlx)
+        return through_mpp, through_mlx
+
+    through_mpp, through_mlx = both_paths()
+    assert mx.array_equal(through_mpp, through_mlx).item()
+    block = SimpleNamespace(ff=feed_forward)
+    install_block_layout_weight(
+        block, "ff.project_in.proj.weight_t", mx.contiguous(project_in.weight.T)
+    )
+    install_block_layout_weight(
+        block, "ff.project_out.weight_t", mx.contiguous(feed_forward.project_out.weight.T)
+    )
+    through_mpp, through_mlx = both_paths()
+    assert mx.array_equal(through_mpp, through_mlx).item()
 
 
 def test_adaln_pretranspose_releases_source_without_changing_output() -> None:

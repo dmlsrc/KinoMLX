@@ -1,30 +1,33 @@
-"""Model command and configuration registry."""
+"""Model selection and command dispatch."""
 
 import argparse
-import importlib
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Protocol, cast
 
 from kinomlx.config import (
     ConfigError,
     load_config,
     parse_set_argument,
 )
-from kinomlx.invocation_controls import (
-    INVOCATION_CONTROLS,
-    MODEL_CONTROL,
-    validate_invocation_controls,
-)
-from kinomlx.model_registry import DEFAULT_MODEL, MODEL_SPECS, config_registry, model_choices
+from kinomlx.model_catalog import DEFAULT_MODEL, MODEL_SPECS, model_choices
+from kinomlx.models.flux2 import command as flux2_command
+from kinomlx.models.gmnet import command as gmnet_command
+from kinomlx.models.krea2 import command as krea2_command
+from kinomlx.models.ltx2 import command as ltx2_command
 
 from .invocation import add_selection_arguments
 
-
-class _ModelCommand(Protocol):
-    """Complete installed command contributed by one model package."""
-
-    def __call__(self, arguments: list[str]) -> int: ...
+# The complete installed command each catalog model contributes. Each entry looks its
+# command up on the model's module when it runs, so a command replaced there is the one
+# dispatched; binding the functions here would silently bypass such a replacement.
+_MODEL_COMMANDS: dict[str, Callable[[list[str]], int]] = {
+    "flux2": lambda arguments: flux2_command.run_flux2_command(arguments),
+    "gmnet": lambda arguments: gmnet_command.run_gmnet_command(arguments),
+    "krea2": lambda arguments: krea2_command.run_krea2_command(arguments),
+    "ltx2": lambda arguments: ltx2_command.run_ltx2_command(arguments),
+}
+if _MODEL_COMMANDS.keys() != MODEL_SPECS.keys():
+    raise RuntimeError("every catalog model must contribute exactly one command")
 
 
 @dataclass(frozen=True)
@@ -58,7 +61,7 @@ def resolve_model_selection(
     *,
     tolerate_errors: bool = False,
 ) -> ModelSelection:
-    """Resolve model precedence without importing a model or native runtime.
+    """Resolve which model an invocation selects.
 
     Selection follows the same precedence as a complete invocation: config,
     then ``--model``, then ordered ``--set model=...`` overrides. Absence of a
@@ -116,124 +119,12 @@ def resolve_model_selection(
 def resolve_model_command(selection: ModelSelection | str) -> Callable[[list[str]], int]:
     """Resolve one model's complete CLI command at dispatch."""
     name = selection.name if isinstance(selection, ModelSelection) else selection
-    spec = MODEL_SPECS[name]
-    return cast(
-        Callable[[list[str]], int],
-        _resolve_callable(spec.command_module, spec.command_function),
-    )
-
-
-CONFIG_CONTROL_DESTINATIONS = frozenset(
-    {"help", *(control.name for control in INVOCATION_CONTROLS if control is not MODEL_CONTROL)}
-)
-
-
-def validate_model_parser(parser: argparse.ArgumentParser, model: str) -> None:
-    """Fail when a complete public parser drifts from its model contribution."""
-    schema = config_registry().model(model)
-    validate_invocation_controls(parser)
-    actions: dict[str, list[argparse.Action]] = {}
-    for action in parser._actions:
-        if action.dest in CONFIG_CONTROL_DESTINATIONS:
-            continue
-        actions.setdefault(action.dest, []).append(action)
-
-    expected = schema.cli_destinations()
-    actual = frozenset(actions)
-    if expected != actual:
-        missing = sorted(expected - actual)
-        unregistered = sorted(actual - expected)
-        details: list[str] = []
-        if missing:
-            details.append("missing parser destinations: " + ", ".join(missing))
-        if unregistered:
-            details.append("unregistered parser destinations: " + ", ".join(unregistered))
-        raise ValueError(f"{model} config/CLI drift: {'; '.join(details)}")
-
-    for field in schema.root_fields:
-        if field.cli is None:
-            raise TypeError(f"{model}.{field.name}: missing root CLI binding")
-        root_actions = actions[field.cli_dest]
-        if len(root_actions) != 1:
-            raise ValueError(f"{model}.{field.name}: expected one root CLI action")
-        field.cli.validate_action(root_actions[0], annotation=type(field.default))
-
-    for table in schema.tables:
-        if not table.cli_generated:
-            continue
-        for field in table.fields:
-            if not field.surfaces.supports("cli"):
-                continue
-            binding = field.cli
-            if binding is None:
-                raise TypeError(f"{model}.{field.name}: missing CLI binding")
-            table.validate_cli_actions(field, actions[field.cli_dest])
-
-    for destination, field in schema.cli_fields().items():
-        if field.cli_item is not None:
-            continue  # The record declaration validates each member's help, choices and defaults.
-        for action in actions[destination]:
-            negative_only = isinstance(action, argparse._StoreFalseAction) or (
-                bool(action.option_strings)
-                and all(option.startswith("--no-") for option in action.option_strings)
-            )
-            accepted_help = {field.help_text(negative=negative_only)}
-            if not negative_only:
-                for implication in schema.implications:
-                    if schema.field(implication.trigger).cli_dest == destination:
-                        accepted_help.add(schema.implication_help(implication.trigger))
-            if action.help not in accepted_help:
-                raise ValueError(
-                    f"{model} config/CLI help drift for {destination}: "
-                    f"registered={sorted(accepted_help)}, parser={action.help!r}"
-                )
-        non_null_defaults = [
-            action.default for action in actions[destination] if action.default is not None
-        ]
-        if non_null_defaults:
-            raise ValueError(
-                f"{model} config/CLI default drift for {destination}: parser defaults "
-                "must be None so lower-precedence config sources remain visible"
-            )
-        declared = [
-            tuple(str(choice) for choice in action.choices)
-            for action in actions[destination]
-            if action.choices is not None
-        ]
-        if not declared:
-            if field.choices:
-                raise ValueError(
-                    f"{model} config/CLI choice drift for {destination}: "
-                    f"registered={sorted(field.choices)}, parser has no choices"
-                )
-            continue
-        registered = (
-            frozenset(config_registry().models())
-            if destination == "model"
-            else frozenset(field.choices)
-        )
-        for choices in declared:
-            parsed = frozenset(choices)
-            if registered != parsed:
-                raise ValueError(
-                    f"{model} config/CLI choice drift for {destination}: "
-                    f"registered={sorted(registered)}, parser={sorted(parsed)}"
-                )
-
-
-def _resolve_callable(module_name: str, attribute: str) -> _ModelCommand:
-    module = importlib.import_module(module_name)
-    value: object = getattr(module, attribute)
-    if not callable(value):
-        raise TypeError(f"{module_name}.{attribute} is not callable")
-    return cast(_ModelCommand, value)
+    return _MODEL_COMMANDS[name]
 
 
 __all__ = [
-    "CONFIG_CONTROL_DESTINATIONS",
     "ModelSelection",
     "model_summary",
     "resolve_model_command",
     "resolve_model_selection",
-    "validate_model_parser",
 ]

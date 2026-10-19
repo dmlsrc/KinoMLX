@@ -10,13 +10,13 @@ import Foundation
 import mlx.core as mx
 import pytest
 
-from kinomlx.models.ltx2.generation import GenerationOutput
+from kinomlx.models.ltx2.generation import LTX2GenerationOutput
 from kinomlx.models.ltx2.output import write_generation
 from kinomlx.models.ltx2.output_config import OutputConfig
-from kinomlx.models.ltx2.pipelines.distilled import generate_distilled
+from kinomlx.models.ltx2.pipelines.distilled import generate_ltx2
 from kinomlx.models.ltx2.runner import LTX2Runner
 from kinomlx.models.ltx2.settings import LTX2Settings
-from kinomlx.models.ltx2.types import DistilledRequest
+from kinomlx.models.ltx2.types import LTX2Request
 from kinomlx.settings import Settings
 from tests.models.ltx2._source_weights import NO_LTX23_CHECKPOINT, ltx23_checkpoint
 
@@ -63,8 +63,8 @@ def test_real_ltx23_joint_pipeline_writes_video_and_audio(tmp_path: Path) -> Non
         pytest.skip(NO_LTX23_CHECKPOINT)
 
     with LTX2Runner(model_settings, infrastructure=infrastructure).run(
-        generate_distilled,
-        DistilledRequest(
+        generate_ltx2,
+        LTX2Request(
             prompt="A simple landscape.",
             width=64,
             height=64,
@@ -85,7 +85,7 @@ def test_real_ltx23_joint_pipeline_writes_video_and_audio(tmp_path: Path) -> Non
 
         frames = _InspectingFrameStream(output.frames)
         muxed = write_generation(
-            GenerationOutput(
+            LTX2GenerationOutput(
                 frames=frames,
                 audio_waveform=output.audio_waveform,
                 audio_sample_rate=output.audio_sample_rate,

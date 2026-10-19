@@ -11,6 +11,7 @@ import mlx.core as mx
 from kinomlx.adapters.algebra import ia3_input_scale, reconstruct_delta
 from kinomlx.adapters.formats import (
     AdapterInventory,
+    AdapterKind,
     AdapterOperation,
 )
 from kinomlx.adapters.fusion import (
@@ -26,6 +27,12 @@ from kinomlx.adapters.receipt import (
     AdapterPlacement,
     AdapterReceipt,
     log_adapter_receipt,
+)
+from kinomlx.adapters.scaling import (
+    UNKNOWN_SCALE_WARNING,
+    ScaleDetermination,
+    determine_scale,
+    log_scale_determination,
 )
 from kinomlx.adapters.schedule import render_strength_plan
 from kinomlx.adapters.selection import AdapterSelection
@@ -104,8 +111,8 @@ def _inspect_selection(selected: AdapterSelection) -> AdapterSource:
 
 
 def _needs_bias_operation(operation: AdapterOperation) -> bool:
-    return operation.kind in ("glora_peft", "road") or (
-        operation.kind == "ia3_peft" and not ia3_input_scale(operation)
+    return operation.kind in (AdapterKind.GLORA_PEFT, AdapterKind.ROAD) or (
+        operation.kind == AdapterKind.IA3_PEFT and not ia3_input_scale(operation)
     )
 
 
@@ -149,7 +156,9 @@ def _place_inventory(
                 bias_target = target.removesuffix(".weight") + ".bias"
                 if bias_target not in target_shapes and (
                     "base_bias" in operation.factors
-                    or (operation.kind == "glora_peft" and glora_has_bias_paths(operation))
+                    or (
+                        operation.kind == AdapterKind.GLORA_PEFT and glora_has_bias_paths(operation)
+                    )
                 ):
                     raise ValueError(
                         f"PEFT {operation.kind} bias paths require a biased Linear target"
@@ -211,7 +220,7 @@ def _place_inventory(
 
 
 def _verify_accounting(placed: _PlacedInventory, source: AdapterSource) -> None:
-    consumed = [key for item in placed.placements for key in item.source_keys]
+    consumed = [*item.source_keys for item in placed.placements]
     if len(consumed) != len(set(consumed)) or set(consumed) != set(source.tensor_names):
         raise RuntimeError(
             "adapter placement receipt does not account for every source tensor exactly once"
@@ -249,7 +258,8 @@ def prepare_krea2_adapters(
         )
         _verify_accounting(placed, source)
         zero_alpha_count = sum(
-            operation.alpha == 0.0 and operation.kind in ("lora", "loha", "lokr")
+            operation.alpha == 0.0
+            and operation.kind in (AdapterKind.LORA, AdapterKind.LOHA, AdapterKind.LOKR)
             for operation in inventory.operations
         )
         prepared.append(
@@ -303,6 +313,7 @@ def apply_krea2_adapters(
         if not selected.effective:
             placed = _PlacedInventory(prepared.placements, ())
             zero_alpha = prepared.zero_alpha_count
+            scale = ScaleDetermination()
         else:
             inventory = parse_lazy_adapter(load_weights(source.path), source.config)
             placed = _place_inventory(
@@ -314,9 +325,11 @@ def apply_krea2_adapters(
                 base_for=live_base,
             )
             zero_alpha = sum(
-                operation.alpha == 0.0 and operation.kind in ("lora", "loha", "lokr")
+                operation.alpha == 0.0
+                and operation.kind in (AdapterKind.LORA, AdapterKind.LOHA, AdapterKind.LOKR)
                 for operation in inventory.operations
             )
+            scale = determine_scale(source.config_source, source.config, inventory.operations)
         _verify_accounting(placed, source)
         # A step array naming one strength for every step is a constant, and
         # fusion applies a constant once rather than paying two operations per
@@ -361,6 +374,9 @@ def apply_krea2_adapters(
             )
         if unknown_tensors:
             warnings.append(f"{unknown_tensors} unknown adapter tensors were not placed")
+        scale_unknown = source.scale_unknown and selected.effective
+        if scale_unknown:
+            warnings.append(UNKNOWN_SCALE_WARNING)
         receipt = AdapterReceipt(
             path=source.path,
             source_identity=source.source_identity,
@@ -379,6 +395,8 @@ def apply_krea2_adapters(
             sigma_window=(
                 None if selected.sigma_window is None else selected.sigma_window.to_metadata()
             ),
+            scale_source=scale.source,
+            intrinsic_scales=scale.scales,
         )
         receipts.append(receipt)
         _plan_detail = render_strength_plan(selected.schedule, selected.sigma_window)
@@ -399,6 +417,15 @@ def apply_krea2_adapters(
                 *(() if _plan_detail is None else (_plan_detail,)),
             ),
         )
+        log_scale_determination(
+            _log,
+            model="Krea 2",
+            name=selected.path.name,
+            determination=scale,
+            strength=selected.effective_strength,
+        )
+        if scale_unknown:
+            _log.warning("Krea 2 adapter %s: %s", selected.path.name, UNKNOWN_SCALE_WARNING)
         if zero_alpha:
             _log.info(
                 "Krea 2 adapter %s: %d saved zero-alpha operations use unit intrinsic scale",

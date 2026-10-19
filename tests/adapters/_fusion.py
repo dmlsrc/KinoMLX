@@ -4,10 +4,11 @@ import mlx.core as mx
 
 from kinomlx.adapters.fusion import fuse_adapter_operations
 from kinomlx.adapters.validation import AdapterWeightCheck
+from kinomlx.modeling.dtypes import FloatDType
 from kinomlx.reporting import NullReporter
 
 
-def fuse_and_check(targets, operations, *, transposed=frozenset(), accumulation="float32"):
+def fuse_and_check(targets, operations, *, transposed=frozenset(), accumulation=FloatDType.FLOAT32):
     pending = AdapterWeightCheck()
     fuse_adapter_operations(
         targets, operations, pending=pending, transposed=transposed, accumulation=accumulation

@@ -3,22 +3,22 @@
 import gc
 from collections.abc import Generator
 from dataclasses import dataclass, replace
-from functools import partial
 from pathlib import Path
 
 import mlx.core as mx
 
 from kinomlx.adapters.receipt import AdapterReceipt
 from kinomlx.adapters.selection import AdapterSelection
-from kinomlx.components import ComponentLease
 from kinomlx.io.image import image_size
-from kinomlx.modeling.dtypes import resolve_float_dtype
+from kinomlx.modeling.dtypes import resolve_bound_dtype
 from kinomlx.reporting import NullReporter, Reporter, reported_phase
 from kinomlx.samplers.noise import create_normal_noise_stream
-from kinomlx.seed_execution import SeedModels, execute_seed_stations
+from kinomlx.seed_execution import SeedModels, execute_seed_stages
+from kinomlx.seeds import SeedMode
 from kinomlx.types import DEFAULT_NOISE_BACKEND, NoiseBackend
 
-from .adapters.loading import apply_flux2_adapters, prepare_flux2_adapters
+from .adapters.loading import prepare_flux2_adapters
+from .components import Flux2Components, Flux2ComponentsProvider, Flux2SeedComponents
 from .image_processing import (
     ReferenceGeometry,
     load_reference_pixels,
@@ -28,19 +28,17 @@ from .image_processing import (
     spatial_ids,
     unpack_tokens,
 )
-from .loading import (
+from .resources import Flux2Resources
+from .restart import PreparedResources
+from .sampling import SamplingRecipe, denoise
+from .source_loading import (
     component_weight_files,
     load_text_encoder,
     load_tokenizer,
-    load_transformer_component,
     load_vae,
 )
-from .resources import Flux2Component, Flux2Resources
-from .restart import PreparedResources
-from .sampling import SamplingRecipe, denoise
-from .stations import Flux2Conditioning
 from .text import prepare_text
-from .transformer import Flux2Transformer
+from .text_conditioning import Flux2Conditioning
 
 
 @dataclass(frozen=True)
@@ -80,11 +78,12 @@ def generate_image(
     reporter: Reporter | None = None,
     adapters: tuple[AdapterSelection, ...] = (),
     conditioning: Flux2Conditioning | None = None,
-    capture_stations: bool = False,
+    capture_stages: bool = False,
+    components: Flux2ComponentsProvider | None = None,
 ) -> Flux2ImageResult:
-    """Generate one image using normal station lifetimes."""
+    """Generate one image using normal stage lifetimes."""
     models = SeedModels()
-    job = image_stations(
+    job = image_stages(
         resources=resources,
         prompt=prompt,
         recipe=recipe,
@@ -101,18 +100,19 @@ def generate_image(
         reporter=reporter,
         adapters=adapters,
         conditioning=conditioning,
-        capture_stations=capture_stations,
+        capture_stages=capture_stages,
         models=models,
+        components=components,
     )
     try:
         next(job)
-        return next(execute_seed_stations([job], models, "sequential"))
+        return next(execute_seed_stages([job], models, SeedMode.SEQUENTIAL))
     finally:
         job.close()
         models.close()
 
 
-def image_stations(
+def image_stages(
     resources: Flux2Resources | PreparedResources,
     prompt: str,
     *,
@@ -130,8 +130,9 @@ def image_stations(
     reporter: Reporter | None = None,
     adapters: tuple[AdapterSelection, ...] = (),
     conditioning: Flux2Conditioning | None = None,
-    capture_stations: bool = False,
+    capture_stages: bool = False,
     models: SeedModels,
+    components: Flux2ComponentsProvider | None = None,
 ) -> Generator[Flux2Conditioning | None, None, Flux2ImageResult]:
     """Generate with prepared resources; return pixels without choosing an output path.
 
@@ -140,8 +141,7 @@ def image_stations(
     releases each model before loading the next component.
     """
     selected = recipe or SamplingRecipe(resources.profile.variant)
-    transformer_component = resources.component("transformer")
-    dtype = resolve_float_dtype(transformer_component.dtype_policy)
+    dtype = resolve_bound_dtype(resources.component("transformer").dtype_policy)
     if selected.variant != resources.profile.variant:
         raise ValueError("Sampling recipe must match the prepared transformer variant")
     _, guidance = selected.resolved()
@@ -191,6 +191,8 @@ def image_stations(
             raise ValueError("Explicit noise and negative embeddings must be finite")
     stream = create_normal_noise_stream(seed, backend=noise_backend)
     progress = reporter or NullReporter()
+    provider = components if components is not None else Flux2Components(reporter=progress)
+    ports = Flux2SeedComponents(provider, models)
     with reported_phase(progress, "inspect_adapters"):
         adapter_plan = prepare_flux2_adapters(adapters)
     if conditioning is None:
@@ -219,19 +221,9 @@ def image_stations(
         else pack_tokens(stream.normal((1, 128, height // 16, width // 16), dtype))
     )
 
-    def load_transformer() -> ComponentLease[tuple[Flux2Transformer, tuple[AdapterReceipt, ...]]]:
-        model = load_transformer_component(transformer_component, dtype=dtype, reporter=progress)
-        with reported_phase(progress, "fuse_adapters"):
-            receipts = apply_flux2_adapters(
-                model,
-                adapter_plan,
-                variant=selected.variant.value,
-                check_weights=resources.check_adapter_weights,
-            )
-        return ComponentLease((model, receipts), cleanup=_cleanup_models)
-
-    transformer_lease = models.borrow("transformer", load_transformer)
-    transformer, adapter_receipts = transformer_lease.value
+    transformer_lease = ports.transformer(resources, adapter_plan=adapter_plan)
+    transformer = transformer_lease.value
+    adapter_receipts = transformer.adapter_receipts
     latents = denoise(
         transformer,
         current,
@@ -246,13 +238,13 @@ def image_stations(
     )
     del transformer
     transformer_lease.close()
-    saved_conditioning = conditioning if capture_stations else None
+    saved_conditioning = conditioning if capture_stages else None
     del conditioning
     gc.collect()
     mx.clear_cache()
     yield None
     pixels = decode_latents(
-        resources.component("vae"), latents, width, height, reporter=progress, models=models
+        resources, latents, width, height, reporter=progress, models=models, components=provider
     )
     return Flux2ImageResult(
         pixels,
@@ -262,21 +254,22 @@ def image_stations(
         geometries,
         adapter_receipts,
         saved_conditioning,
-        current if capture_stations else None,
-        selected.sigma_array(current.shape[1]) if capture_stations else None,
+        current if capture_stages else None,
+        selected.sigma_array(current.shape[1]) if capture_stages else None,
     )
 
 
 def decode_latents(
-    vae_component: Flux2Component,
+    resources: Flux2Resources | PreparedResources,
     latents: mx.array,
     width: int,
     height: int,
     *,
     reporter: Reporter | None = None,
     models: SeedModels | None = None,
+    components: Flux2ComponentsProvider | None = None,
 ) -> mx.array:
-    """Decode a final station using only the selected VAE component."""
+    """Decode a final stage using only the selected VAE component."""
     if min(width, height) < 64 or width % 16 or height % 16:
         raise ValueError("Klein decode dimensions require multiples of 16 >=64")
     if latents.shape != (1, width // 16 * (height // 16), 128):
@@ -286,15 +279,9 @@ def decode_latents(
     ):
         raise ValueError("Klein final latents must be finite floating-point values")
     progress = reporter or NullReporter()
-    load = partial(
-        load_vae, component_weight_files(vae_component), mode="decode", reporter=progress
-    )
-    lease = (
-        None
-        if models is None
-        else models.borrow("vae", lambda: ComponentLease(load(), cleanup=_cleanup_models))
-    )
-    vae = load() if lease is None else lease.value
+    provider = components if components is not None else Flux2Components(reporter=progress)
+    ports = provider if models is None else Flux2SeedComponents(provider, models)
+    vae = ports.image_decoder(resources).value
     with reported_phase(progress, "decode"):
         decoded = vae.decode_normalized(
             unpack_tokens(latents.astype(mx.bfloat16), height // 16, width // 16)

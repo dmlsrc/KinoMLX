@@ -65,7 +65,7 @@ def test_full_u64_list_and_selection_precedence(parser, assemble, schema, tmp_pa
 
 @pytest.mark.parametrize(("parser", "assemble", "schema"), MODELS[:2])
 def test_image_modes_and_variation_conflict(parser, assemble, schema):
-    for mode in ("sequential", "station", "resident"):
+    for mode in ("sequential", "stage", "resident"):
         invocation = assemble(
             parser().parse_args(["--prompt", "test", "--seed", "9", "2", "--seed-mode", mode])
         )

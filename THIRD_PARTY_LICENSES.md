@@ -15,11 +15,13 @@ here; see the "Attribution and license" section of the [README](./README.md).
 ## MLX
 
 - **Source:** <https://github.com/ml-explore/mlx>
-- **Used in:** runtime dependency declared in `pyproject.toml`, plus the
-  BF16-only STEEL attention Metal resources under
-  `kinomlx/models/ltx2/kernels/metal/`.
-  Those derived resources use MLX source commit
-  `2165dc08d7b33258260aa849d39f087d50e62962`.
+- **Used in:** runtime dependency declared in `pyproject.toml`, plus the STEEL
+  attention primitives of the FP16 dense, Sol-Attn and neighborhood attention kernels
+  under `kinomlx/models/ltx2/kernels/metal/`, and the STEEL GEMM fragment layout, block
+  product and loader index scheme of the low-rank fusion kernel in
+  `kinomlx/kernels/metal/low_rank_fusion.metal`. The attention resources use MLX source
+  commit `2165dc08d7b33258260aa849d39f087d50e62962`; the fusion resource follows MLX
+  v0.32.3, commit `64ea011cb65f14d9ce2737e60db9a4ae91ed7441`.
 - **License:** MIT
 
 ```text
@@ -342,10 +344,26 @@ SOFTWARE.
 
 ---
 
+## Sana Sol-Engine (Sol-Attn)
+
+- **Source:** <https://github.com/NVlabs/Sana> (`sol-engine` branch,
+  `techniques/sparse_backends/sol_attn`, read at commit
+  `62da34b14a53d7289e82fa56692f34e96e089bee`)
+- **Used in:** algorithmic reference for the sparse video self-attention under
+  `kinomlx/models/ltx2/kernels/sol_attention.py` and its Metal resources: 64-token
+  block routing by mean query and mean key against a per-row mean plus tau standard
+  deviations with a diagonal key variance, exact computation of routed and neighboring
+  blocks, and the length-weighted mean-key approximation of the rest. The kernel is a
+  new implementation on the MLX STEEL primitives noted above; no Sol-Attn source is
+  copied.
+- **License:** Apache-2.0 (full text in the shared section below)
+
+---
+
 ## Apache License 2.0 (shared text)
 
 The complete license text below applies to the Transformers, Krea 2,
-diffusers, PEFT, and comfyui-krea2edit entries above.
+diffusers, PEFT, comfyui-krea2edit, and Sana Sol-Engine entries above.
 
 ```text
                                  Apache License

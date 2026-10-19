@@ -7,14 +7,15 @@ from kinomlx.adapters.schedule import parse_step_strengths
 from kinomlx.api_boundaries import APIBoundary, configuration, runtime
 from kinomlx.cli.config_schema import settings_table
 from kinomlx.cli.image_schema import (
-    RESTART_PHASE_CLI,
     RESTART_RUN_CLI,
+    RESTART_STAGE_CLI,
     SIGMAS_CLI,
     SOURCE_ASPECT_CLI,
     SOURCE_IMAGE_CLI,
     image_output_table,
 )
 from kinomlx.cli.prompt_arguments import prompt_unconditional_field
+from kinomlx.cli.resource_operation import operation_table
 from kinomlx.cli.seed_arguments import seed_fields
 from kinomlx.config import (
     CliBinding,
@@ -25,10 +26,11 @@ from kinomlx.config import (
     ModelConfigSpec,
 )
 from kinomlx.config.source_rules import PROMPT_FILE
-from kinomlx.config.stations import StationPolicy
-from kinomlx.config_bindings import argument_value
+from kinomlx.config.stages import IrrelevantAction, StageMode, StagePolicy
+from kinomlx.config_bindings import CliAction, argument_value
 from kinomlx.config_constraints import field_choices
 from kinomlx.config_surfaces import CONFIG_SURFACES, MODEL_SURFACES, SOURCE_SURFACES
+from kinomlx.image_restart_config import IMAGE_RESTARTS, IMAGE_STAGES, ImageStage
 from kinomlx.invocation_controls import MODEL_CONTROL
 from kinomlx.settings import Settings
 
@@ -38,7 +40,7 @@ from .pipelines.image_edit import generate_krea2_edit
 from .pipelines.restart import restart_krea2
 from .pipelines.text_to_image import generate_krea2
 from .resources import prepare_resources
-from .restart import RESTART_PHASE_CHOICES, RestartConfig
+from .restart import RestartConfig
 from .runner import API_BOUNDARIES as RUNNER_API_BOUNDARIES
 from .settings import Krea2Settings
 from .types import Krea2GenerateConfig, Krea2Request
@@ -46,54 +48,88 @@ from .types import Krea2GenerateConfig, Krea2Request
 F = ConfigFieldSpec
 
 _LOCKED = (
-    StationPolicy(
-        "denoise", "locked", reason="This input belongs to completed source or text preparation."
+    StagePolicy(
+        "denoise",
+        StageMode.LOCKED,
+        reason="This input belongs to completed source or text preparation.",
     ),
-    StationPolicy(
-        "decode", "locked", reason="Decoding cannot change completed source or denoise input."
+    StagePolicy(
+        "decode",
+        StageMode.LOCKED,
+        reason="Decoding cannot change completed source or denoise input.",
     ),
 )
 _DENOISE = (
-    StationPolicy("denoise", "mutable", reason="A denoise restart reruns this input's station."),
-    StationPolicy("decode", "locked", reason="Decoding cannot change an earlier denoise input."),
+    StagePolicy(
+        ImageStage.DENOISE,
+        StageMode.MUTABLE,
+        reason="A denoise restart reruns this input's stage.",
+    ),
+    StagePolicy(
+        ImageStage.DECODE,
+        StageMode.LOCKED,
+        reason="Decoding cannot change an earlier denoise input.",
+    ),
 )
 _DECODE = (
-    StationPolicy("denoise", "mutable", reason="A denoise restart will run the decoder again."),
-    StationPolicy("decode", "mutable", reason="A decode restart can select a new decoder input."),
+    StagePolicy(
+        ImageStage.DENOISE,
+        StageMode.MUTABLE,
+        reason="A denoise restart will run the decoder again.",
+    ),
+    StagePolicy(
+        ImageStage.DECODE,
+        StageMode.MUTABLE,
+        reason="A decode restart can select a new decoder input.",
+    ),
 )
 _SOURCE_IDENTITY = (
-    StationPolicy("denoise", "locked", reason="The saved run fixes this model source identity."),
-    StationPolicy("decode", "locked", reason="The saved run fixes this model source identity."),
+    StagePolicy(
+        ImageStage.DENOISE,
+        StageMode.LOCKED,
+        reason="The saved run fixes this model source identity.",
+    ),
+    StagePolicy(
+        ImageStage.DECODE,
+        StageMode.LOCKED,
+        reason="The saved run fixes this model source identity.",
+    ),
 )
 _DENOISER_SETTING = (
-    StationPolicy(
-        "denoise", "mutable", reason="The new denoise execution may choose this setting."
+    StagePolicy(
+        "denoise", StageMode.MUTABLE, reason="The new denoise execution may choose this setting."
     ),
-    StationPolicy(
-        "decode", "locked", reason="Decode cannot change the source denoiser's execution setting."
+    StagePolicy(
+        "decode",
+        StageMode.LOCKED,
+        reason="Decode cannot change the source denoiser's execution setting.",
     ),
 )
 _RESTART_SELECTOR = (
-    StationPolicy(
-        "denoise", "mutable", reason="This selector belongs to the current restart invocation."
+    StagePolicy(
+        "denoise",
+        StageMode.MUTABLE,
+        reason="This selector belongs to the current restart invocation.",
     ),
-    StationPolicy(
-        "decode", "mutable", reason="This selector belongs to the current restart invocation."
+    StagePolicy(
+        "decode",
+        StageMode.MUTABLE,
+        reason="This selector belongs to the current restart invocation.",
     ),
 )
 _RESTART_LATENTS = (
-    StationPolicy(
+    StagePolicy(
         "denoise",
-        "irrelevant",
+        StageMode.IRRELEVANT,
         reason="Denoise consumes text conditioning, not final latents.",
-        irrelevant_action="reject",
+        irrelevant_action=IrrelevantAction.REJECT,
     ),
-    StationPolicy(
-        "decode", "mutable", reason="The current decode invocation may substitute final latents."
+    StagePolicy(
+        "decode",
+        StageMode.MUTABLE,
+        reason="The current decode invocation may substitute final latents.",
     ),
 )
-
-
 DIRECT_API_BOUNDARIES = (
     APIBoundary(
         "krea2",
@@ -137,7 +173,7 @@ DIRECT_API_BOUNDARIES = (
         (
             configuration("request", Krea2GenerateConfig, "generate", projection=True),
             runtime("resources", "prepared resource inventory"),
-            runtime("restart", "prepared station handoff"),
+            runtime("restart", "prepared stage handoff"),
             runtime("components", "component provider"),
             runtime("text_conditioner", "text-conditioning provider"),
             runtime("reporter", "progress reporter"),
@@ -150,9 +186,10 @@ DIRECT_API_BOUNDARIES = (
 
 CONFIG_SCHEMA = ModelConfigSpec(
     model="krea2",
-    restart_stations=RESTART_PHASE_CHOICES,
+    stages=IMAGE_STAGES,
+    restart_stages=IMAGE_RESTARTS,
     api_boundaries=(*RUNNER_API_BOUNDARIES, *DIRECT_API_BOUNDARIES),
-    title="KinoMLX Krea 2 generation and station-restart configuration",
+    title="KinoMLX Krea 2 generation and stage-restart configuration",
     introduction=(
         "Generate Krea 2 Raw or Turbo still images from local model resources.",
         (
@@ -181,13 +218,13 @@ CONFIG_SCHEMA = ModelConfigSpec(
             path=("generate",),
             cli_generated=True,
             record=Krea2GenerateConfig,
-            stations=RESTART_PHASE_CHOICES,
-            station_record=Krea2Request,
+            stages=IMAGE_RESTARTS,
+            stage_record=Krea2Request,
             fields=(
                 *(
                     replace(
                         field,
-                        station_policies={
+                        stage_policies={
                             "seed": _DENOISE,
                             "seeds": _LOCKED,
                             "seed_mode": _LOCKED,
@@ -195,11 +232,11 @@ CONFIG_SCHEMA = ModelConfigSpec(
                     )
                     for field in seed_fields(image=True)
                 ),
-                replace(prompt_unconditional_field(), station_policies=_LOCKED),
+                replace(prompt_unconditional_field(), stage_policies=_LOCKED),
                 F(
                     persistence="intent",
                     name="turbo_4step_exclusions",
-                    station_policies=_DENOISE,
+                    stage_policies=_DENOISE,
                     purpose="Set excluded target categories for the four-step Turbo adapter only",
                     valid="a comma-separated category string; none disables exclusions; requires turbo_4step",
                     example="output",
@@ -210,12 +247,12 @@ CONFIG_SCHEMA = ModelConfigSpec(
                 F(
                     persistence="intent",
                     name="turbo_sda",
-                    station_policies=_DENOISE,
+                    stage_policies=_DENOISE,
                     purpose="Apply the community SDA diversity adapter, gated to its training band",
                     valid="a boolean",
                     example=True,
                     cli_dest="turbo_sda",
-                    cli=CliBinding("Krea 2 generation", action="boolean"),
+                    cli=CliBinding("Krea 2 generation", action=CliAction.BOOLEAN),
                     notes=(
                         "Restores sampling diversity the Turbo distillation removed. Gated "
                         "by default to the band the adapter records, which reproduces its "
@@ -226,7 +263,7 @@ CONFIG_SCHEMA = ModelConfigSpec(
                 F(
                     persistence="intent",
                     name="turbo_sda_strength",
-                    station_policies=_DENOISE,
+                    stage_policies=_DENOISE,
                     purpose="Set the SDA diversity adapter strength",
                     valid="a finite number; requires turbo_sda",
                     example=1.0,
@@ -237,7 +274,7 @@ CONFIG_SCHEMA = ModelConfigSpec(
                 F(
                     persistence="intent",
                     name="turbo_sda_exclusions",
-                    station_policies=_DENOISE,
+                    stage_policies=_DENOISE,
                     purpose="Set excluded target categories for the SDA adapter only",
                     valid="a comma-separated category string; none disables exclusions; requires turbo_sda",
                     example="text_fusion",
@@ -248,7 +285,7 @@ CONFIG_SCHEMA = ModelConfigSpec(
                 F(
                     persistence="intent",
                     name="turbo_4step_step_strengths",
-                    station_policies=_DENOISE,
+                    stage_policies=_DENOISE,
                     purpose="Schedule the four-step Turbo adapter strength per denoise step",
                     valid="one finite value per resolved step; requires turbo_4step",
                     example=(1.0, 1.0, 0.0, 0.0),
@@ -262,7 +299,7 @@ CONFIG_SCHEMA = ModelConfigSpec(
                 F(
                     persistence="intent",
                     name="turbo_4step_sigma_window",
-                    station_policies=_DENOISE,
+                    stage_policies=_DENOISE,
                     purpose="Activate the four-step Turbo adapter only inside a noise-level window",
                     valid=(
                         'one "low" or "low:high" band, optionally "@strength", '
@@ -276,7 +313,7 @@ CONFIG_SCHEMA = ModelConfigSpec(
                 F(
                     persistence="intent",
                     name="turbo_sda_step_strengths",
-                    station_policies=_DENOISE,
+                    stage_policies=_DENOISE,
                     purpose="Schedule the SDA diversity adapter strength per denoise step",
                     valid="one finite value per resolved step; requires turbo_sda",
                     example=(1.0, 1.0, 0.0, 0.0),
@@ -290,7 +327,7 @@ CONFIG_SCHEMA = ModelConfigSpec(
                 F(
                     persistence="intent",
                     name="turbo_sda_sigma_window",
-                    station_policies=_DENOISE,
+                    stage_policies=_DENOISE,
                     purpose="Activate the SDA diversity adapter only inside a noise-level window",
                     valid=(
                         'one "low" or "low:high" band, optionally "@strength", '
@@ -304,19 +341,19 @@ CONFIG_SCHEMA = ModelConfigSpec(
                 F(
                     persistence="intent",
                     name="turbo_4step",
-                    station_policies=_DENOISE,
+                    stage_policies=_DENOISE,
                     purpose="Use the cached community four-step Turbo LoRA recipe",
                     valid="a boolean; four steps, no CFG, mu 1.15; Raw also needs a standard 8-step Turbo LoRA",
                     example=True,
                     cli_dest="turbo_4step",
                     groups=frozenset({ConfigGroup.SOURCE_SELECTOR}),
-                    cli=CliBinding("Krea 2 generation", action="boolean"),
+                    cli=CliBinding("Krea 2 generation", action=CliAction.BOOLEAN),
                     surfaces=CONFIG_SURFACES,
                 ),
                 F(
                     persistence="intent",
                     name="turbo_4step_strength",
-                    station_policies=_DENOISE,
+                    stage_policies=_DENOISE,
                     purpose="Set the four-step Turbo adapter strength",
                     valid="a finite positive number; requires turbo_4step",
                     example=0.75,
@@ -341,16 +378,16 @@ CONFIG_SCHEMA = ModelConfigSpec(
                 F(
                     persistence="intent",
                     name="prompt",
-                    station_policies=(
-                        StationPolicy(
+                    stage_policies=(
+                        StagePolicy(
                             "denoise",
-                            "locked",
+                            StageMode.LOCKED,
                             "prompts",
                             reason="Saved Qwen conditioning fixes the resolved prompt rows.",
                         ),
-                        StationPolicy(
+                        StagePolicy(
                             "decode",
-                            "locked",
+                            StageMode.LOCKED,
                             "prompts",
                             reason="Saved latents fix the resolved prompt rows.",
                         ),
@@ -360,13 +397,13 @@ CONFIG_SCHEMA = ModelConfigSpec(
                     example="A cinematic portrait in afternoon light",
                     starter="A cinematic portrait in afternoon light",
                     cli_dest="prompt",
-                    cli=CliBinding("Generation", action="append"),
+                    cli=CliBinding("Generation", action=CliAction.APPEND),
                     surfaces=CONFIG_SURFACES,
                 ),
                 F(
                     persistence="intent",
                     name="system_prompt",
-                    station_policies=_LOCKED,
+                    stage_policies=_LOCKED,
                     purpose="Override the regular Qwen system instruction",
                     valid="a string, including empty; omit for the training default; regular text only",
                     example="Describe the visible objects and their spatial relationships.",
@@ -377,16 +414,16 @@ CONFIG_SCHEMA = ModelConfigSpec(
                 F(
                     persistence="intent",
                     name="negative_prompt",
-                    station_policies=(
-                        StationPolicy(
+                    stage_policies=(
+                        StagePolicy(
                             "denoise",
-                            "locked",
+                            StageMode.LOCKED,
                             "negative_prompts",
                             reason="Saved Qwen conditioning fixes the negative rows.",
                         ),
-                        StationPolicy(
+                        StagePolicy(
                             "decode",
-                            "locked",
+                            StageMode.LOCKED,
                             "negative_prompts",
                             reason="Saved latents fix the negative rows.",
                         ),
@@ -395,13 +432,13 @@ CONFIG_SCHEMA = ModelConfigSpec(
                     valid="a string or array matching the prompt batch",
                     example="blurry, low contrast",
                     cli_dest="negative_prompt",
-                    cli=CliBinding("Generation", action="append"),
+                    cli=CliBinding("Generation", action=CliAction.APPEND),
                     surfaces=CONFIG_SURFACES,
                 ),
                 F(
                     persistence="intent",
                     name="width",
-                    station_policies=_DENOISE,
+                    stage_policies=_DENOISE,
                     purpose="Set requested output width before Krea alignment and crop",
                     valid="a positive pixel count",
                     example=1024,
@@ -412,7 +449,7 @@ CONFIG_SCHEMA = ModelConfigSpec(
                 F(
                     persistence="intent",
                     name="height",
-                    station_policies=_DENOISE,
+                    stage_policies=_DENOISE,
                     purpose="Set requested output height before Krea alignment and crop",
                     valid="a positive pixel count",
                     example=1024,
@@ -423,7 +460,7 @@ CONFIG_SCHEMA = ModelConfigSpec(
                 F(
                     persistence="intent",
                     name="steps",
-                    station_policies=_DENOISE,
+                    stage_policies=_DENOISE,
                     purpose="Override the selected variant's denoise step count",
                     valid="a positive integer",
                     example=8,
@@ -435,7 +472,7 @@ CONFIG_SCHEMA = ModelConfigSpec(
                 F(
                     persistence="intent",
                     name="guidance",
-                    station_policies=_DENOISE,
+                    stage_policies=_DENOISE,
                     purpose="Override Krea conditional-offset guidance",
                     valid="a finite nonnegative number",
                     example=3.5,
@@ -447,7 +484,7 @@ CONFIG_SCHEMA = ModelConfigSpec(
                 F(
                     persistence="intent",
                     name="mu",
-                    station_policies=_DENOISE,
+                    stage_policies=_DENOISE,
                     purpose="Override the scheduler shift and disable dynamic resolution shift",
                     valid="a finite number",
                     example=1.15,
@@ -459,7 +496,7 @@ CONFIG_SCHEMA = ModelConfigSpec(
                 F(
                     persistence="intent",
                     name="sigmas",
-                    station_policies=_DENOISE,
+                    stage_policies=_DENOISE,
                     purpose="Set the denoise schedule explicitly instead of shifting a uniform one",
                     valid=(
                         "an array of numbers between 0 and 1 in strictly decreasing order; "
@@ -477,7 +514,7 @@ CONFIG_SCHEMA = ModelConfigSpec(
                 F(
                     persistence="intent",
                     name="images_per_prompt",
-                    station_policies=_LOCKED,
+                    stage_policies=_LOCKED,
                     purpose="Generate this many independently seeded images per prompt",
                     valid="a positive integer",
                     example=1,
@@ -488,7 +525,7 @@ CONFIG_SCHEMA = ModelConfigSpec(
                 F(
                     persistence="intent",
                     name="noise_backend",
-                    station_policies=_DENOISE,
+                    stage_policies=_DENOISE,
                     purpose="Select native MLX noise or the PyTorch MPS normal-noise stream",
                     valid="",
                     choices=field_choices(Krea2GenerateConfig, "noise_backend"),
@@ -504,7 +541,7 @@ CONFIG_SCHEMA = ModelConfigSpec(
                 F(
                     persistence="intent",
                     name="text_conditioning",
-                    station_policies=_DENOISE,
+                    stage_policies=_DENOISE,
                     purpose="Load saved prompt tensors instead of running Qwen",
                     valid="a path to a compatible Krea 2 safetensors file",
                     example=Path("prompt_text.safetensors"),
@@ -515,7 +552,7 @@ CONFIG_SCHEMA = ModelConfigSpec(
                 F(
                     persistence="intent",
                     name="vae_tiling",
-                    station_policies=_DECODE,
+                    stage_policies=_DECODE,
                     purpose="Select automatic, full-image, or custom VAE decoding",
                     valid="",
                     choices=field_choices(Krea2GenerateConfig, "vae_tiling"),
@@ -532,7 +569,7 @@ CONFIG_SCHEMA = ModelConfigSpec(
                 F(
                     persistence="intent",
                     name="vae_tile_size",
-                    station_policies=_DECODE,
+                    stage_policies=_DECODE,
                     purpose="Set the custom VAE tile size in decoded pixels",
                     valid="a positive integer larger than the stride",
                     example=256,
@@ -543,7 +580,7 @@ CONFIG_SCHEMA = ModelConfigSpec(
                 F(
                     persistence="intent",
                     name="vae_tile_stride",
-                    station_policies=_DECODE,
+                    stage_policies=_DECODE,
                     purpose="Set the custom VAE tile stride in decoded pixels",
                     valid="a positive integer smaller than the tile size",
                     example=192,
@@ -551,11 +588,11 @@ CONFIG_SCHEMA = ModelConfigSpec(
                     cli=CliBinding("Generation"),
                     surfaces=CONFIG_SURFACES,
                 ),
-                replace(ADAPTERS, station_policies=_DENOISE),
+                replace(ADAPTERS, stage_policies=_DENOISE),
                 F(
                     persistence="intent",
                     name="source_images",
-                    station_policies=_LOCKED,
+                    stage_policies=_LOCKED,
                     purpose="Use one or two reference images in scene/subject order for editing",
                     valid="an array of image paths",
                     example=(Path("reference.png"),),
@@ -566,7 +603,7 @@ CONFIG_SCHEMA = ModelConfigSpec(
                 F(
                     persistence="intent",
                     name="match_source_aspect",
-                    station_policies=_LOCKED,
+                    stage_policies=_LOCKED,
                     purpose=(
                         "Keep the source image's aspect ratio; the named dimension is pinned "
                         "to the one size you pass (default 1024) and the other follows the source"
@@ -593,7 +630,7 @@ CONFIG_SCHEMA = ModelConfigSpec(
                 F(
                     persistence="intent",
                     name="edit_adapter_path",
-                    station_policies=_LOCKED,
+                    stage_policies=_LOCKED,
                     purpose="Select the edit adapter independently of additional adapters",
                     valid="a local safetensors path; omitted resolves the default from the HF cache",
                     example=Path("edit.safetensors"),
@@ -604,7 +641,7 @@ CONFIG_SCHEMA = ModelConfigSpec(
                 F(
                     persistence="intent",
                     name="edit_adapter_strength",
-                    station_policies=_LOCKED,
+                    stage_policies=_LOCKED,
                     purpose="Set the edit adapter strength independently of additional adapters",
                     valid="a finite nonzero number",
                     example=1.0,
@@ -615,7 +652,7 @@ CONFIG_SCHEMA = ModelConfigSpec(
                 F(
                     persistence="intent",
                     name="edit_adapter_exclusions",
-                    station_policies=_LOCKED,
+                    stage_policies=_LOCKED,
                     purpose="Set excluded target categories for the edit adapter only",
                     valid="a comma-separated category string; none disables exclusions",
                     example="text_fusion",
@@ -626,7 +663,7 @@ CONFIG_SCHEMA = ModelConfigSpec(
                 F(
                     persistence="intent",
                     name="reference_fit",
-                    station_policies=_LOCKED,
+                    stage_policies=_LOCKED,
                     valid="",
                     purpose="Choose how reference pixels fit the output grid",
                     choices=field_choices(Krea2GenerateConfig, "reference_fit"),
@@ -642,7 +679,7 @@ CONFIG_SCHEMA = ModelConfigSpec(
                 F(
                     persistence="intent",
                     name="grounding_system_prompt",
-                    station_policies=_LOCKED,
+                    stage_policies=_LOCKED,
                     purpose="Override the system instruction for image-grounded conditioning",
                     valid="text; empty uses the training default",
                     example="Describe facial identity and clothing details.",
@@ -653,20 +690,22 @@ CONFIG_SCHEMA = ModelConfigSpec(
                 F(
                     persistence="intent",
                     name="reference_boost_regions",
-                    station_policies=_LOCKED,
+                    stage_policies=_LOCKED,
                     purpose="Select reference boost regions by percentage coordinates; repeat to combine",
                     valid="rect:left,top,right,bottom; circle:x,y,radius; ellipse:x,y,rx,ry; polygon:x,y;x,y;x,y (percentages, optional %)",
                     example=("rect:35,15,65,55",),
                     cli_dest="reference_boost_regions",
                     cli=CliBinding(
-                        "Krea 2 editing", flags=("--reference-boost-region",), action="append"
+                        "Krea 2 editing",
+                        flags=("--reference-boost-region",),
+                        action=CliAction.APPEND,
                     ),
                     surfaces=CONFIG_SURFACES,
                 ),
                 F(
                     persistence="intent",
                     name="reference_boost_mask",
-                    station_policies=_LOCKED,
+                    stage_policies=_LOCKED,
                     purpose="Apply the last reference attention boost only to white mask regions",
                     valid="a grayscale image path; resized to the reference token grid",
                     example="subject-mask.png",
@@ -677,7 +716,7 @@ CONFIG_SCHEMA = ModelConfigSpec(
                 F(
                     persistence="intent",
                     name="grounding_px",
-                    station_policies=_LOCKED,
+                    stage_policies=_LOCKED,
                     purpose="Set the longest side used for semantic image grounding",
                     valid="a nonnegative integer; zero keeps native size",
                     example=768,
@@ -688,7 +727,7 @@ CONFIG_SCHEMA = ModelConfigSpec(
                 F(
                     persistence="intent",
                     name="reference_strength",
-                    station_policies=_LOCKED,
+                    stage_policies=_LOCKED,
                     purpose="Set target attention strength toward the last reference",
                     valid="a finite nonnegative number",
                     example=1.0,
@@ -699,7 +738,7 @@ CONFIG_SCHEMA = ModelConfigSpec(
                 F(
                     persistence="intent",
                     name="scene_reference_strength",
-                    station_policies=_LOCKED,
+                    stage_policies=_LOCKED,
                     purpose="Set target attention strength toward the first of two references",
                     valid="a finite nonnegative number",
                     example=1.0,
@@ -712,27 +751,27 @@ CONFIG_SCHEMA = ModelConfigSpec(
         image_output_table(
             "krea2",
             output_policies=OUTPUT_POLICIES,
-            stations=RESTART_PHASE_CHOICES,
+            stages=IMAGE_RESTARTS,
             noise_help="Save the generated unpacked noise as safetensors",
             latents_help="Save the final unpacked VAE latents as safetensors",
             conditioning_help="Save positive and optional negative Qwen output tensors",
         ),
         settings_table(
-            stations=RESTART_PHASE_CHOICES,
-            adapter_weight_check_stations=frozenset({"denoise"}),
+            stages=IMAGE_RESTARTS,
+            adapter_weight_check_stages=frozenset({"denoise"}),
         ),
         ConfigTableSpec(
             path=("model_settings",),
             cli_generated=True,
             cli_group="Krea 2 settings (override env vars)",
             record=Krea2Settings,
-            stations=RESTART_PHASE_CHOICES,
-            station_record=Krea2Settings,
+            stages=IMAGE_RESTARTS,
+            stage_record=Krea2Settings,
             fields=(
                 F(
                     persistence="intent",
                     name="variant",
-                    station_policies=_SOURCE_IDENTITY,
+                    stage_policies=_SOURCE_IDENTITY,
                     purpose="Select the Raw or Turbo Krea 2 recipe family",
                     valid="",
                     choices=field_choices(Krea2Settings, "variant"),
@@ -748,7 +787,7 @@ CONFIG_SCHEMA = ModelConfigSpec(
                 F(
                     persistence="intent",
                     name="source_path",
-                    station_policies=_SOURCE_IDENTITY,
+                    stage_policies=_SOURCE_IDENTITY,
                     purpose="Set a local baseline snapshot or component-pack directory",
                     valid="a compatible local directory",
                     example=Path("Krea-2-Turbo"),
@@ -758,7 +797,7 @@ CONFIG_SCHEMA = ModelConfigSpec(
                 F(
                     persistence="intent",
                     name="tokenizer_path",
-                    station_policies=_SOURCE_IDENTITY,
+                    stage_policies=_SOURCE_IDENTITY,
                     purpose="Override only the tokenizer source",
                     valid="a tokenizer directory or tokenizer.json path",
                     example=Path("components/tokenizer"),
@@ -768,7 +807,7 @@ CONFIG_SCHEMA = ModelConfigSpec(
                 F(
                     persistence="intent",
                     name="text_encoder_path",
-                    station_policies=_SOURCE_IDENTITY,
+                    stage_policies=_SOURCE_IDENTITY,
                     purpose="Override only the Qwen text-encoder source",
                     valid="a component directory or safetensors path",
                     example=Path("components/text_encoder"),
@@ -778,7 +817,7 @@ CONFIG_SCHEMA = ModelConfigSpec(
                 F(
                     persistence="intent",
                     name="transformer_path",
-                    station_policies=_SOURCE_IDENTITY,
+                    stage_policies=_SOURCE_IDENTITY,
                     purpose="Override only the Krea transformer source",
                     valid="a component directory, index, or safetensors path",
                     example=Path("components/transformer"),
@@ -788,7 +827,7 @@ CONFIG_SCHEMA = ModelConfigSpec(
                 F(
                     persistence="intent",
                     name="vae_path",
-                    station_policies=_DECODE,
+                    stage_policies=_DECODE,
                     purpose="Override the VAE source and autodetect its supported decoder profile",
                     valid="a component directory or safetensors path",
                     example=Path("components/vae"),
@@ -799,7 +838,7 @@ CONFIG_SCHEMA = ModelConfigSpec(
                 F(
                     persistence="intent",
                     name="vae_decoder",
-                    station_policies=_DECODE,
+                    stage_policies=_DECODE,
                     purpose="Select the stock Qwen or cached aesthetic 2x decoder",
                     valid="",
                     choices=field_choices(Krea2Settings, "vae_decoder"),
@@ -818,7 +857,7 @@ CONFIG_SCHEMA = ModelConfigSpec(
                 F(
                     persistence="intent",
                     name="transformer_dtype",
-                    station_policies=_DENOISER_SETTING,
+                    stage_policies=_DENOISER_SETTING,
                     purpose="Select the transformer execution dtype",
                     valid="",
                     choices=field_choices(Krea2Settings, "transformer_dtype"),
@@ -834,7 +873,7 @@ CONFIG_SCHEMA = ModelConfigSpec(
                 F(
                     persistence="intent",
                     name="reference_denoise",
-                    station_policies=_DENOISER_SETTING,
+                    stage_policies=_DENOISER_SETTING,
                     purpose="Use padded, masked denoising with original weight layouts",
                     valid="true or false; true requires BF16 or FP32 because padding can overflow FP16",
                     example=False,
@@ -845,7 +884,7 @@ CONFIG_SCHEMA = ModelConfigSpec(
                 F(
                     persistence="intent",
                     name="vae_dtype",
-                    station_policies=_DECODE,
+                    stage_policies=_DECODE,
                     purpose="Select the VAE decode dtype",
                     valid="",
                     choices=field_choices(Krea2Settings, "vae_dtype"),
@@ -860,18 +899,19 @@ CONFIG_SCHEMA = ModelConfigSpec(
                 ),
             ),
         ),
+        operation_table(cli_group="Krea 2 execution", stages=IMAGE_RESTARTS),
         ConfigTableSpec(
             path=("restart",),
             cli_generated=True,
             record=RestartConfig,
-            stations=RESTART_PHASE_CHOICES,
-            station_record=RestartConfig,
+            stages=IMAGE_RESTARTS,
+            stage_record=RestartConfig,
             default_present=False,
             fields=(
                 F(
                     persistence="intent",
                     name="run",
-                    station_policies=_RESTART_SELECTOR,
+                    stage_policies=_RESTART_SELECTOR,
                     purpose="Load a prior Krea run record",
                     valid="a completed KinoMLX Krea run-log path",
                     example=Path("previous_run.json"),
@@ -884,26 +924,26 @@ CONFIG_SCHEMA = ModelConfigSpec(
                 ),
                 F(
                     persistence="intent",
-                    name="phase",
-                    station_policies=_RESTART_SELECTOR,
-                    purpose="Select the first Krea station to repeat",
+                    name="stage",
+                    stage_policies=_RESTART_SELECTOR,
+                    purpose="Select the first Krea stage to repeat",
                     valid="",
-                    choices=field_choices(RestartConfig, "phase"),
+                    choices=field_choices(RestartConfig, "stage"),
                     choice_help=(
                         ("decode", "Decode an already generated final latent"),
                         ("denoise", "Resume after Qwen from saved text conditioning"),
                     ),
                     example="denoise",
-                    cli_dest="restart_phase",
-                    environment_key="restart_phase",
+                    cli_dest="restart_stage",
+                    environment_key="restart_stage",
                     groups=frozenset({ConfigGroup.SOURCE_SELECTOR}),
-                    cli=RESTART_PHASE_CLI,
+                    cli=RESTART_STAGE_CLI,
                     surfaces=CONFIG_SURFACES,
                 ),
                 F(
                     persistence="intent",
                     name="latents",
-                    station_policies=_RESTART_LATENTS,
+                    stage_policies=_RESTART_LATENTS,
                     purpose="Substitute the final-latent artifact",
                     valid="a compatible KinoMLX Krea safetensors file",
                     example=Path("edited.safetensors"),
@@ -917,7 +957,7 @@ CONFIG_SCHEMA = ModelConfigSpec(
                 F(
                     persistence="intent",
                     name="index",
-                    station_policies=_RESTART_SELECTOR,
+                    stage_policies=_RESTART_SELECTOR,
                     purpose="Select which image of a multi-image source run to resume",
                     valid="a one-based output index within the source run's image count",
                     example=2,

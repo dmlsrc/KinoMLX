@@ -13,8 +13,9 @@ from kinomlx.adapters.fusion import (
 from kinomlx.adapters.lora import LoRAProfile
 from kinomlx.io.safetensors import load_weights
 from kinomlx.modeling.conversion import SourceTensor
+from kinomlx.modeling.dtypes import FloatDType
 from kinomlx.models.ltx2.weights.policy import normalize_transformer_layout_policy
-from kinomlx.models.ltx2.weights.schema import TRANSFORMER_QUANTIZE_OFF
+from kinomlx.models.ltx2.weights.schema import TransformerQuantize
 from kinomlx.models.ltx2.weights.tensors import quant_mode_for_key
 
 from .adapters.loading import community_adapter_operations
@@ -66,7 +67,7 @@ def transformer_source_loader(
         audio_attn_layout_layers=policy.audio_attn_layout_layers,
         video_ff_quantize_specs=policy.video_ff_quantize_specs,
         video_ff_quantize_layers=policy.video_ff_quantize_layers,
-        layouts_enabled=policy.transformer_quantize == TRANSFORMER_QUANTIZE_OFF,
+        layouts_enabled=policy.transformer_quantize == TransformerQuantize.OFF,
     )
     resolved_bindings = resolve_transformer_bindings(
         source, config, include_audio=policy.include_audio
@@ -114,7 +115,7 @@ def transformer_source_loader(
         half_accumulation_fallbacks(
             {key: group for key, group in operations.items() if key in half_targets}
         )
-        if accumulation == "float16"
+        if accumulation == FloatDType.FLOAT16
         else frozenset()
     )
 
@@ -123,7 +124,9 @@ def transformer_source_loader(
         if selected is None:
             return value
         return fuse_weight(
-            value, selected, accumulation="float32" if mlx_key in fallbacks else accumulation
+            value,
+            selected,
+            accumulation=FloatDType.FLOAT32 if mlx_key in fallbacks else accumulation,
         )
 
     preparation = prepare_transformer_source(
@@ -178,11 +181,7 @@ def transformer_source_loader(
                 block_sources[index].append(item)
     window_size = policy.resident_blocks or 1
     windows = {
-        start: tuple(
-            item
-            for index in range(start, start + window_size)
-            for item in block_sources.get(index, ())
-        )
+        start: tuple(*block_sources.get(index, ()) for index in range(start, start + window_size))
         for start in range(0, len(block_sources), window_size)
     }
 

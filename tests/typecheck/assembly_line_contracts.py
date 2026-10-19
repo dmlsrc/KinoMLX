@@ -18,33 +18,34 @@ from kinomlx.media.signals import (
 )
 from kinomlx.models.ltx2.adapters.receipt import LTX2AdapterReceipt
 from kinomlx.models.ltx2.components import (
-    AudioDecoderPort,
-    DurationPredictorPort,
-    NativeLTX2Components,
-    TransformerPort,
-    VideoDecoderPort,
-    VideoEncoderPort,
-    VocoderPort,
+    LTX2AudioDecoderPort,
+    LTX2Components,
+    LTX2DurationPredictorPort,
+    LTX2TransformerPort,
+    LTX2VideoDecoderPort,
+    LTX2VideoEncoderPort,
+    LTX2VocoderPort,
 )
 from kinomlx.models.ltx2.components import (
-    DistilledComponents as ProductDistilledComponents,
+    LTX2ComponentsProvider as ProductDistilledComponents,
 )
 from kinomlx.models.ltx2.conditioning import EncodedCondition
 from kinomlx.models.ltx2.conditioning.tools import VideoLatentTools
-from kinomlx.models.ltx2.pipelines.distilled import generate_distilled
+from kinomlx.models.ltx2.pipelines.distilled import generate_ltx2
 from kinomlx.models.ltx2.resources import LTX2Resources
 from kinomlx.models.ltx2.runner import Recipe
 from kinomlx.models.ltx2.signals import LTX23_SDR_SIGNAL
-from kinomlx.models.ltx2.types import DistilledRequest as ProductDistilledRequest
 from kinomlx.models.ltx2.types import LatentState
-from kinomlx.models.ltx2.upscaler.ports import LatentStatisticsPort, SpatialUpscalerPort
+from kinomlx.models.ltx2.types import LTX2Request as ProductDistilledRequest
+from kinomlx.models.ltx2.upscaler.ports import LTX2LatentStatisticsPort, LTX2SpatialUpscalerPort
 from kinomlx.output import ArtifactSet, Generation, GenerationSink, VideoToolboxGenerationSink
 from kinomlx.reporting import Reporter
 from tests.models.ltx2.assembly_line._contracts import (
     ContractOutput,
     ContractResources,
-    DistilledComponents,
-    DistilledRequest,
+    LTX2ComponentsProvider,
+    LTX2Request,
+    LTX2TextConditionerPort,
     NativeContractComponents,
     OneStageComponents,
     OneStageRequest,
@@ -52,7 +53,6 @@ from tests.models.ltx2.assembly_line._contracts import (
     RecordingComponents,
     RecordingProgressReporter,
     RecordingTextConditioner,
-    TextConditioner,
     run_distilled_contract,
     run_one_stage_contract,
 )
@@ -61,11 +61,11 @@ from tests.models.ltx2.assembly_line._contracts import (
 class DistilledRecipe(Protocol):
     def __call__(
         self,
-        request: DistilledRequest,
+        request: LTX2Request,
         resources: ContractResources,
         *,
-        components: DistilledComponents | None = None,
-        text_conditioner: TextConditioner | None = None,
+        components: LTX2ComponentsProvider | None = None,
+        text_conditioner: LTX2TextConditionerPort | None = None,
         reporter: ProgressReporter | None = None,
     ) -> ContractOutput: ...
 
@@ -77,7 +77,7 @@ class OneStageRecipe(Protocol):
         resources: ContractResources,
         *,
         components: OneStageComponents | None = None,
-        text_conditioner: TextConditioner | None = None,
+        text_conditioner: LTX2TextConditionerPort | None = None,
         reporter: ProgressReporter | None = None,
     ) -> ContractOutput: ...
 
@@ -114,7 +114,7 @@ class SyntheticTransformer:
 
 
 class SyntheticVideoEncoder:
-    per_channel_statistics: LatentStatisticsPort = SyntheticStatistics()
+    per_channel_statistics: LTX2LatentStatisticsPort = SyntheticStatistics()
 
     def __call__(self, video: mx.array, *, reporter: Reporter | None = None) -> mx.array:
         del reporter
@@ -122,7 +122,7 @@ class SyntheticVideoEncoder:
 
 
 class SyntheticSpatialUpscaler:
-    per_channel_statistics: LatentStatisticsPort = SyntheticStatistics()
+    per_channel_statistics: LTX2LatentStatisticsPort = SyntheticStatistics()
 
     def __call__(self, latent: mx.array, *, reporter: Reporter | None = None) -> mx.array:
         del reporter
@@ -183,34 +183,34 @@ class SyntheticProductComponents:
         self,
         resources: LTX2Resources,
         profile: LoRAProfile = (),
-    ) -> ComponentLease[TransformerPort]:
+    ) -> ComponentLease[LTX2TransformerPort]:
         del resources, profile
         return ComponentLease(SyntheticTransformer())
 
-    def video_encoder(self, resources: LTX2Resources) -> ComponentLease[VideoEncoderPort]:
+    def video_encoder(self, resources: LTX2Resources) -> ComponentLease[LTX2VideoEncoderPort]:
         del resources
         return ComponentLease(SyntheticVideoEncoder())
 
-    def spatial_upscaler(self, resources: LTX2Resources) -> ComponentLease[SpatialUpscalerPort]:
+    def spatial_upscaler(self, resources: LTX2Resources) -> ComponentLease[LTX2SpatialUpscalerPort]:
         del resources
         return ComponentLease(SyntheticSpatialUpscaler())
 
     def duration_predictor(
         self,
         resources: LTX2Resources,
-    ) -> ComponentLease[DurationPredictorPort]:
+    ) -> ComponentLease[LTX2DurationPredictorPort]:
         del resources
         return ComponentLease(SyntheticDurationPredictor())
 
-    def audio_decoder(self, resources: LTX2Resources) -> ComponentLease[AudioDecoderPort]:
+    def audio_decoder(self, resources: LTX2Resources) -> ComponentLease[LTX2AudioDecoderPort]:
         del resources
         return ComponentLease(SyntheticAudioDecoder())
 
-    def vocoder(self, resources: LTX2Resources) -> ComponentLease[VocoderPort]:
+    def vocoder(self, resources: LTX2Resources) -> ComponentLease[LTX2VocoderPort]:
         del resources
         return ComponentLease(SyntheticVocoder())
 
-    def video_decoder(self, resources: LTX2Resources) -> ComponentLease[VideoDecoderPort]:
+    def video_decoder(self, resources: LTX2Resources) -> ComponentLease[LTX2VideoDecoderPort]:
         del resources
         return ComponentLease(SyntheticVideoDecoder())
 
@@ -221,14 +221,14 @@ class SyntheticGenerationSink:
         return ArtifactSet(video=Path("synthetic.mp4"))
 
 
-recording_components: DistilledComponents = RecordingComponents()
-native_components: DistilledComponents = NativeContractComponents()
-product_native_components: ProductDistilledComponents = NativeLTX2Components()
+recording_components: LTX2ComponentsProvider = RecordingComponents()
+native_components: LTX2ComponentsProvider = NativeContractComponents()
+product_native_components: ProductDistilledComponents = LTX2Components()
 product_test_components: ProductDistilledComponents = SyntheticProductComponents()
-product_distilled_recipe: Recipe[ProductDistilledRequest] = generate_distilled
+product_distilled_recipe: Recipe[ProductDistilledRequest] = generate_ltx2
 one_stage_components: OneStageComponents = RecordingComponents()
 reporter: ProgressReporter = RecordingProgressReporter()
-text_conditioner: TextConditioner = RecordingTextConditioner()
+text_conditioner: LTX2TextConditionerPort = RecordingTextConditioner()
 product_reporter: Reporter = RecordingProgressReporter()
 encoded_condition: EncodedCondition = SyntheticEncodedCondition()
 generation_sink: GenerationSink = SyntheticGenerationSink()
@@ -241,7 +241,7 @@ one_stage_recipe: OneStageRecipe = run_one_stage_contract
 
 
 def external_example(
-    request: DistilledRequest,
+    request: LTX2Request,
     resources: ContractResources,
 ) -> tuple[str, ...]:
     """Type-check the ordinary external recipe -> sink composition."""

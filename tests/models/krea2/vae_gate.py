@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any
 
 import mlx.core as mx
-from _vae_fixtures import (
+from vae._fixtures import (
     ALTERNATE_VAE_NORMALIZED_RMSE_LIMIT,
     ALTERNATE_VAE_PIXEL_MAX_ABS_LIMIT,
     ALTERNATE_VAE_PIXEL_MEAN_ABS_LIMIT,
@@ -262,7 +262,7 @@ def run_vae(
     ]
 
     import kinomlx.models.krea2 as krea2_package
-    from kinomlx.models.krea2.components import NativeKrea2Components
+    from kinomlx.models.krea2.components import Krea2Components
     from kinomlx.models.krea2.output import Krea2StillOutputPlan, Krea2StillOutputSink
     from kinomlx.models.krea2.resources import prepare_resources
     from kinomlx.models.krea2.settings import Krea2Settings
@@ -301,7 +301,7 @@ def run_vae(
 
     events = RecordingReporter()
     timing = TimingReporter(events)
-    components = NativeKrea2Components(reporter=timing)
+    components = Krea2Components(reporter=timing)
     memory_before, before_available = _memory_snapshot(mx)
     load_started = time.perf_counter()
     lease = components.image_decoder(turbo)

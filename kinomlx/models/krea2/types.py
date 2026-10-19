@@ -14,7 +14,7 @@ from kinomlx.config_constraints import (
     NumberSequenceConstraint,
 )
 from kinomlx.config_records import config_record, construct_record, supplied_fields
-from kinomlx.io.geometry import MATCH_SOURCE_ASPECT_CHOICES
+from kinomlx.io.geometry import MATCH_SOURCE_ASPECT_CHOICES, REFERENCE_FIT_CHOICES
 from kinomlx.prompts import PromptInputConstraint, normalize_prompts
 from kinomlx.request_rules import IMAGE_PROMPT, IMAGE_SEEDS
 from kinomlx.samplers.config import SigmaScheduleConstraint
@@ -89,7 +89,8 @@ class _Krea2InputFields:
         },
     )
     seed_mode: SeedMode = field(
-        default="sequential", metadata={"config_constraints": (ChoiceConstraint(SEED_MODES),)}
+        default=SeedMode.SEQUENTIAL,
+        metadata={"config_constraints": (ChoiceConstraint(SEED_MODES),)},
     )
     turbo_4step: bool = field(default=False, metadata={"config_rules": (PROFILES,)})
     turbo_4step_exclusions: str = field(
@@ -136,7 +137,7 @@ class _Krea2InputFields:
         metadata={"config_constraints": (ChoiceConstraint(NOISE_BACKEND_CHOICES),)},
     )
     vae_tiling: VAETilingMode = field(
-        default="auto",
+        default=VAETilingMode.AUTO,
         metadata={"config_constraints": (ChoiceConstraint(VAE_TILING_MODE_CHOICES),)},
     )
     vae_tile_size: int = field(
@@ -162,7 +163,7 @@ class _Krea2InputFields:
         default="", metadata={"config_constraints": (ProfileExclusionsConstraint(),)}
     )
     reference_fit: str = field(
-        default="fit", metadata={"config_constraints": (ChoiceConstraint(("fit", "crop")),)}
+        default="fit", metadata={"config_constraints": (ChoiceConstraint(REFERENCE_FIT_CHOICES),)}
     )
     grounding_system_prompt: str = field(
         default="", metadata={"config_constraints": (LengthConstraint(maximum=65_536),)}

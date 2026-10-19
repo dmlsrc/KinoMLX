@@ -18,11 +18,15 @@ class LTX2AdapterReceipt:
     complete_targets: int
     placed_targets: int
     structural_coverage: float
+    bare_parameter_targets: int
     target_categories: tuple[tuple[str, int], ...]
     skipped_reasons: tuple[tuple[str, int], ...]
     effective: bool
     warnings: tuple[str, ...]
     adapter_types: tuple[str, ...]
+    # What set the intrinsic scale beneath user strength, and its LoRA values.
+    scale_source: str | None = None
+    intrinsic_scales: tuple[float, ...] = ()
 
     def to_metadata(self) -> dict[str, object]:
         return {
@@ -37,10 +41,13 @@ class LTX2AdapterReceipt:
             "complete_targets": self.complete_targets,
             "placed_targets": self.placed_targets,
             "structural_coverage": self.structural_coverage,
+            "bare_parameter_targets": self.bare_parameter_targets,
             "target_categories": dict(self.target_categories),
             "skipped_reasons": dict(self.skipped_reasons),
             "effective": self.effective,
             "warnings": list(self.warnings),
+            "scale_source": self.scale_source,
+            "intrinsic_scales": list(self.intrinsic_scales),
         }
 
 

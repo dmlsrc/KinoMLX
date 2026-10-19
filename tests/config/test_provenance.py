@@ -76,7 +76,7 @@ def test_deleted_prepared_field_does_not_steal_inherited_origin():
     inputs = collect_invocation_sources(config_registry().model("krea2"), options).prepare(
         PreparedConfig({"output": {"save_final_latents": False}}, {})
     )
-    # Existing station preparation may remove artifacts unavailable at that station.
+    # Existing stage preparation may remove artifacts unavailable at that stage.
     inputs.cli.values["output"].pop("save_final_latents")
     origin = inputs.provenance()[("output", "save_final_latents")]
     assert origin.kind == "inherited"

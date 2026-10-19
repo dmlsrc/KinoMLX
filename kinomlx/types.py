@@ -7,13 +7,30 @@ models reuse the shape primitives without inheriting another model's
 defaults.
 """
 
-from typing import Literal, NamedTuple
+from enum import StrEnum
+from typing import NamedTuple
 
-NoiseBackend = Literal["mlx", "torch-mps"]
-NOISE_BACKEND_CHOICES = ("mlx", "torch-mps")
-DEFAULT_NOISE_BACKEND: NoiseBackend = "mlx"
-VAETilingMode = Literal["auto", "single", "custom"]
-VAE_TILING_MODE_CHOICES = ("auto", "single", "custom")
+
+class NoiseBackend(StrEnum):
+    """Which normal-noise stream a request reproduces."""
+
+    MLX = "mlx"
+    TORCH_MPS = "torch-mps"
+
+
+NOISE_BACKEND_CHOICES = tuple(item.value for item in NoiseBackend)
+DEFAULT_NOISE_BACKEND: NoiseBackend = NoiseBackend.MLX
+
+
+class VAETilingMode(StrEnum):
+    """How a VAE decode is split to fit its memory budget."""
+
+    AUTO = "auto"
+    SINGLE = "single"
+    CUSTOM = "custom"
+
+
+VAE_TILING_MODE_CHOICES = tuple(item.value for item in VAETilingMode)
 
 
 class VideoPixelShape(NamedTuple):

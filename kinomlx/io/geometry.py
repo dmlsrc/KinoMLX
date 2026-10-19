@@ -1,8 +1,29 @@
 """Shared source-aspect output sizing for image models."""
 
 import math
+from enum import StrEnum
 
-MATCH_SOURCE_ASPECT_CHOICES = ("long", "short", "width", "height")
+
+class MatchSourceAspect(StrEnum):
+    """Which output axis a source aspect ratio is pinned to."""
+
+    LONG = "long"
+    SHORT = "short"
+    WIDTH = "width"
+    HEIGHT = "height"
+
+
+MATCH_SOURCE_ASPECT_CHOICES = tuple(item.value for item in MatchSourceAspect)
+
+
+class ReferenceFit(StrEnum):
+    """How a reference image is placed on the output grid."""
+
+    FIT = "fit"
+    CROP = "crop"
+
+
+REFERENCE_FIT_CHOICES = tuple(item.value for item in ReferenceFit)
 _AXES = ("width", "height")
 
 

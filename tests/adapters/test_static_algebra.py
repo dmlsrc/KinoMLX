@@ -11,6 +11,7 @@ from kinomlx.adapters.algebra import (
 )
 from kinomlx.adapters.formats import parse_adapter
 from kinomlx.adapters.fusion import WeightedAdapterOperation
+from kinomlx.modeling.dtypes import FloatDType
 from kinomlx.modeling.loading import WeightTarget
 from tests.adapters._fusion import fuse_and_check
 
@@ -445,7 +446,7 @@ def test_half_targets_accumulate_plain_lora_in_half_and_others_in_fp32() -> None
     fuse_and_check(
         {"layer": WeightTarget(owner, "weight", base.shape)},
         {"layer": (first, second)},
-        accumulation="float16",
+        accumulation=FloatDType.FLOAT16,
     )
     up16, down16 = up.astype(mx.float16), down.astype(mx.float16)
     expected_half = mx.addmm(
@@ -472,7 +473,7 @@ def test_half_targets_accumulate_plain_lora_in_half_and_others_in_fp32() -> None
     fuse_and_check(
         {"layer": WeightTarget(owner_wide, "weight", base.shape)},
         {"layer": (first, second)},
-        accumulation="float16",
+        accumulation=FloatDType.FLOAT16,
     )
     expected_wide = mx.addmm(
         mx.addmm(wide.astype(mx.float32), up, down, alpha=0.5 * unit_scale),
@@ -497,7 +498,7 @@ def test_half_targets_accumulate_plain_lora_in_half_and_others_in_fp32() -> None
     fuse_and_check(
         {"layer": WeightTarget(owner_half, "weight", dora_base.shape)},
         {"layer": selected},
-        accumulation="float16",
+        accumulation=FloatDType.FLOAT16,
     )
     assert mx.array_equal(owner_half.weight, reference.weight.astype(mx.float16)).item()
 
@@ -526,8 +527,8 @@ def test_half_admission_rejects_factors_beyond_float16_range() -> None:
     # The narrow range is real: the FP32 chain fuses the wide factors to 1.0, the
     # half path overflows on the factor cast, which is why callers gate on admission.
     base = mx.zeros((2, 3), dtype=mx.float16)
-    wide_fp32 = fuse_weight(base, wide_ops, accumulation="float32")
-    wide_fp16 = fuse_weight(base, wide_ops, accumulation="float16")
+    wide_fp32 = fuse_weight(base, wide_ops, accumulation=FloatDType.FLOAT32)
+    wide_fp16 = fuse_weight(base, wide_ops, accumulation=FloatDType.FLOAT16)
     mx.eval(wide_fp32, wide_fp16)
     assert mx.all(wide_fp32 == 1.0).item()
     assert not mx.all(mx.isfinite(wide_fp16)).item()
@@ -559,7 +560,7 @@ def test_half_fallback_is_per_target_and_skips_native_half_factors(monkeypatch) 
         for key, owner in owners.items()
     }
     fusion.fuse_adapter_operations(
-        targets, groups, pending=AdapterWeightCheck(), accumulation="float16"
+        targets, groups, pending=AdapterWeightCheck(), accumulation=FloatDType.FLOAT16
     )
     for key, owner in owners.items():
         assert mx.array_equal(owner.weight, expected[key]).item()

@@ -1,6 +1,6 @@
 """Pure contract harness for the assembly-line architecture.
 
-The harness is independent of MLX and model weights. It verifies station ordering
+The harness is independent of MLX and model weights. It verifies stage ordering
 and ownership rules with injected providers and reusable trace assertions.
 """
 
@@ -58,108 +58,108 @@ class ComponentEvent:
 
     action: Literal["load", "use", "close"]
     component: ComponentName
-    station: str
+    stage: str
     active: frozenset[ComponentName]
     profile: LoraProfile = EMPTY_PROFILE
 
 
-class InjectedStationFailure(RuntimeError):
-    """Failure raised by the recording provider at a selected station."""
+class InjectedStageFailure(RuntimeError):
+    """Failure raised by the recording provider at a selected stage."""
 
-    def __init__(self, station: str) -> None:
-        super().__init__(f"injected failure at {station}")
-        self.station = station
+    def __init__(self, stage: str) -> None:
+        super().__init__(f"injected failure at {stage}")
+        self.stage = stage
 
 
 class ComponentPort(Protocol):
     """Operation shared by the synthetic component ports."""
 
-    def use(self, station: str) -> None: ...
+    def use(self, stage: str) -> None: ...
 
 
-class VideoEncoderPort(ComponentPort, Protocol):
+class LTX2VideoEncoderPort(ComponentPort, Protocol):
     pass
 
 
-class TransformerPort(ComponentPort, Protocol):
+class LTX2TransformerPort(ComponentPort, Protocol):
     pass
 
 
-class SpatialUpscalerPort(ComponentPort, Protocol):
+class LTX2SpatialUpscalerPort(ComponentPort, Protocol):
     pass
 
 
-class AudioDecoderPort(ComponentPort, Protocol):
+class LTX2AudioDecoderPort(ComponentPort, Protocol):
     pass
 
 
-class VocoderPort(ComponentPort, Protocol):
+class LTX2VocoderPort(ComponentPort, Protocol):
     pass
 
 
-class VideoDecoderPort(ComponentPort, Protocol):
+class LTX2VideoDecoderPort(ComponentPort, Protocol):
     pass
 
 
-class VideoEncoderProvider(Protocol):
+class LTX2VideoEncoderProvider(Protocol):
     def video_encoder(
         self,
         resources: ContractResources,
-    ) -> AbstractContextManager[VideoEncoderPort]: ...
+    ) -> AbstractContextManager[LTX2VideoEncoderPort]: ...
 
 
-class TransformerProvider(Protocol):
+class LTX2TransformerProvider(Protocol):
     def transformer(
         self,
         resources: ContractResources,
         profile: LoraProfile,
-    ) -> AbstractContextManager[TransformerPort]: ...
+    ) -> AbstractContextManager[LTX2TransformerPort]: ...
 
 
-class SpatialUpscalerProvider(Protocol):
+class LTX2SpatialUpscalerProvider(Protocol):
     def spatial_upscaler(
         self,
         resources: ContractResources,
-    ) -> AbstractContextManager[SpatialUpscalerPort]: ...
+    ) -> AbstractContextManager[LTX2SpatialUpscalerPort]: ...
 
 
-class AudioDecoderProvider(Protocol):
+class LTX2AudioDecoderProvider(Protocol):
     def audio_decoder(
         self,
         resources: ContractResources,
-    ) -> AbstractContextManager[AudioDecoderPort]: ...
+    ) -> AbstractContextManager[LTX2AudioDecoderPort]: ...
 
 
-class VocoderProvider(Protocol):
+class LTX2VocoderProvider(Protocol):
     def vocoder(
         self,
         resources: ContractResources,
-    ) -> AbstractContextManager[VocoderPort]: ...
+    ) -> AbstractContextManager[LTX2VocoderPort]: ...
 
 
-class VideoDecoderProvider(Protocol):
+class LTX2VideoDecoderProvider(Protocol):
     def video_decoder(
         self,
         resources: ContractResources,
-    ) -> AbstractContextManager[VideoDecoderPort]: ...
+    ) -> AbstractContextManager[LTX2VideoDecoderPort]: ...
 
 
-class DistilledComponents(
-    VideoEncoderProvider,
-    TransformerProvider,
-    SpatialUpscalerProvider,
-    AudioDecoderProvider,
-    VocoderProvider,
-    VideoDecoderProvider,
+class LTX2ComponentsProvider(
+    LTX2VideoEncoderProvider,
+    LTX2TransformerProvider,
+    LTX2SpatialUpscalerProvider,
+    LTX2AudioDecoderProvider,
+    LTX2VocoderProvider,
+    LTX2VideoDecoderProvider,
     Protocol,
 ):
     pass
 
 
 class OneStageComponents(
-    VideoEncoderProvider,
-    TransformerProvider,
-    VideoDecoderProvider,
+    LTX2VideoEncoderProvider,
+    LTX2TransformerProvider,
+    LTX2VideoDecoderProvider,
     Protocol,
 ):
     pass
@@ -181,44 +181,44 @@ class ProgressReporter(Protocol):
 
 
 @dataclass(frozen=True)
-class EncodedTextConditioning:
+class LTX2EncodedTextConditioning:
     """Pure synthetic prompt product with no component ownership."""
 
     value: str
 
 
-class TextConditioner(Protocol):
-    """Prompt station callable, deliberately not a component provider."""
+class LTX2TextConditionerPort(Protocol):
+    """Prompt stage callable, deliberately not a component provider."""
 
     def __call__(
         self,
-        request: DistilledRequest | OneStageRequest,
+        request: LTX2Request | OneStageRequest,
         resources: ContractResources,
         *,
         reporter: ProgressReporter | None = None,
-    ) -> EncodedTextConditioning: ...
+    ) -> LTX2EncodedTextConditioning: ...
 
 
 @dataclass
 class RecordingTextConditioner:
-    """Record prompt-station calls and optionally fail before producing text."""
+    """Record prompt-stage calls and optionally fail before producing text."""
 
     fail: bool = False
     events: list[tuple[str, str]] = field(default_factory=list)
 
     def __call__(
         self,
-        request: DistilledRequest | OneStageRequest,
+        request: LTX2Request | OneStageRequest,
         resources: ContractResources,
         *,
         reporter: ProgressReporter | None = None,
-    ) -> EncodedTextConditioning:
+    ) -> LTX2EncodedTextConditioning:
         del request, resources, reporter
         self.events.append(("start", "prompt"))
         if self.fail:
             self.events.append(("fail", "prompt"))
-            raise InjectedStationFailure("prompt")
-        product = EncodedTextConditioning("encoded prompt")
+            raise InjectedStageFailure("prompt")
+        product = LTX2EncodedTextConditioning("encoded prompt")
         self.events.append(("return", product.value))
         return product
 
@@ -263,29 +263,29 @@ class RecordingProgressReporter:
 
 
 @contextmanager
-def _reported(reporter: ProgressReporter, station: str) -> Iterator[None]:
-    reporter.phase_start(station)
+def _reported(reporter: ProgressReporter, stage: str) -> Iterator[None]:
+    reporter.phase_start(stage)
     try:
         yield
     finally:
-        reporter.phase_end(station)
+        reporter.phase_end(stage)
 
 
 class RecordingLease:
-    """Idempotent component lease owned by one lexical station scope."""
+    """Idempotent component lease owned by one lexical stage scope."""
 
     def __init__(
         self,
         factory: RecordingComponents,
         component: ComponentName,
         *,
-        load_station: str,
+        load_stage: str,
         profile: LoraProfile = EMPTY_PROFILE,
     ) -> None:
         self._factory = factory
         self.component = component
         self.profile = profile
-        self._load_station = load_station
+        self._load_stage = load_stage
         self._entered = False
         self._closed = False
 
@@ -294,22 +294,22 @@ class RecordingLease:
             raise RuntimeError(f"cannot enter closed {self.component} lease")
         if self._entered:
             raise RuntimeError(f"cannot enter {self.component} lease twice")
-        self._factory._load(self.component, self._load_station, self.profile)
+        self._factory._load(self.component, self._load_stage, self.profile)
         self._entered = True
         return self
 
-    def use(self, station: str) -> None:
+    def use(self, stage: str) -> None:
         if not self._entered or self._closed:
             raise RuntimeError(f"cannot use inactive {self.component} lease")
-        self._factory._use(self.component, station, self.profile)
+        self._factory._use(self.component, stage, self.profile)
 
-    def close(self, station: str | None = None) -> None:
+    def close(self, stage: str | None = None) -> None:
         if not self._entered or self._closed:
             return
         self._closed = True
         self._factory._close(
             self.component,
-            station if station is not None else f"{self._load_station} exit",
+            stage if stage is not None else f"{self._load_stage} exit",
             self.profile,
         )
 
@@ -354,55 +354,55 @@ class RecordingComponents:
     def _lease(
         self,
         component: ComponentName,
-        station: str,
+        stage: str,
         profile: LoraProfile = EMPTY_PROFILE,
     ) -> RecordingLease:
-        return RecordingLease(self, component, load_station=station, profile=profile)
+        return RecordingLease(self, component, load_stage=stage, profile=profile)
 
     def _load(
         self,
         component: ComponentName,
-        station: str,
+        stage: str,
         profile: LoraProfile,
     ) -> None:
         if component in self._active:
             raise AssertionError(f"duplicate live {component} component")
         self._active.add(component)
-        self._record("load", component, station, profile)
+        self._record("load", component, stage, profile)
 
     def _use(
         self,
         component: ComponentName,
-        station: str,
+        stage: str,
         profile: LoraProfile,
     ) -> None:
-        self._record("use", component, station, profile)
-        if self.fail_at == station:
-            raise InjectedStationFailure(station)
+        self._record("use", component, stage, profile)
+        if self.fail_at == stage:
+            raise InjectedStageFailure(stage)
 
     def _close(
         self,
         component: ComponentName,
-        station: str,
+        stage: str,
         profile: LoraProfile,
     ) -> None:
         if component not in self._active:
             raise AssertionError(f"closing inactive {component} component")
         self._active.remove(component)
-        self._record("close", component, station, profile)
+        self._record("close", component, stage, profile)
 
     def _record(
         self,
         action: Literal["load", "use", "close"],
         component: ComponentName,
-        station: str,
+        stage: str,
         profile: LoraProfile,
     ) -> None:
         self.events.append(
             ComponentEvent(
                 action=action,
                 component=component,
-                station=station,
+                stage=stage,
                 active=self.active,
                 profile=profile,
             )
@@ -419,7 +419,7 @@ class DecodedFrameStream(Iterator[str]):
     def __init__(
         self,
         resources: ContractResources,
-        components: VideoDecoderProvider,
+        components: LTX2VideoDecoderProvider,
         *,
         frame_count: int = 3,
     ) -> None:
@@ -427,8 +427,8 @@ class DecodedFrameStream(Iterator[str]):
         self._components = components
         self._frame_count = frame_count
         self._index = 0
-        self._manager: AbstractContextManager[VideoDecoderPort] | None = None
-        self._decoder: VideoDecoderPort | None = None
+        self._manager: AbstractContextManager[LTX2VideoDecoderPort] | None = None
+        self._decoder: LTX2VideoDecoderPort | None = None
         self._closed = False
 
     def __iter__(self) -> DecodedFrameStream:
@@ -471,7 +471,7 @@ class ContractOutput:
 
     frames: DecodedFrameStream
     audio_waveform: str | None
-    text_conditioning: EncodedTextConditioning
+    text_conditioning: LTX2EncodedTextConditioning
     recording: RecordingComponents | None = None
     recording_text_conditioner: RecordingTextConditioner | None = None
 
@@ -486,7 +486,7 @@ class ContractOutput:
 
 
 @dataclass(frozen=True)
-class DistilledRequest:
+class LTX2Request:
     stage_1_profile: LoraProfile = EMPTY_PROFILE
     stage_2_profile: LoraProfile = EMPTY_PROFILE
     image_conditioned: bool = True
@@ -495,11 +495,11 @@ class DistilledRequest:
 
 
 def run_distilled_contract(
-    request: DistilledRequest,
+    request: LTX2Request,
     resources: ContractResources,
     *,
-    components: DistilledComponents | None = None,
-    text_conditioner: TextConditioner | None = None,
+    components: LTX2ComponentsProvider | None = None,
+    text_conditioner: LTX2TextConditionerPort | None = None,
     reporter: ProgressReporter | None = None,
 ) -> ContractOutput:
     """Execute the intended distilled ownership schedule with injected ports."""
@@ -519,7 +519,7 @@ def run_distilled_contract(
 
     transformer_manager = selected.transformer(resources, request.stage_1_profile)
     stage_1_transformer = transformer_manager.__enter__()
-    transformer: TransformerPort | None = stage_1_transformer
+    transformer: LTX2TransformerPort | None = stage_1_transformer
     try:
         with _reported(progress, "stage 1"):
             stage_1_transformer.use("stage 1")
@@ -594,7 +594,7 @@ def run_one_stage_contract(
     resources: ContractResources,
     *,
     components: OneStageComponents | None = None,
-    text_conditioner: TextConditioner | None = None,
+    text_conditioner: LTX2TextConditionerPort | None = None,
     reporter: ProgressReporter | None = None,
 ) -> ContractOutput:
     """Compose a conditioned one-stage recipe without the distilled runner."""
@@ -633,7 +633,7 @@ def run_one_stage_contract(
 
 def event_signature(event: ComponentEvent) -> tuple[str, ComponentName, str, LoraProfile]:
     """Return the stable event fields used for call-graph comparisons."""
-    return event.action, event.component, event.station, event.profile
+    return event.action, event.component, event.stage, event.profile
 
 
 def assert_balanced(factory: RecordingComponents) -> None:

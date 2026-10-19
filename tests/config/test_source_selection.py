@@ -30,16 +30,16 @@ def test_selector_projection_ignores_record_execution_but_preserves_parent_assig
     overrides = SetOverrides.parse(
         [
             "generate.adapters[99].strength=0.5",
-            'restart={run="first.json",phase="decode"}',
+            'restart={run="first.json",stage="decode"}',
             "generate.adapters=[]",
             'restart.run="second.json"',
-            'restart={phase="denoise"}',
+            'restart={stage="denoise"}',
         ]
     )
-    selected = overrides.project(frozenset({("restart", "run"), ("restart", "phase")}))
-    assert selected.config == {"restart": {"run": "second.json", "phase": "denoise"}}
+    selected = overrides.project(frozenset({("restart", "run"), ("restart", "stage")}))
+    assert selected.config == {"restart": {"run": "second.json", "stage": "denoise"}}
     assert selected.origins[("restart", "run")].ordinal == 4
-    assert selected.origins[("restart", "phase")].ordinal == 5
+    assert selected.origins[("restart", "stage")].ordinal == 5
     assert overrides.assignments[0].path == ("generate", "adapters", 99, "strength")
 
 
@@ -47,7 +47,7 @@ def test_selector_projection_ignores_record_execution_but_preserves_parent_assig
 def test_source_projection_agrees_with_complete_precedence(model, tmp_path):
     schema = config_registry().model(model)
     config = tmp_path / "run.toml"
-    config.write_text('[restart]\nrun="file.json"\nphase="decode"\n')
+    config.write_text('[restart]\nrun="file.json"\nstage="decode"\n')
     options = argparse.Namespace(
         config=config,
         restart_run=Path("cli.json"),
@@ -55,7 +55,7 @@ def test_source_projection_agrees_with_complete_precedence(model, tmp_path):
     )
     inputs = collect_invocation_layers(schema, options)
     selected = inputs.selection()
-    assert selected == {"restart": {"run": "set.json", "phase": "decode"}}
+    assert selected == {"restart": {"run": "set.json", "stage": "decode"}}
     assert selected["restart"] == inputs.state().values["restart"]
     assert "settings" not in selected
 
@@ -83,11 +83,11 @@ def test_admitted_sources_select_restart_before_prompt_file_effects(model, tmp_p
         sources.prepare()
 
 
-def test_final_source_projection_cannot_silently_change_the_selected_station():
+def test_final_source_projection_cannot_silently_change_the_selected_stage():
     schema = config_registry().model("flux2")
-    path = ("restart", "phase")
+    path = ("restart", "stage")
     rule = LayerTransform(
-        "fixture_rewrite_station",
+        "fixture_rewrite_stage",
         frozenset({path}),
         frozenset({path}),
         lambda values: {path: "denoise"} if path in values else {},
@@ -97,7 +97,7 @@ def test_final_source_projection_cannot_silently_change_the_selected_station():
             table,
             fields=tuple(
                 replace(field, layer_transforms=(*field.layer_transforms, rule))
-                if table.path == ("restart",) and field.name == "phase"
+                if table.path == ("restart",) and field.name == "stage"
                 else field
                 for field in table.fields
             ),
@@ -112,11 +112,11 @@ def test_final_source_projection_cannot_silently_change_the_selected_station():
         argparse.Namespace(
             config=None,
             set_overrides=[
-                'restart={run="selected.json",phase="decode"}',
+                'restart={run="selected.json",stage="decode"}',
             ],
         ),
     )
-    assert sources.selection()["restart"]["phase"] == "decode"
+    assert sources.selection()["restart"]["stage"] == "decode"
     with pytest.raises(ConfigError, match="source selectors changed"):
         sources.prepare()
 
@@ -134,7 +134,7 @@ def test_saved_component_selector_masks_environment_before_final_projection(monk
     assert sources.selection() == {
         "model_settings": {"vae_path": "current/vae" if override else Path("environment/vae")}
     }
-    layers = sources.prepare(saved, station="decode")
+    layers = sources.prepare(saved, stage="decode")
     expected = "current/vae" if override else "saved/vae"
     assert layers.merge()["model_settings"]["vae_path"] == expected
     assert layers.selection() == {"model_settings": {"vae_path": expected}}
@@ -145,8 +145,8 @@ def test_saved_component_selector_masks_environment_before_final_projection(monk
 @pytest.mark.parametrize(
     ("model", "variable", "value"),
     [
-        ("krea2", "KINO_KREA2_RESTART_PHASE", "decode"),
-        ("ltx2", "KINO_LTX2_LATENT_STAGE", "final"),
+        ("krea2", "KINO_KREA2_RESTART_STAGE", "decode"),
+        ("ltx2", "KINO_LTX2_LATENT_STAGE", "stage-2"),
         ("flux2", "KINO_FLUX2_RESTART_INDEX", "1"),
     ],
 )
@@ -207,13 +207,13 @@ def test_an_environment_selector_beside_a_real_restart_run_is_kept(monkeypatch, 
     [
         (
             "krea2",
-            ["--set", "restart.phase=decode"],
-            "[restart].run is required; [restart].phase was set by --set",
+            ["--set", "restart.stage=decode"],
+            "[restart].run is required; [restart].stage was set by --set",
         ),
         (
             "ltx2",
             ["--restart-from", "decode"],
-            "[restart].run is required; [restart].phase was set by command line",
+            "[restart].run is required; [restart].stage was set by command line",
         ),
         (
             "flux2",
@@ -236,7 +236,7 @@ def test_a_restart_key_above_the_environment_still_requires_run(
 def test_a_file_restart_key_names_the_environment_variable_beside_it(monkeypatch, tmp_path, caplog):
     for name in config_registry().environment_variables():
         monkeypatch.delenv(name, raising=False)
-    monkeypatch.setenv("KINO_KREA2_RESTART_PHASE", "decode")
+    monkeypatch.setenv("KINO_KREA2_RESTART_STAGE", "decode")
     config = tmp_path / "restart.toml"
     config.write_text('[restart]\nlatents = "latents.safetensors"\n', encoding="utf-8")
     import logging
@@ -254,4 +254,4 @@ def test_a_file_restart_key_names_the_environment_variable_beside_it(monkeypatch
     rendered = caplog.text
     assert f"{config}: [restart].run is required" in rendered
     assert f"[restart].latents was set by {config}" in rendered
-    assert "[restart].phase was set by environment KINO_KREA2_RESTART_PHASE" in rendered
+    assert "[restart].stage was set by environment KINO_KREA2_RESTART_STAGE" in rendered

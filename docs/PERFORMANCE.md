@@ -1,118 +1,99 @@
 # Performance and memory
 
-Start with the model's default settings and save a run log. Output dimensions,
-video length, sampling steps, reference images, and adapters all affect time and
-memory. Change one setting at a time and compare the phase that dominates your run.
+Start with a model's defaults and save a run log. Output size, video length, steps, reference
+images, and adapters all change time and memory. Change one setting at a time, and compare the
+phase that dominates your run.
 
-- [Memory controls](#memory-controls): allocator caching, wiring, and zero values.
+- [Memory controls](#memory-controls): the allocator cache, wiring, and what zero means.
+- [Energy mode](#energy-mode): High Power keeps long runs from throttling.
 - [Choose a change](#choose-a-change): what to try for memory pressure or slow runs.
-- [Example run times](#example-run-times): two measured LTX-2.3 runs as a planning anchor.
-- [Compare runs](#compare-runs): capture settings, timings, and repeatability.
-- [Public API memory policy](#public-api-memory-policy): configure runners and component calls.
+- [Precision](#precision): FP16 against BF16.
+- [Compare runs](#compare-runs): settings, timings, and repeatability.
+- [Public API memory policy](#public-api-memory-policy): runners and component calls.
+
+Each model's performance page covers its own levers: [LTX2](ltx2/performance.md),
+[Krea 2](krea2/performance.md), and [Klein](flux2/performance.md).
 
 ## Memory controls
 
-These controls apply to all four model families. Despite the `-gb` spelling,
-values are GiB (`1024**3` bytes), and must be finite and non-negative.
+These apply to every model. Despite the `-gb` spelling, values are GiB (`1024**3` bytes), finite
+and not negative.
 
-| Control | Default | Meaning of `0` |
+| Control | Default | `0` means |
 | --- | --- | --- |
-| `--mlx-cache-limit-gb` | 1 GiB, including LTX streaming | Disable caching of unused MLX allocations |
-| `--mlx-wired-limit-gb` | Current device recommended working set | Disable MLX wiring |
+| `--mlx-cache-limit-gb` | 1 GiB, LTX2 streaming included; LTX2's decoder chooses its own | Keep no freed allocations for reuse |
+| `--mlx-wired-limit-gb` | The device's recommended working set | Wire nothing |
 
-Neither setting caps total process memory or changes downloaded checkpoint files.
-Live weights, activations, temporary tensors, CPU allocations, and filesystem
-caching still need memory.
+Neither caps the process's total memory or touches model files. Weights, activations, temporary
+tensors, CPU allocations, and the file cache still need memory.
 
 ### Allocator cache
 
-MLX can retain a freed tensor's allocation for another tensor to reuse. The cache
-limit controls this unused-memory pool. It does not limit the size of live tensors:
-a 1 GiB cache can coexist with tens of GiB of active model memory.
+MLX can keep a freed buffer to reuse for the next tensor. The cache limit sets the size of that
+pool of unused memory; it does not limit live tensors, so a 1 GiB cache can sit beside tens of GiB
+of model memory.
 
-`--mlx-cache-limit-gb 0` passes zero to MLX and disables this cache. Generation
-still works, but repeated allocations may cost more. It is not an unlimited or
-automatic setting. MLX documents that lowering the limit reclaims excess cached
-memory on the next allocation; changing the limit is not an immediate cache-clear
-operation in an already running Python process.
+`--mlx-cache-limit-gb 0` disables the cache. Generation still works, but repeated allocations may
+cost more; zero is not "unlimited" or "automatic". Lowering the limit frees the excess at the next
+allocation, not immediately.
 
-A larger cache allows more buffer reuse while retaining more unused memory.
-Streaming repeatedly reloads block weights and can be sensitive to this tradeoff.
-KinoMLX honors your selected limit without imposing a streaming-specific minimum.
-Start with 1 GiB; any speed benefit from changing it needs a comparison on your
-workload. There is no established universal advantage to a 4 GiB streaming cache.
-
-For example, to select a 2 GiB cache for one generation:
+A larger cache allows more reuse but keeps more unused memory. LTX2 streaming reloads blocks
+repeatedly and can be sensitive to this trade. KinoMLX applies your limit without a
+streaming-specific minimum. Start at 1 GiB and measure before changing it; no larger value is a
+proven gain for every workload.
 
 ```bash
 kinomlx --model krea2 --prompt "A ceramic cup in soft window light" \
   --mlx-cache-limit-gb 2 --save-run-log
 ```
 
-The same setting can be supplied through TOML or the environment:
-
-```toml
-[settings]
-mlx_cache_limit_gb = 2.0
-```
-
-```bash
-export KINO_MLX_CACHE_LIMIT_GB=2
-```
+The same setting is `mlx_cache_limit_gb = 2.0` under `[settings]` in TOML, or
+`KINO_MLX_CACHE_LIMIT_GB=2` in the environment.
 
 ### Memory residency
 
-Wiring allows MLX buffers to remain resident instead of being compressed or paged
-out by macOS. The wired limit is a ceiling, not a reservation: setting it does not
-allocate that much memory. Allocations can exceed it, so it is not a guarantee that
-a generation fits or remains fully resident.
+Wiring keeps MLX buffers resident instead of letting macOS compress or page them out. The wired
+limit is a ceiling, not a reservation: setting it allocates nothing, and allocations can exceed
+it, so it does not guarantee a run fits or stays resident.
 
-By default KinoMLX reads `max_recommended_working_set_size` from the device at each
-invocation. You can select a lower limit with `--mlx-wired-limit-gb`,
-`[settings].mlx_wired_limit_gb`, or `KINO_MLX_WIRED_LIMIT_GB`. A value above the
-reported device limit is rejected. Zero disables wiring without disabling the
-allocator cache.
+By default KinoMLX reads the device's recommended working set at each run. Choose a lower limit
+with `--mlx-wired-limit-gb`, `[settings].mlx_wired_limit_gb`, or `KINO_MLX_WIRED_LIMIT_GB`; a value
+above the device limit is refused, and zero turns wiring off without touching the cache.
 
-On a 64 GiB M1 Max, the automatic system policy was measured at **51.84 GiB**,
-about **81% of physical memory**, with `iogpu.wired_limit_mb=0`. This is an
-observed default for that machine and macOS version, not a fixed percentage for
-every Mac. The 60 GiB value in the table below is an explicit override.
+macOS sets the automatic limit itself. One measurement:
 
-To inspect your current policy and effective device recommendation, use the
-Python environment where KinoMLX is installed:
+| Mac | `iogpu.wired_limit_mb` | Automatic limit |
+| --- | --- | ---: |
+| M1 Max, 64 GB | `0` (automatic) | 51.84 GiB, about 81% of memory |
+
+That is one machine and macOS version, not a fixed share for every Mac. To see your current policy
+and the effective limit, in the Python environment where KinoMLX is installed:
 
 ```bash
 sysctl iogpu.wired_limit_mb
 python -c 'import mlx.core as mx; print(mx.device_info()["max_recommended_working_set_size"] / 1024**3, "GiB")'
 ```
 
-If `sysctl` reports `0`, automatic policy is active and the Python command shows
-its effective limit. A nonzero value means a system override is active; the
-Python command then shows the effective limit under that override, not the
-automatic default.
+`0` from `sysctl` means the automatic policy is active, and the Python line shows its limit. A
+nonzero value means a system override is active, and the Python line shows the limit under it.
 
-To measure the automatic default while an override is active, first record the
-current `sysctl` value and stop generation. Restore automatic policy:
+To measure the automatic default while an override is active, note the current value, stop any
+generation, and restore automatic policy:
 
 ```bash
 sudo sysctl iogpu.wired_limit_mb=0
 ```
 
-Then rerun the Python check above in a fresh process. This changes the system
-policy. Reapply the recorded override afterward if you want to keep it, and start
-a fresh KinoMLX process before resuming generation.
-Leave room for macOS, CPU-side model work, and other applications when considering
-a larger wired budget.
+Then run the Python check in a fresh process. This changes a system setting: reapply your
+override afterward if you want it, and start a fresh KinoMLX process before generating.
 
 #### Optional system override
 
-If the automatic ceiling is the limiting factor, macOS provides the system-wide
-`iogpu.wired_limit_mb` override. For example, 61440 MiB selects a 60 GiB ceiling
-on a 64 GiB Mac. That leaves only 4 GiB outside the ceiling; whether this is enough
-depends on the rest of the workload. This is an example, not a preset for every Mac.
+If the automatic ceiling is what limits you, macOS's `iogpu.wired_limit_mb` raises it system-wide.
+For example, 61440 MiB gives a 60 GiB ceiling on a 64 GiB Mac. That leaves 4 GiB outside the
+ceiling, which may or may not be enough for the rest of your work.
 
-The table leaves 4 GiB outside the GPU wired-memory ceiling, using
-`(installed GiB - 4) * 1024` for the `iogpu.wired_limit_mb` value:
+This table leaves 4 GiB outside the ceiling, using `(installed GiB - 4) * 1024`:
 
 | Unified memory | GPU wired limit | `iogpu.wired_limit_mb` |
 | --- | --- | --- |
@@ -127,46 +108,39 @@ The table leaves 4 GiB outside the GPU wired-memory ceiling, using
 | 96 GiB | 92 GiB | 94208 |
 | 128 GiB | 124 GiB | 126976 |
 
-These are optional ceilings, not memory reservations or a guarantee that 4 GiB is
-enough for every workload. Leave more headroom when other applications or CPU-side
-allocations need it. On smaller machines, a table value may be lower than the
-automatic device recommendation.
+These are optional ceilings, not reservations, and 4 GiB is not enough for every workload: leave
+more when other applications need it. On small Macs a table value can be below the automatic
+limit.
 
-With generation stopped, an administrator can apply that example with:
+With generation stopped, an administrator applies the example with:
 
 ```bash
 sudo sysctl iogpu.wired_limit_mb=61440
 ```
 
-Start a fresh KinoMLX process afterward. The override resets on reboot unless a
-separate launch configuration reapplies it. To restore the automatic system policy:
+Start a fresh KinoMLX process afterward. The override lasts until reboot. To restore automatic
+policy:
 
 ```bash
 sudo sysctl iogpu.wired_limit_mb=0
 ```
 
-The two zeros have different meanings: **system `iogpu.wired_limit_mb=0` restores
-automatic policy; KinoMLX `--mlx-wired-limit-gb 0` disables MLX wiring**. Raising
-the system ceiling does not reduce the generation's memory requirement.
+The two zeros differ: **system `iogpu.wired_limit_mb=0` restores automatic policy, while KinoMLX
+`--mlx-wired-limit-gb 0` turns MLX wiring off**. A higher ceiling does not make a run need less
+memory.
 
 #### Apply the override at boot with launchd
 
-Try the temporary `sysctl` override first and use it through representative
-generations alongside your usual applications. Once the chosen limit runs reliably
-without excessive memory pressure, you can make it persistent with launchd.
-Until then, leaving it temporary provides a straightforward recovery path: a reboot
-restores the automatic macOS policy, provided no existing boot configuration
-reapplies the override.
+Try the temporary override first, through representative runs alongside your usual applications.
+Make it permanent only once your chosen limit runs reliably without heavy memory pressure; until
+then a reboot is an easy way back.
 
-A system LaunchDaemon can apply the override at every boot, before user login.
-It runs `sysctl` directly; no shell script or Python dependency is needed.
-This is an optional macOS configuration, independent of the KinoMLX installation.
+A system LaunchDaemon can apply the override at every boot, before login, by running `sysctl`
+directly. It is an optional macOS setting, independent of KinoMLX.
 
-With generation stopped, paste the following into a terminal in a local working
-directory. It creates the plist, validates it, installs it with root ownership and
-normal LaunchDaemon permissions, and loads it into the system domain. The example
-uses the 60 GiB ceiling for a 64 GiB Mac; replace `61440` with your chosen MiB value
-from the table above before running it.
+With generation stopped, paste this into a terminal in a working folder. It writes the plist,
+validates it, installs it owned by root, and loads it. It uses the 64 GiB example; replace `61440`
+with your value from the table first.
 
 ```bash
 cat > com.local.sysctl-iogpu.plist <<'PLIST'
@@ -192,27 +166,23 @@ sudo install -o root -g wheel -m 644 com.local.sysctl-iogpu.plist /Library/Launc
 sudo launchctl bootstrap system /Library/LaunchDaemons/com.local.sysctl-iogpu.plist
 ```
 
-Installation and loading proceed only if the preceding command succeeds. These
-commands assume the service is not already installed; inspect an existing file
-before replacing it. `RunAtLoad` applies the setting immediately on bootstrap and
-again when the daemon loads at boot. `KeepAlive` is intentionally absent: this
-command should run once and exit.
+Each step runs only if the one before succeeds. The commands assume the service is not installed
+yet; inspect an existing file before replacing it. `RunAtLoad` applies the setting when loaded now
+and at every boot, and there is no `KeepAlive`: the command runs once and exits.
 
-Verify the service and the live setting:
+Check the service and the live setting:
 
 ```bash
 sudo launchctl print system/com.local.sysctl-iogpu
 sysctl iogpu.wired_limit_mb
 ```
 
-Look for `last exit code = 0` and the selected MiB value. A `not running` service
-state is normal after this one-shot command completes. Start a fresh KinoMLX
-process; the Python check above can confirm the effective device recommendation.
+Look for `last exit code = 0` and your value. `not running` is normal after the command finishes.
+Start a fresh KinoMLX process, and use the Python check above to confirm the effective limit.
 
-To change the persistent value later, stop generation, edit your local plist, and
-unload the existing service with
-`sudo launchctl bootout system/com.local.sysctl-iogpu`. Then repeat the validation,
-installation, and bootstrap commands above.
+To change the value later, stop generation, edit your plist, unload the service with
+`sudo launchctl bootout system/com.local.sysctl-iogpu`, and repeat the validation, install, and
+bootstrap commands.
 
 To remove the boot override, stop generation and run:
 
@@ -221,143 +191,82 @@ sudo launchctl bootout system/com.local.sysctl-iogpu
 sudo rm /Library/LaunchDaemons/com.local.sysctl-iogpu.plist
 ```
 
-Unloading or deleting the daemon does not undo the already applied setting.
-Restore automatic policy with the `sysctl` reset command above, or reboot after
-removing the daemon. Start a fresh KinoMLX process after changing the policy.
+Removing the daemon does not undo the setting already applied: restore automatic policy with the
+`sysctl` reset above, or reboot. Start a fresh KinoMLX process after changing the policy.
+
+## Energy mode
+
+On a Mac that offers High Power, choose it before long runs: System Settings > Battery > Energy
+Mode > On power adapter > High Power, or System Settings > Energy on a desktop Mac.
+
+Under Automatic, macOS throttles the GPU after a few minutes of full load: it lowers the GPU's
+clock instead of running the fans faster, so a long run slows as it goes. High Power runs the fans
+faster and keeps the full clock, at the cost of more fan noise.
+
+A sustained GPU workload on an M1 Max:
+
+| Energy mode | Speed |
+| --- | --- |
+| Automatic | Full speed for about 3.5 minutes, then about 20% longer for the same work |
+| High Power | Full speed for the whole run |
 
 ## Choose a change
 
-| Observation | Useful next step | Tradeoff or limit |
+| Observation | Try | Trade-off |
 | --- | --- | --- |
-| LTX transformer does not fit comfortably | Use [block streaming](LTX2.md#block-streaming-on-32-gb-systems) | Reloads weights and repeats preparation during denoising |
-| Streamed LTX spends much of its time reading weights | Try [selective tensor retention](LTX2.md#retaining-selected-block-tensors) | Reduces repeated work by keeping more tensors resident |
-| LTX weight memory is too high | Consider [transformer quantization](LTX2.md#transformer-quantization) | Changes weights and output; can be slower |
-| Decode is the memory peak | Keep automatic VAE tiling for LTX or Krea; reduce geometry if needed | Tiling adds work; Klein currently has no VAE tiling |
-| Successive runs get slower | Repeat the baseline after cooldown and check competing GPU work | Temperature, power limits, and memory pressure can confound timings |
-| First-use adapter checking is expensive | Inspect the weight-check timing before opting out | Disabling the scan removes a validation step |
+| The LTX2 transformer does not fit | [Streaming](ltx2/performance.md#run-on-32-gb) | Reloads weights every step |
+| Streamed LTX2 spends its time reading weights | [Keeping some tensors loaded](ltx2/performance.md#keep-some-tensors-loaded) | More live memory |
+| LTX2 weight memory is too high | [Quantization](ltx2/performance.md#use-less-transformer-memory) | Changes the output; slower |
+| Decoding sets the peak | Keep automatic tiling ([LTX2](ltx2/decode.md#memory-tiling-and-cache), [Krea 2](krea2/performance.md#decoder-memory)), or a smaller size | Tiling adds work; Klein has none |
+| A long run slows after a few minutes | [High Power](#energy-mode) on the power adapter | Louder fans |
+| Later runs get slower | Rerun the baseline after a cooldown; close other GPU work | Heat, power limits, and memory pressure skew timings |
+| The first-use adapter check is slow | Read its time in the log before turning it off | Turning it off loses a check |
 
-Reduce image dimensions, reference count, or video length when the total working
-set is too large. Increasing a memory limit alone does not reduce that working set.
+When the whole working set is too large, use a smaller size, fewer references, or a shorter
+video. Raising a memory limit does not shrink the working set.
 
-### Precision
+## Precision
 
-LTX, Krea, and Klein default to BF16 transformer execution. Klein's default
-preserves the bundled weights' precision; FP16 is an optional speed optimization.
-Use `--transformer-dtype float16` to opt in or `--transformer-dtype bfloat16` to
-select BF16 explicitly. Both types use two bytes per element. FP16 has more
-mantissa precision but a narrower numerical range; it can overflow where BF16
-would not. Speed depends on the model's kernels and workload.
+LTX2 runs its transformer in FP16 by default, and Krea 2 and Klein in BF16, the precision of their
+weights. `--transformer-dtype` selects either. Both use two bytes per value: FP16 has more
+mantissa precision but a narrower range, so it can overflow where BF16 does not. Which is faster
+depends on the model's kernels; see [LTX2 precision](ltx2/performance.md#precision).
 
-LTX's STEEL attention kernels are BF16-only, so an FP16 LTX transformer runs
-attention on stock MLX scaled dot-product attention instead. That is a fallback,
-not an error, and it does not always cost time: for one measured pair of 30-second
-runs the FP16 configuration finished sooner despite it. See
-[example run times](#example-run-times) for that comparison. Precision changes the
-sample, so a shared seed does not make FP16 and BF16 outputs comparable frame for
-frame; judge the result as well as the clock.
+Precision changes the sample, so one seed does not make FP16 and BF16 images comparable pixel for
+pixel. Judge the result as well as the clock.
 
-Decoder precision is separate: Krea exposes `--vae-dtype`, and LTX exposes
-`--vae-decode-dtype` with decoder-specific restrictions. See the
-[Krea precision guide](KREA2.md#denoising-mode-and-precision) and
-[LTX guide](LTX2.md) before changing them. Compare output as well as elapsed time.
-
-### Adapter validation
-
-`--check-adapter-weights` is enabled by default for the generative models. It
-checks adapter-modified active floating-point weights after first use; streamed
-LTX checks each newly used target before its group is evicted. A new adapter
-profile can require another check. Packed LTX targets rely on the latent check.
-
-`--no-check-adapter-weights` skips that weight scan while preserving per-step
-latent finite checks. Use it only when you accept losing that diagnostic, such as
-when repeating an already checked model, dtype, and adapter configuration.
-See [weight validation](WEIGHTS.md#precision-and-validation) for coverage.
-
-## Example run times
-
-The two runs below are the same LTX-2.3 job on one machine, differing only in
-transformer precision. Use them as a planning anchor for how long a run of this
-shape takes, not as a benchmark or a performance guarantee. Different hardware, a
-different macOS or MLX build, competing GPU work, or a warmer machine will produce
-different numbers, and a single run does not establish a difference.
-
-Measured with KinoMLX 0.0.1 on an Apple M1 Max with 64 GiB of unified memory,
-macOS 27.0 and MLX 0.32.2, with the 60 GiB system wired-memory override applied.
-
-Both runs used these settings; only `--transformer-dtype` differed:
-
-```bash
-kinomlx --model ltx2 --model-generation 2.3 --prompt-file PROMPT.txt \
-  --width 768 --height 448 --duration 30 --seed 42 \
-  --generate-audio --save-all-sidecars --output-prefix PREFIX
-```
-
-| Input | Value |
-| --- | --- |
-| Model | LTX-2.3 distilled 22B, `ltx-2.3-22b-distilled-1.1` checkpoint |
-| Output | 768x448, 721 frames, 24 fps, 30.0 s timeline, joint 48 kHz stereo audio |
-| Sampling | Distilled two-stage, 8 + 3 steps, deterministic Euler, seed 42 |
-| Adapters | None |
-| Execution | Fast mode, compiled attention, all blocks resident, no quantization |
-| Decode | Automatic VAE tiling, conv video VAE |
-| Memory limits | 1 GiB allocator cache, wired limit at the device recommendation |
-
-| Phase | BF16 | FP16 |
-| --- | --- | --- |
-| Encode prompt with Gemma 3 | 3.6 s | 3.7 s |
-| Project audio/video text context | 1.8 s | 1.8 s |
-| Stage 1 denoise, 8 steps at half resolution | 287.6 s | 255.4 s |
-| Upscale video latent | 4.7 s | 4.7 s |
-| Stage 2 denoise, 3 steps at full resolution | 663.5 s | 594.4 s |
-| Vocode audio with bandwidth extension | 14.1 s | 14.1 s |
-| VAE decode tiles | 65.8 s | 65.5 s |
-| Total | 1044 s (17.4 min) | 942 s (15.7 min) |
-| Peak memory | 41.1 GiB | 41.1 GiB |
-
-Denoising was about 90% of both runs, so the sampling stages are where a change to
-geometry, length, or step count shows up. At this geometry the runs cost roughly
-35 s (BF16) and 31 s (FP16) of wall time per second of finished video. Neither
-number scales linearly to another resolution or duration: stage 2 runs at full
-resolution over the whole timeline, and decode and audio work scale separately.
-
-The FP16 run finished 9.7% sooner, and all of that came from denoising. Prompt
-encoding, latent upscaling, vocoding, and decode matched the BF16 run to within a
-few tenths of a second. Peak memory was unchanged, as expected for two types that
-both use two bytes per element. Note that FP16 gave up the BF16-only STEEL
-attention path and still finished sooner on this workload; see
-[precision](#precision) before choosing it, and compare output, not only elapsed time.
+Decoder precision is separate: LTX2 has `--vae-decode-dtype`, and Krea 2 and Klein `--vae-dtype`,
+each with its own choices; see [LTX2 decoding](ltx2/decode.md#decode-precision), [Krea 2
+precision](krea2/performance.md#precision), and [Klein precision](flux2/performance.md#precision).
 
 ## Compare runs
 
-1. Save the resolved configuration and timings with `--save-effective-config` and
-   `--save-run-log`. `--save-all-sidecars` also enables these, but saves additional
-   model-dependent artifacts that can consume substantial disk space.
-2. Keep model sources, prompt, seed, geometry, steps, adapters, precision, and both
-   memory limits fixed except for the setting under comparison.
-3. Close competing GPU workloads. Compare runs with similar starting temperature
-   and memory pressure; filesystem caching can also make later runs faster.
-4. Repeat the comparison and run the original baseline again at the end. If the
-   baseline drift is comparable to the apparent improvement, the result is inconclusive.
-5. Compare total time, phase timings, memory peaks, and output quality. A lower
-   denoising peak is not necessarily a lower whole-run peak.
+1. Save the settings and timings with `--save-effective-config` and `--save-run-log`.
+   `--save-all-sidecars` includes them, but also saves large tensor sidecars.
+2. Keep model files, prompt, seed, size, steps, adapters, precision, and both memory limits fixed,
+   except the setting under test.
+3. Close other GPU work. Start runs at a similar temperature and memory pressure, in the same
+   [energy mode](#energy-mode); the file cache can also make later runs faster.
+4. Repeat, and rerun the original baseline at the end. If the baseline drifts as much as the
+   apparent gain, the result is inconclusive.
+5. Compare total time, phase timings, memory peaks, and the output. A lower denoising peak is not
+   necessarily a lower whole-run peak.
 
-The run sidecar uses the output stem, for example `<stem>_run.json`.
-`--json` emits a machine-readable result on stdout. The saved effective TOML
-records the resolved configuration, including the selected memory limits.
-For Instruments tracing, use `--profile-signposts`; add
-`--profile-signpost-log PATH` to save the profiling log.
+The run record, `<stem>_run.json`, and `--json` give the numbers in machine-readable form; the
+saved TOML records the memory limits used. For Instruments traces, add `--profile-signposts`, and
+`--profile-signpost-log PATH` to save the log.
 
-Sustained GPU work can heat the machine and reduce its available power. A slower
-second run alone does not establish that a setting is slower. Likewise, a seed
-makes inputs repeatable but does not guarantee identical outputs across changes
-in dtype, quantization, kernels, or model recipe.
+Sustained GPU work heats the machine, and under Automatic macOS lowers the GPU's clock, so a
+slower second run alone does not show a setting is slower.
+
+A seed makes inputs repeatable, but not outputs across changes of dtype, quantization, kernels, or
+recipe.
 
 ## Public API memory policy
 
-`Settings.mlx_cache_limit_gb` and `Settings.mlx_wired_limit_gb` configure both
-controls for every model. Resource inspection captures those choices without changing
-MLX state. Runners and public recipes apply them before model work, including when
-reusing prepared resources. Nested runner/recipe calls apply the policy once.
+`Settings.mlx_cache_limit_gb` and `Settings.mlx_wired_limit_gb` set both controls for every
+model. Preparing resources records them without touching MLX. Runners and public recipes apply
+them before model work, on every call, reused resources included; nested calls apply them once.
 
 ```python
 from kinomlx import Settings
@@ -369,18 +278,16 @@ runner = Krea2Runner(
 )
 ```
 
-Custom recipes with `(request, resources, ...)` parameters can use
-`@kinomlx.memory_managed` to establish the same boundary. They work both as
-standalone calls and through a runner; see
+Your own recipes taking `(request, resources, ...)` can use `@kinomlx.memory_managed` to apply
+the same policy, whether called directly or through a runner; see
 [the explicit LTX recipe example](../examples/ltx2_distilled.py).
 
-The wired default (`None`) reads the current device recommendation on each invocation.
-Zero actively disables wiring, including after a previous run enabled it. A `None`
-allocator limit leaves the host's current allocator setting unchanged; zero disables
-allocator retention.
+A wired limit of `None` reads the device recommendation at each call, and zero turns wiring off,
+even after an earlier run turned it on. A cache limit of `None` leaves the current setting alone,
+and zero disables the cache.
 
-For standalone component loaders or custom model execution, apply the same policy
-explicitly before loading weights or allocating inputs:
+Component loaders and custom model code apply the policy themselves, before loading weights or
+allocating inputs:
 
 ```python
 from kinomlx import apply_memory_policy
@@ -389,20 +296,7 @@ apply_memory_policy(resources.memory_policy)
 # Load components and run model work here.
 ```
 
-`apply_memory_policy` also accepts `Settings` or `MLXMemoryPolicy` and returns `None`.
-These are process-wide controls. Serialize model invocations,
-consume and close lazy outputs before starting another, and change policies only
-while MLX is idle. Limits remain in effect after the invocation; the next invocation
-applies its selected policy.
-
-## Model guides
-
-- [LTX2](LTX2.md): streaming, retention, quantization, adapter accumulation, and VAE choices.
-- [Krea 2](KREA2.md): Raw/Turbo steps, denoising precision, editing, and the optional 2x VAE.
-- [Klein](FLUX2.md): base/distilled/KV recipes, reference count, and reference KV lifetime.
-- [GMNet](GMNET.md): variant selection and HDR still output.
-
-KinoMLX prepares weights from original checkpoints when components are first used
-and releases components at model-defined phase boundaries. There is no generated
-model-weight cache to build on disk. See [Weight loading](WEIGHTS.md) for source
-selection, preparation, and component lifetime.
+`apply_memory_policy` also accepts `Settings` or `MLXMemoryPolicy`. These limits apply to the whole
+process: run one model call at a time, consume and close lazy outputs before starting another, and
+change policies only while MLX is idle. A policy stays in effect until the next call applies its
+own.

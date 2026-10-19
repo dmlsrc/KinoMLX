@@ -3,10 +3,24 @@
 from types import SimpleNamespace
 
 import mlx.core as mx
+import pytest
 
 import kinomlx.models.ltx2.decode as decode
 from kinomlx.components import ComponentLease
 from kinomlx.models.ltx2.signals import ltx23_sdr_signal
+from kinomlx.models.ltx2.video_vae.kinds import VideoVAEKind
+
+
+def _entry_receipt() -> decode.VAEEntryMemoryReceipt:
+    return decode.VAEEntryMemoryReceipt(
+        active_bytes=1_000,
+        cache_bytes=0,
+        peak_bytes=1_000,
+        total_bytes=40_000_000_000,
+        recommended_working_set_bytes=40_000_000_000,
+        available_bytes=31_430_000_000,
+        planner_budget_bytes=31_430_000_000,
+    )
 
 
 def test_decode_video_passes_tiling_config_by_keyword(monkeypatch) -> None:
@@ -75,8 +89,8 @@ def test_auto_tiler_receives_loaded_decoder_compute_dtype(monkeypatch) -> None:
     received = []
     decoder = SimpleNamespace(compute_dtype=mx.float32)
 
-    def auto_native_conv3d(height, width, frames, *, memory_budget_gb, compute_dtype):
-        received.append((height, width, frames, memory_budget_gb, compute_dtype))
+    def auto_conv3d(height, width, frames, *, memory_budget_gb, compute_dtype, optimized_fp16):
+        received.append((height, width, frames, memory_budget_gb, compute_dtype, optimized_fp16))
         return decode.TilingConfig()
 
     def fake_decode_streaming(_latent, _decoder, **_kwargs):
@@ -84,14 +98,14 @@ def test_auto_tiler_receives_loaded_decoder_compute_dtype(monkeypatch) -> None:
 
     monkeypatch.setattr(
         decode.TilingConfig,
-        "auto_native_conv3d",
-        staticmethod(auto_native_conv3d),
+        "auto_conv3d",
+        staticmethod(auto_conv3d),
     )
     monkeypatch.setattr(decode, "decode_streaming", fake_decode_streaming)
     monkeypatch.setattr(
         decode,
         "capture_vae_entry_memory_receipt",
-        lambda **_kwargs: SimpleNamespace(planner_budget_gb=31.43),
+        lambda **_kwargs: _entry_receipt(),
     )
     stream = decode.decode_ltx23_sdr_frames(
         mx.zeros((1, 128, 1, 2, 2), dtype=mx.bfloat16),
@@ -102,12 +116,21 @@ def test_auto_tiler_receives_loaded_decoder_compute_dtype(monkeypatch) -> None:
     )
 
     assert len(list(stream)) == 1
-    assert received == [(64, 64, 1, 31.43, mx.float32)]
+    assert len(received) == 3
+    assert received[0] == (
+        64,
+        64,
+        1,
+        pytest.approx((31_430_000_000 - 5 * 1024**3) / 1e9),
+        mx.float32,
+        False,
+    )
+    assert stream.receipts["vae_cache"]["selected_limit_gb"] == 4.0
 
 
 def test_diffusion_decode_receives_selected_noise_backend(monkeypatch) -> None:
     received = []
-    decoder = SimpleNamespace(decoder_kind="diffusion-na")
+    decoder = SimpleNamespace(decoder_kind=VideoVAEKind.DIFFUSION)
 
     def fake_decode_streaming(_latent, _decoder, **kwargs):
         received.append(kwargs["noise_backend"])
@@ -117,7 +140,7 @@ def test_diffusion_decode_receives_selected_noise_backend(monkeypatch) -> None:
     monkeypatch.setattr(
         decode,
         "capture_vae_entry_memory_receipt",
-        lambda **_kwargs: SimpleNamespace(planner_budget_gb=31.43),
+        lambda **_kwargs: _entry_receipt(),
     )
     stream = decode.decode_ltx23_sdr_frames(
         mx.zeros((1, 128, 1, 2, 2), dtype=mx.bfloat16),

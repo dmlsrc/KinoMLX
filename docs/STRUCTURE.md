@@ -38,16 +38,18 @@ KinoMLX/
 |-- pyproject.toml                   # deps, entry point, ruff/pytest config
 |-- .gitignore                       # Python template + project-specific ignores
 |-- docs/                            # human-readable project documentation
-|   |-- FLUX2.md                     # Klein generation, editing, and saved stations
-|   |-- ADAPTERS.md                  # shared adapter formats and composition
-|   |-- CONVENTIONS.md               # contributor rules for code, APIs, and validation
-|   |-- GMNET.md                     # gmnet weights, usage, output, and API guide
-|   |-- KREA2.md                     # Krea source, loading, generation, and API guide
-|   |-- LTX2.md                      # ltx2 setup, generation, restart, and API guide
-|   |-- PERFORMANCE.md               # memory controls, precision, and measured run times
+|   |-- ADAPTERS.md                  # shared adapter formats, strength, and checks
+|   |-- CONFIG.md                    # config files, environment, --set, shared arguments
+|   |-- CONVENTIONS.md               # contributor rules for code, docs, and validation
+|   |-- PERFORMANCE.md               # memory controls, precision, and comparing runs
 |   |-- SCHEDULES.md                 # sigma schedules and adapter strength over a run
-|   |-- WEIGHTS.md                   # lazy weight loading and component lifetime
-|   `-- STRUCTURE.md                 # this file
+|   |-- STRUCTURE.md                 # this file
+|   |-- USAGE.md                     # prompts, seeds, outputs, run records, restart
+|   |-- WEIGHTS.md                   # model files, loading, and checkpoint conversion
+|   |-- flux2/                       # Klein guides; README.md first, arguments.md catalog
+|   |-- gmnet/                       # GMNet guides; README.md first, arguments.md catalog
+|   |-- krea2/                       # Krea 2 guides; README.md first, arguments.md catalog
+|   `-- ltx2/                        # LTX2 guides; README.md first, arguments.md catalog
 |-- examples/                        # public recipe/runner compositions
 |   |-- flux2_generate.py            # Klein public runner and image output
 |   |-- gmnet_expand.py              # small still-expansion + transaction example
@@ -56,7 +58,7 @@ KinoMLX/
 |-- tests/                           # pytest tests (mirrors package structure)
 |   |-- adapters/                    # static adapter formats, algebra, schedules, fusion
 |   |-- cli/                         # root dispatch, shared arguments, config utilities
-|   |-- config/                      # registry, precedence, station policies, fixtures/
+|   |-- config/                      # registry, precedence, stage policies, fixtures/
 |   |-- io/                          # atomic publication, image input, safetensors, identity
 |   |-- kernels/                     # shared fused-op parity
 |   |-- media/                       # frame ownership and HDR transfers
@@ -77,6 +79,7 @@ KinoMLX/
 ```text
 kinomlx/
 |-- __init__.py                      # version and genuinely shared public API
+|-- _config_record_state.py          # supplied-argument presence for frozen records
 |-- _json.py                         # recursive JSON value types
 |-- _mlx_nn.py                       # typed access to the exact installed mlx.nn objects
 |-- _mlx_nn.pyi                      # strict type surface for those exact objects
@@ -87,7 +90,6 @@ kinomlx/
 |-- config_bindings.py               # neutral CLI contract shared by Settings and registry
 |-- config_constraints.py            # pure local value constraints owned by typed fields
 |-- config_record_cli.py             # argparse actions building records from item tokens
-|-- config_record_state.py           # supplied-argument presence for frozen records
 |-- config_records.py                # typed construction and presence for config records
 |-- config_rules.py                  # field-owned validation of complete config records
 |-- config_surfaces.py               # supported transports and reasons for unavailable ones
@@ -97,7 +99,8 @@ kinomlx/
 |-- image_restart_config.py          # shared still-image restart inputs and relationships
 |-- invocation_controls.py           # control declarations shared by every host surface
 |-- memory_policy.py                 # invocation-owned allocator and wired limits
-|-- model_registry.py                # model catalog and contributions for every surface
+|-- model_catalog.py                 # model names, help, and the default model
+|-- model_registry.py                # global registry of every model's config contribution
 |-- output.py                        # typed generation sink + VideoToolbox adapter
 |-- prompts.py                       # shared explicit empty-user-prompt contract
 |-- recipe_host.py                   # public recipe execution boundary over model ports
@@ -106,7 +109,7 @@ kinomlx/
 |-- request_rules.py                 # coupled policies shared by generation request fields
 |-- restart_receipts.py              # observational receipts for the artifacts a restart reads
 |-- restart_selection.py             # select one image of a multi-image run for a restart
-|-- seed_execution.py                # request-scoped model ownership at image stations
+|-- seed_execution.py                # request-scoped model ownership at image stages
 |-- seeds.py                         # ordered seed selection shared by every generation family
 |-- settings.py                      # infrastructure settings + env/CLI field machinery
 |-- types.py                         # model-neutral shapes and compute-policy literals
@@ -132,6 +135,7 @@ kinomlx/
 |   |-- semantics.py                 # static export and omitted-state boundaries
 |   |-- fusion.py                    # bounded scratch preflight and lazy physical weight updates
 |   |-- receipt.py                   # per-adapter tensor placement results
+|   |-- scaling.py                   # intrinsic-scale determination and its console line
 |   |-- config_schema.py             # adapter record contributions to the shared configuration
 |   |-- huggingface.py               # offline selection of one community release file
 |   |-- input_rules.py               # adapter relationships with supplied-strength ownership
@@ -177,7 +181,7 @@ kinomlx/
 |   |-- persistence.py               # saved configuration format: values plus presence
 |   |-- provenance.py                # internal explanations of supplied and derived fields
 |   |-- source_rules.py              # declared source decoding and reads before normalization
-|   |-- stations.py                  # station comparison policy for request projections
+|   |-- stages.py                  # stage comparison policy for request projections
 |   `-- transforms.py                # bounded declared transformations of one sparse layer
 |
 |-- debug/                           # opt-in reproducibility artifacts
@@ -228,32 +232,36 @@ kinomlx/
 |   |-- __init__.py                  # namespace for the per-model subpackages
 |   |
 |   |-- flux2/                       # Klein 9B resources and image recipes
-|   |   |-- __init__.py              # Klein generation, conditioning stations, publication
+|   |   |-- __init__.py              # Klein generation, conditioning stages, publication
 |   |   |-- catalog.py               # base, distilled, and KV profiles
 |   |   |-- arguments.py             # common image flags plus Klein controls
 |   |   |-- command.py               # generation, restart, reporting, and publication
-|   |   |-- config.py                # layered prompt/config and station admission
+|   |   |-- config.py                # layered prompt/config and stage admission
 |   |   |-- types.py                 # typed generation and restart controls
 |   |   |-- config_schema.py         # model-owned configuration contribution
 |   |   |-- settings.py              # local bundled and override source selection
 |   |   |-- resources.py             # immutable source and tensor disposition inventory
 |   |   |-- metadata.py              # strict supported graph configurations
 |   |   |-- shapes.py                # full bundled source name/shape contracts
-|   |   |-- loading.py               # exact component bindings; lazy transformer weights
+|   |   |-- source_loading.py        # exact component bindings; lazy transformer weights
 |   |   |-- transformer.py           # shared double/single-stream Klein 9B graph
 |   |   |-- kv.py                    # generation-owned reference K/V and masked attention
 |   |   |-- sampling.py              # target-only Euler trajectories and external base CFG
 |   |   |-- generation.py            # sequential component lifetimes and image result API
-|   |   |-- pipeline.py              # typed generation and restart recipes used by CLI/API
+|   |   |-- pipelines/               # sequential complete public recipes
+|   |   |   |-- __init__.py          # recipe and typed-output exports
+|   |   |   |-- text_to_image.py     # prompt -> Qwen3 text -> Klein 9B -> VAE
+|   |   |   `-- restart.py           # resume Klein from a saved stage or final latents
 |   |   |-- runner.py                # stateless public host over resources and reporting
-|   |   |-- stations.py              # complete text/negative/reference conditioning bundles
-|   |   |-- restart.py               # saved station and source validation
+|   |   |-- text_conditioning.py     # complete text/negative/reference conditioning bundles
+|   |   |-- restart.py               # saved stage and source validation
 |   |   |-- output.py                # Klein artifacts over shared publication primitives
 |   |   |-- text.py                  # Klein template, padding and THWL text positions
 |   |   |-- text_encoder.py          # plain Qwen3 layers with hidden-state taps 9, 18 and 27
 |   |   |-- vae.py                   # untiled spatial encoder/decoder and latent normalization
 |   |   |-- image_processing.py      # output/reference geometry, native pixels and token IDs
-|   |   |-- conditioning.py          # velocity callables with invariant conditioning
+|   |   |-- velocity.py              # velocity protocols and prepared velocity callables
+|   |   |-- components.py            # public component ports and the default native provider
 |   |   |-- geometry_rules.py        # Klein geometry choices needing no source-image read
 |   |   |-- layout.py                # measured Klein storage layouts, apart from logical shapes
 |   |   |-- output_policies.py       # Klein output availability for schemas and planning
@@ -275,7 +283,9 @@ kinomlx/
 |   |   |-- types.py                 # immutable public still-expansion request
 |   |   |-- resources.py             # source paths and policies, never live weights
 |   |   |-- components.py            # generator port, lease, and native provider
-|   |   |-- pipeline.py              # public stateless expand_gmnet recipe
+|   |   |-- pipelines/               # public recipe implementations
+|   |   |   |-- __init__.py          # recipe export
+|   |   |   `-- sdr_to_hdr.py        # stateless expand_gmnet recipe
 |   |   |-- runner.py                # generic recipe host + convenience expand method
 |   |   |-- output.py                # typed all-or-nothing EXR/HEIC/gain-map terminal
 |   |   |-- net.py                   # NHWC GMNet generator + checkpoint key map
@@ -294,7 +304,7 @@ kinomlx/
 |   |   `-- weights/                 # converted weights (gitignored) + provenance docs
 |   |
 |   |-- krea2/                       # Krea 2 Raw/Turbo text-to-image generation
-|   |   |-- __init__.py              # direct resources, recipe, runner, and station APIs
+|   |   |-- __init__.py              # direct resources, recipe, runner, and stage APIs
 |   |   |-- catalog.py               # Raw/Turbo source, architecture, and recipe facts
 |   |   |-- arguments.py             # complete --model krea2 parser
 |   |   |-- command.py               # preparation/generation execution and run sidecars
@@ -307,6 +317,7 @@ kinomlx/
 |   |   |-- resources.py             # immutable source inventory
 |   |   |-- sampling.py              # geometry, noise, schedule, CFG, Euler, pack/unpack
 |   |   |-- settings.py              # baseline/component paths and compute dtype
+|   |   |-- settings_rules.py        # pure final resource policies owned by Krea Settings fields
 |   |   |-- text_conditioning.py     # sequential Qwen lifetime, products, provenance
 |   |   |-- types.py                 # request plus generation/output config records
 |   |   |-- weight_keys.py           # consumed source-to-target mappings
@@ -385,15 +396,16 @@ kinomlx/
 |       |-- transformer_config.py    # neutral transformer constructor record
 |       |-- run_logging.py           # request, resources, and sampling summaries
 |       |-- noising.py               # LTX clean-latent two-lerp Gaussian injection
-|       |-- transition_noise.py      # ordered two-stage ancestral-noise stream
+|       |-- transition_noise.py      # ordered ancestral-noise stream for one stage
 |       |-- patchifier.py            # audio/video tokens, grid bounds, pixel coordinates
 |       |-- components.py            # public component ports, providers, and leases
 |       |-- duration.py              # optional natural-duration head + VAE-grid snapping
 |       |-- generated_keyframes.py   # stage-1 generated-slot layout, mask, and cleanup
-|       |-- artifacts.py             # LTX-2 artifact schemas, names, and sidecar paths
+|       |-- artifacts.py             # LTX-2 artifact schemas, builders, and sidecar paths
+|       |-- output_policies.py       # output availability derived from the stage model
 |       |-- resources.py             # immutable checkpoint inventory
 |       |-- settings.py              # LTX-2 checkpoint and transformer policy
-|       |-- text_conditioning.py     # encoder-neutral station, product, provenance
+|       |-- text_conditioning.py     # encoder-neutral stage, product, provenance
 |       |-- denoise.py               # pure: denoise_step, denoise_loop
 |       |-- encode.py                # pure: encode_text, encode_image
 |       |-- decode.py                # audio decode + lazy owned video-frame stream
@@ -403,6 +415,8 @@ kinomlx/
 |       |-- compatibility.py         # central, packaging-neutral LTX-2 compatibility inspection
 |       |-- hdr_profile.py           # explicit HDR producer facts, no checkpoint allowlists
 |       |-- hdr_reference.py         # SDR reference-video preprocessing for the HDR recipe
+|       |-- frame_position.py        # first/last/integer frame-position grammar and constraint
+|       |-- image_arguments.py       # image-condition members, --image shorthand, collection
 |       |-- keyframe_positions.py    # generated-keyframe positions for admission and run
 |       |-- layer_rules.py           # LTX rules contributed through the shared runner
 |       |-- metadata.py              # header-only component config and compatibility
@@ -410,7 +424,7 @@ kinomlx/
 |       |-- precision.py             # explicit dtype boundaries for native LTX-2 pipelines
 |       |-- preparation.py           # lazy LTX transformer conversion and weight binding
 |       |-- request_rules.py         # coupled LTX request policies owned by fields
-|       |-- restart_rules.py         # pure LTX restart selection and concrete artifact policies
+|       |-- restart_rules.py         # LTX stage model and the restart record rules that read it
 |       |-- settings_rules.py        # pure final resource policies owned by LTX Settings fields
 |       |-- source_loading.py        # reloadable lazy transformer source preparation
 |       |
@@ -420,7 +434,7 @@ kinomlx/
 |       |   |-- keys.py              # source aliases, graph targets, and knockout categories
 |       |   |-- receipt.py           # adapter application receipt
 |       |   |-- selection.py         # per-stage strengths and resolved LoRA profiles
-|       |   |-- loading.py           # direct-strength application and execution layout handling
+|       |   |-- loading.py           # direct or PEFT-scaled application and execution layouts
 |       |   |-- config_schema.py     # LTX-2 adapter collection and stage shorthand
 |       |   `-- inputs.py            # LTX-2 adapter inputs with optional stage strengths
 |       |
@@ -441,20 +455,20 @@ kinomlx/
 |       |   |-- item.py              # encoded-condition structural protocol
 |       |   |-- keyframe.py          # insert image at arbitrary frame
 |       |   |-- latent.py            # latent-replacement at frame 0
-|       |   |-- preparation.py       # raw-source -> encoded-condition station
+|       |   |-- preparation.py       # raw-source -> encoded-condition stage
 |       |   |-- tools.py             # shape-bound patch/mask/position helpers
 |       |   `-- reference.py         # clean full-video tokens for IC-LoRA conditioning
 |       |
-|       |-- kernels/                 # LTX-shape-specific STEEL attention
-|       |   |-- __init__.py          # LTX-2-specific Metal kernels and selectors
-|       |   |-- steel_attention.py   # dispatch, shape gates, and fallback
-|       |   |-- source.py            # bundled Metal source loader
+|       |-- kernels/                 # LTX attention Metal kernels
+|       |   |-- __init__.py          # LTX-2-specific Metal kernels
+|       |   |-- dense_attention.py   # FP16 dense attention and its call gate
+|       |   |-- sol_attention.py     # Sol-Attn sparse video self-attention
 |       |   |
-|       |   `-- metal/               # BF16 LTX attention source fragments
+|       |   `-- metal/               # shared FP16 primitives and kernel bodies
 |       |
 |       |-- pipelines/               # composition entry points
 |       |   |-- __init__.py          # generation pipelines for the LTX-2 model
-|       |   |-- distilled.py         # public distilled recipe and station products
+|       |   |-- distilled.py         # public distilled recipe and stage products
 |       |   `-- restart.py           # stage-2/direct-decode recipe shared by API and CLI
 |       |
 |       |-- text_encoder/            # tokenizer + Gemma 3/4 12B + AV connector
@@ -475,7 +489,7 @@ kinomlx/
 |       |   |-- __init__.py          # LTX-2 diffusion transformer public API
 |       |   |-- attention.py         # MHA + 3D / 1D RoPE wiring
 |       |   |-- rope.py              # 3D RoPE for video, 1D for audio
-|       |   |-- feed_forward.py      # GELU MLP (BF16 default; optional FP16 transformer lane)
+|       |   |-- feed_forward.py      # GELU MLP in the transformer's dtype (FP16 default)
 |       |   |-- timestep.py          # timestep MLP + checkpoint-shaped AdaLN projections
 |       |   |-- preprocessing.py     # per-modality masks, RoPE, and A/V timestep preparation
 |       |   |-- transformer.py       # one joint A/V DiT block
@@ -488,7 +502,7 @@ kinomlx/
 |       |   |-- __init__.py          # spatial recipe upscaling and temporal x2 support
 |       |   |-- ports.py             # neutral upscaler and latent-statistics protocols
 |       |   |-- spatial.py           # normalized-latent wrapper + raw 2x spatial model
-|       |   `-- temporal.py          # temporal x2 component + VAE-statistics station
+|       |   `-- temporal.py          # temporal x2 component + VAE-statistics stage
 |       |
 |       |-- video_vae/               # metadata-selected native MLX video VAE
 |       |   |-- __init__.py          # native MLX video VAE graphs for LTX-2 checkpoints
@@ -614,7 +628,7 @@ can be reused by other diffusion models.
 | `kinomlx/modeling/` | Model-neutral layer shells, shared Qwen primitives, dtype/evaluation helpers, and exact checkpoint binding |
 | `kinomlx/huggingface.py` | Read-only discovery of already-local Hugging Face Hub snapshots |
 | `kinomlx/recipe_host.py` | Common public recipe execution boundary, independent of model ports |
-| `kinomlx/seed_execution.py` | Request-scoped model ownership and sequential execution at image stations |
+| `kinomlx/seed_execution.py` | Request-scoped model ownership and sequential execution at image stages |
 | `kinomlx/reporter_stack.py` | The reporter stack every command and converter builds around its work |
 
 Touches the outside world. Still model-agnostic.
@@ -627,7 +641,8 @@ Touches the outside world. Still model-agnostic.
 | `kinomlx/config/` | TOML load/merge/typed overrides/schema/dump primitives |
 | `kinomlx/types.py` | Model-neutral shapes and compute-policy literals |
 | `kinomlx/config_*.py` | Typed record construction and presence, CLI bindings, local constraints, field rules, and transport surface policies |
-| `kinomlx/model_registry.py` | Model catalog and the validated global registry of per-model configuration contributions |
+| `kinomlx/model_catalog.py` | Model catalog: names, help, and the default model |
+| `kinomlx/model_registry.py` | Validated global registry of per-model configuration contributions |
 | `kinomlx/invocation_controls.py`, `kinomlx/api_boundaries.py` | Bootstrap and utility control declarations, plus typed ownership of public API parameters |
 | `kinomlx/memory_policy.py` | Invocation-owned MLX allocator and wired-memory policy |
 | `kinomlx/prompts.py`, `kinomlx/request_rules.py` | Shared generation-request contracts: the explicit empty-user-prompt rule and coupled field policies |
@@ -673,7 +688,9 @@ Diffusion model packages additionally contain their samplers, transformers, VAEs
 text encoders, and adapter support. GMNet has a smaller convolutional still-image
 implementation without those diffusion-specific components.
 
-Every model registers one complete command in `kinomlx/model_registry.py`.
+Every model has one entry in `kinomlx/model_catalog.py`, one complete command in the
+dispatch table of `kinomlx/cli/_registry.py`, and one configuration contribution in
+`kinomlx/model_registry.py`, all imported statically.
 `--model <name>` routes the whole invocation to the model's own `command.py`,
 whose `arguments.py` defines its complete inference parser while reusing the
 shared flag conventions (`--output`, `--output-dir`, `--config`, `--set`) and
@@ -702,45 +719,45 @@ Two layers, both first-class.
 ```python
 from kinomlx import Settings
 from kinomlx.models.ltx2 import (
-    DistilledRequest,
+    LTX2Request,
     LTX2Runner,
     LTX2Settings,
-    generate_distilled,
+    generate_ltx2,
 )
 
 runner = LTX2Runner(
     LTX2Settings.from_env(),
     infrastructure=Settings.from_env(),
 )
-with runner.run(generate_distilled, DistilledRequest(prompt="...")) as output:
+with runner.run(generate_ltx2, LTX2Request(prompt="...")) as output:
     for frame in output.frames:
         consume(frame)
 ```
 
-Saved-station restart is another public recipe, not a branch inside the generic
+Saved-stage restart is another public recipe, not a branch inside the generic
 runner or the ordinary distilled recipe:
 
 ```python
 from pathlib import Path
 
-from kinomlx.models.ltx2 import DistilledRequest, DistilledRestart
+from kinomlx.models.ltx2 import LTX2Request, LTX2Restart
 
-request = DistilledRequest(width=768, height=448, frames=121)
-selection = DistilledRestart.decode(Path("outputs/source.safetensors"))
+request = LTX2Request(width=768, height=448, frames=121)
+selection = LTX2Restart.decode(Path("outputs/source.safetensors"))
 with runner.restart(request, selection) as output:
     consume(output)
 ```
 
-`DistilledRestart.stage_2(...)` selects the shared upscaler, stage-2 denoise,
+`LTX2Restart.stage_2(...)` selects the shared upscaler, stage-2 denoise,
 decode, and terminal path from a stage-1 latent plus text-conditioning product.
 The CLI resolves its run manifest into this same typed selection and invokes
-the same `restart_distilled()` recipe. VSR, frame-rate conversion, and media
+the same `restart_ltx2()` recipe. VSR, frame-rate conversion, and media
 encoding remain terminal responsibilities downstream of either recipe.
 
 `LTX2Runner` prepares one immutable resource inventory and retains only
 stateless component, text-conditioner, reporter, and artifact ports. The
 generic host contains no distilled branch: callers supply the public recipe
-and its typed request. Each recipe releases live components at bounded station
+and its typed request. Each recipe releases live components at bounded stage
 boundaries. Video decoder ownership transfers to the lazy frame stream and
 ends on exhaustion, early close, or output failure.
 
@@ -749,25 +766,25 @@ ends on exhaustion, early close, or output failure.
 ```python
 from kinomlx import Settings
 from kinomlx.models.ltx2 import LTX2Settings
-from kinomlx.models.ltx2.pipelines.distilled import generate_distilled
+from kinomlx.models.ltx2.pipelines.distilled import generate_ltx2
 from kinomlx.models.ltx2.resources import prepare_resources
-from kinomlx.models.ltx2.types import DistilledRequest
+from kinomlx.models.ltx2.types import LTX2Request
 
 resources = prepare_resources(
     LTX2Settings.from_env(),
     infrastructure=Settings.from_env(),
 )
-request = DistilledRequest(prompt="...")
-with generate_distilled(request, resources) as output:
+request = LTX2Request(prompt="...")
+with generate_ltx2(request, resources) as output:
     for frame in output.frames:
         consume(frame)
 ```
 
 `LTX2Resources` contains paths and policies, never live model instances.
-`generate_distilled` leases native components at recipe-owned lexical
+`generate_ltx2` leases native components at recipe-owned lexical
 boundaries. Its returned frame stream is intentionally caller-owned. The
 executable [`examples/ltx2_distilled.py`](../examples/ltx2_distilled.py)
-expands the same recipe into every public station and makes the complete
+expands the same recipe into every public stage and makes the complete
 transformer profile reuse/reload branch visible. Terminal hosts pass that
 generation and an explicit `OutputColorPlan` to a `GenerationSink`; the
 native `VideoToolboxGenerationSink` validates the signal/delivery pair before
@@ -803,7 +820,7 @@ with plan.reserve() as reservation:
 
 The reservation precedes inference and the sink publishes the selected EXR,
 HEIC, and gain-map artifacts together. `GMNetRunner.expand()` is the standard
-recipe convenience, while injected `GMNetComponents` make tests and alternate
+recipe convenience, while injected `GMNetComponentsProvider` make tests and alternate
 hosts independent of the native loader. The small composition is
 [`examples/gmnet_expand.py`](../examples/gmnet_expand.py).
 
@@ -848,8 +865,8 @@ math are shared in `kinomlx/adapters/`, while model packages resolve their own t
 
 ### Precision
 
-LTX, Krea, and Klein transformers default to BF16; FP16 is explicitly selectable.
-Both formats use two bytes per weight. Precision-sensitive calculations use wider
+LTX transformers default to FP16 and Krea and Klein transformers to BF16; either
+is selectable. Both formats use two bytes per weight. Precision-sensitive calculations use wider
 arithmetic where required by the model. For example, LTX uses FP32 update math and
 honors the checkpoint's frequency-grid precision before casting rotary tables to
 the activation dtype. FP8 E4M3 source decoding and selected layout transforms are
@@ -892,7 +909,7 @@ runtime uses its own safetensors header reader with MLX tensor loading.
   through compatibility modules.
 - `resources.py` inspects source artifacts and `components.py` binds or fuses
   them into bounded leases. Recipes consume only those public providers and
-  station products; model code owns their lifetimes.
+  stage products; model code owns their lifetimes.
 - `models/ltx2/adapters/loading.py` mediates between the shared `kinomlx/adapters/`
   fusion math and the LTX key/category rules in `adapters/keys.py`.
   Multiple adapters retain independent scalar and per-stage totals, and each
@@ -936,5 +953,5 @@ rollback publication. Model output modules retain their tensor schemas and pixel
 The public model runners share `kinomlx/recipe_host.py` for recipe dispatch, typed-result
 validation, and operational error translation without retaining failed model frames.
 Klein exposes `Flux2Runner`, `Flux2Request`, `Flux2Restart`, and `Flux2GenerationOutput`;
-its `pipeline.py` owns typed generation/restart recipes and `generation.py` retains the
+its `pipelines/` package owns typed generation/restart recipes and `generation.py` retains the
 lower-level single-image implementation. The CLI uses those same runner recipes.

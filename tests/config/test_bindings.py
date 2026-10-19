@@ -7,8 +7,8 @@ from pathlib import Path
 
 import pytest
 
-from kinomlx.cli._registry import validate_model_parser
 from kinomlx.cli.config_arguments import add_config_arguments
+from kinomlx.cli.parser_contract import validate_model_parser
 from kinomlx.config import (
     CliBinding,
     ConfigError,
@@ -38,8 +38,9 @@ def sensor_schema() -> ModelConfigSpec:
         model="sensor",
         title="Sensor configuration",
         introduction=("Synthetic non-model inputs.",),
-        restart_stations=(),
-        no_restart_reason="The synthetic sensor contribution has no saved station.",
+        stages=("capture",),
+        restart_stages=(),
+        no_restart_reason="The synthetic sensor contribution has no saved stage.",
         root_fields=(
             ConfigFieldSpec(
                 "model",
@@ -234,7 +235,7 @@ def test_real_aliases_repetition_and_optional_values(builder):
     assert options.save_all_sidecars is True
     assert options.save_text_conditioning is False
     assert options.restart_run == Path("run.json")
-    assert options.restart_phase == "denoise"
+    assert options.restart_stage == "denoise"
     assert options.restart_index == 2
     assert options.seeds == (7, 7, 9)
     assert options.seed is None

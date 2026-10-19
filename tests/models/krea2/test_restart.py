@@ -11,6 +11,7 @@ import kinomlx.models.krea2.pipelines.restart as restart_module
 from kinomlx.components import ComponentLease
 from kinomlx.config import ConfigError
 from kinomlx.memory_policy import MLXMemoryPolicy
+from kinomlx.model_registry import config_registry
 from kinomlx.models.krea2.arguments import build_parser
 from kinomlx.models.krea2.catalog import Krea2VAEDecoder, Krea2Variant
 from kinomlx.models.krea2.config import assemble, validate_for_execution
@@ -173,7 +174,7 @@ def test_restart_manifest_resolves_relative_latents_and_safe_output_base(tmp_pat
     _write_latents(latent)
     _write_run(run, latent)
 
-    manifest = load_restart_manifest(RestartConfig(run))
+    manifest = load_restart_manifest(RestartConfig(run), schema=config_registry().model("krea2"))
 
     assert manifest.selected_latents == latent
     assert manifest.source_variant == "turbo"
@@ -239,7 +240,7 @@ def test_restart_config_inherits_request_and_allows_only_decode_overrides(tmp_pa
     assert invocation.output.save_initial_noise is False
     assert invocation.output.save_final_latents is True
     assert invocation.output.save_run_log is True
-    assert invocation.resolved_config["restart"] == {"run": run, "phase": "decode"}
+    assert invocation.resolved_config["restart"] == {"run": run, "stage": "decode"}
     validate_for_execution(invocation)
 
 
@@ -275,7 +276,7 @@ def test_denoise_restart_inherits_saved_text_and_allows_downstream_changes(
     )
 
     assert invocation.restart is not None
-    assert invocation.restart.config.phase == "denoise"
+    assert invocation.restart.config.stage == "denoise"
     assert invocation.request is not None
     assert invocation.request.text_conditioning == text
     assert invocation.request.prompts == ("fixture prompt",)
@@ -291,8 +292,7 @@ def test_denoise_restart_inherits_saved_text_and_allows_downstream_changes(
     assert invocation.output.save_text_conditioning is True
     validate_for_execution(invocation)
     record = invocation.restart.to_record(text_conditioning=invocation.request.text_conditioning)
-    assert record["phase"] == "denoise"
-    assert record["latent_stage"] is None
+    assert record["stage"] == "denoise"
     assert record["inputs"]["text_conditioning"]["path"] == str(text)
 
 
@@ -411,7 +411,7 @@ def test_denoise_restart_requires_saved_or_substituted_text(tmp_path: Path) -> N
 def test_denoise_restart_accepts_an_explicit_schedule_and_decode_refuses_it(
     tmp_path: Path,
 ) -> None:
-    """Denoise reruns the sampler, so its schedule is an input of that station."""
+    """Denoise reruns the sampler, so its schedule is an input of that stage."""
     latent = tmp_path / "source_final_latents.safetensors"
     text = tmp_path / "source_text.safetensors"
     run = tmp_path / "source_run.json"
@@ -466,7 +466,7 @@ def test_denoise_restart_rejects_changes_before_saved_text(
     _write_text_conditioning(text)
     _write_run(run, latent, text_conditioning=text)
 
-    with pytest.raises(ConfigError, match="belongs to an earlier station"):
+    with pytest.raises(ConfigError, match="belongs to an earlier stage"):
         assemble(
             build_parser().parse_args(
                 [
@@ -499,7 +499,7 @@ def test_restart_rejects_changes_before_decode(tmp_path: Path, arguments: list[s
     _write_latents(latent)
     _write_run(run, latent)
 
-    with pytest.raises(ConfigError, match="belongs to an earlier station"):
+    with pytest.raises(ConfigError, match="belongs to an earlier stage"):
         assemble(
             build_parser().parse_args(["--model", "krea2", "--restart", str(run), *arguments]),
             base_settings=Settings(),
@@ -507,7 +507,7 @@ def test_restart_rejects_changes_before_decode(tmp_path: Path, arguments: list[s
         )
 
 
-def test_restart_refusal_names_the_station_and_quotes_the_declared_reason(
+def test_restart_refusal_names_the_stage_and_quotes_the_declared_reason(
     tmp_path: Path,
 ) -> None:
     latent = tmp_path / "source_final_latents.safetensors"
@@ -525,7 +525,7 @@ def test_restart_refusal_names_the_station_and_quotes_the_declared_reason(
         )
 
     assert str(refusal.value) == (
-        "[restart]: decode restart: [generate].prompt belongs to an earlier station: "
+        "[restart]: decode restart: [generate].prompt belongs to an earlier stage: "
         "Saved latents fix the resolved prompt rows."
     )
 
@@ -566,7 +566,9 @@ def test_restart_latent_override_replaces_missing_parent_artifact(tmp_path: Path
     _write_latents(replacement)
     _write_run(run, recorded)
 
-    manifest = load_restart_manifest(RestartConfig(run, latents=replacement))
+    manifest = load_restart_manifest(
+        RestartConfig(run, latents=replacement), schema=config_registry().model("krea2")
+    )
 
     assert manifest.selected_latents == replacement
 
@@ -621,7 +623,7 @@ def test_decode_restart_loads_only_the_decoder_and_preserves_output_scale(tmp_pa
             "height": 32,
         }
         assert output.initial_noise is None
-        # The decoded latent is retained so the station can re-emit it.
+        # The decoded latent is retained so the stage can re-emit it.
         assert output.final_latents is not None
         assert tuple(output.final_latents.shape) == (1, 16, 2, 2)
 
@@ -729,7 +731,7 @@ def test_replay_restart_honors_environment_negative_prompt(tmp_path, monkeypatch
     assert str(env_error.value) == str(cli_error.value)
 
 
-@pytest.mark.parametrize("phase", ["denoise", "decode"])
+@pytest.mark.parametrize("stage", ["denoise", "decode"])
 @pytest.mark.parametrize(
     ("field", "value", "expected"),
     [
@@ -737,8 +739,8 @@ def test_replay_restart_honors_environment_negative_prompt(tmp_path, monkeypatch
         ("sigma_window", '"0.93"', "0.93"),
     ],
 )
-def test_restart_community_gate_changes_follow_station_policy(
-    tmp_path, phase, field, value, expected
+def test_restart_community_gate_changes_follow_stage_policy(
+    tmp_path, stage, field, value, expected
 ):
     latent = tmp_path / "latent.safetensors"
     text = tmp_path / "text.safetensors"
@@ -757,12 +759,12 @@ def test_restart_community_gate_changes_follow_station_policy(
             "--restart",
             str(run),
             "--restart-from",
-            phase,
+            stage,
             "--set",
             f"generate.adapters[0].{field}={value}",
         ]
     )
-    if phase == "decode":
+    if stage == "decode":
         with pytest.raises(ConfigError, match="adapters"):
             assemble(args, base_settings=Settings())
     else:
@@ -827,7 +829,7 @@ def test_missing_decoder_observation_does_not_invent_a_stock_decoder(tmp_path: P
     payload["configuration"]["values"]["model_settings"]["vae_path"] = "alternate.safetensors"
     run.write_text(json.dumps(payload))
 
-    manifest = load_restart_manifest(RestartConfig(run))
+    manifest = load_restart_manifest(RestartConfig(run), schema=config_registry().model("krea2"))
     assert manifest.source_vae_decoder is None
     settings = manifest.base_config().values["model_settings"]
     assert "vae_decoder" not in settings

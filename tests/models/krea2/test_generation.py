@@ -390,7 +390,7 @@ def test_turbo_multi_prompt_generation_skips_every_unconditional_operation() -> 
     assert output.images == ()
 
 
-def test_saved_text_conditioning_bypasses_the_qwen_station(tmp_path, monkeypatch) -> None:
+def test_saved_text_conditioning_bypasses_the_qwen_stage(tmp_path, monkeypatch) -> None:
     sidecar = tmp_path / "prompt_text.safetensors"
     mx.save_safetensors(
         str(sidecar),
@@ -409,7 +409,7 @@ def test_saved_text_conditioning_bypasses_the_qwen_station(tmp_path, monkeypatch
         return _Conditioner(events)(("saved prompt",), _resources)
 
     def unexpected_qwen(*_args, **_kwargs):
-        pytest.fail("saved text conditioning must bypass the Qwen station")
+        pytest.fail("saved text conditioning must bypass the Qwen stage")
 
     monkeypatch.setattr(text_to_image, "load_text_conditioning", load_saved)
     with generate_krea2(
@@ -542,7 +542,7 @@ def test_failed_transformer_lease_closes_before_error_escapes() -> None:
 
 
 @pytest.mark.requires_metal
-def test_component_objects_die_before_cleanup_and_next_station() -> None:
+def test_component_objects_die_before_cleanup_and_next_stage() -> None:
     events: list[object] = []
     references: dict[str, weakref.ReferenceType] = {}
 
@@ -677,7 +677,7 @@ def test_denoise_checks_adapter_destination_only_on_first_use(invalid):
     assert reporter.events[-1][:2] == ("end", "denoise")
 
 
-@pytest.mark.parametrize(("mode", "loads"), [("sequential", 3), ("station", 1), ("resident", 1)])
+@pytest.mark.parametrize(("mode", "loads"), [("sequential", 3), ("stage", 1), ("resident", 1)])
 def test_seed_modes_reuse_conditioning_and_preserve_noise(mode, loads):
     events = []
     request = Krea2Request(
@@ -703,7 +703,7 @@ def test_seed_modes_reuse_conditioning_and_preserve_noise(mode, loads):
         assert events.index("load-decoder") < events.index("close-transformer")
     else:
         assert events.index("close-transformer") < events.index("load-decoder")
-    if mode == "station":
+    if mode == "stage":
         assert max(
             index
             for index, event in enumerate(events)
@@ -716,7 +716,7 @@ def test_multi_prompt_seed_list_encodes_every_prompt_under_one_text_lifetime():
     request = Krea2Request(
         ("first", "second", "third"),
         seeds=(9, 2),
-        seed_mode="station",
+        seed_mode="stage",
         width=16,
         height=16,
         steps=1,

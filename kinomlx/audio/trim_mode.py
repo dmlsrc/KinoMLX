@@ -2,7 +2,6 @@
 
 import math
 from dataclasses import dataclass
-from types import MappingProxyType
 
 from kinomlx.config_constraints import LengthConstraint
 
@@ -10,7 +9,7 @@ DEFAULT_TRIM_MS = 120.0
 """Default leading region zero-filled after automatic spike detection."""
 
 
-NAMED_TRIM_MODES = MappingProxyType(
+NAMED_TRIM_MODES = frozendict(
     {"auto": ("auto", DEFAULT_TRIM_MS), "off": ("off", 0.0), "none": ("off", 0.0)}
 )
 

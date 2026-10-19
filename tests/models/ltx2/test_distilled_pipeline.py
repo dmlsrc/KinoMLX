@@ -16,22 +16,26 @@ from kinomlx.media.frames import VideoFrameStream
 from kinomlx.memory_policy import MLXMemoryPolicy
 from kinomlx.models.ltx2.adapters.inputs import LTX2AdapterConfig
 from kinomlx.models.ltx2.artifacts import (
+    FINAL_LATENTS,
     STAGE_1_CONDITIONING,
+    STAGE_1_LATENTS,
     STAGE_2_CONDITIONING,
     TEXT_CONDITIONING,
 )
 from kinomlx.models.ltx2.precision import LTX2DTypePolicy
 from kinomlx.models.ltx2.resources import ComponentKind, LTX2Resources
 from kinomlx.models.ltx2.text_conditioning import (
-    EncodedTextConditioning,
-    TextConditioningProvenance,
+    LTX2EncodedTextConditioning,
+    LTX2TextConditioningProvenance,
 )
 from kinomlx.models.ltx2.types import (
-    DistilledRequest,
-    ImageConditioningConfig,
-    VideoVAETilingConfig,
+    LTX2ImageConditioningConfig,
+    LTX2Request,
+    LTX2VideoVAETilingConfig,
 )
 from kinomlx.models.ltx2.video_vae.config import LTX23_VIDEO_VAE_CONFIG
+from kinomlx.models.ltx2.video_vae.kinds import VideoVAEKind
+from kinomlx.models.ltx2.vocabularies import LTX2StageSampler
 from kinomlx.samplers.noise import NoiseStreamState
 from kinomlx.types import VideoPixelShape
 from tests._reporting import RecordingReporter
@@ -39,20 +43,26 @@ from tests._reporting import RecordingReporter
 
 @dataclass(frozen=True)
 class _MemoryReceipt:
-    station: str
+    stage: str
     active_components: frozenset[str]
     active_bytes: int
 
 
+@dataclass
 class _Resources:
-    memory_policy = MLXMemoryPolicy()
+    generation: str = "2.3"
+    dtype_policy: LTX2DTypePolicy | None = None
+    memory_policy: MLXMemoryPolicy = MLXMemoryPolicy()
 
     def __init__(
         self,
         *,
         generation: str = "2.3",
         dtype_policy: LTX2DTypePolicy | None = None,
+        memory_policy: MLXMemoryPolicy = MLXMemoryPolicy(),
     ) -> None:
+        self.generation = generation
+        self.memory_policy = memory_policy
         self.dtype_policy = dtype_policy or LTX2DTypePolicy(
             transformer=mx.float32,
             latent=mx.float32,
@@ -63,13 +73,13 @@ class _Resources:
         self.capabilities = SimpleNamespace(
             model_generation=generation,
             recipe_families=("distilled",),
-            video_vae_kind="native-conv3d",
+            video_vae_kind=VideoVAEKind.CONV,
             condition_families=("text", "image", "keyframe"),
             generates_audio=True,
-            sampler_policy=(
-                "deterministic-euler-two-stage"
+            stage_samplers=(
+                (LTX2StageSampler.DETERMINISTIC, LTX2StageSampler.DETERMINISTIC)
                 if generation == "2.3"
-                else "ancestral-stage1-deterministic-stage2"
+                else (LTX2StageSampler.ANCESTRAL, LTX2StageSampler.ANCESTRAL)
             ),
             generated_keyframes=generation == "2.5",
             native_hdr=generation == "2.5",
@@ -84,7 +94,7 @@ class _Resources:
         )
         self.components = ()
         self.execution_policy = SimpleNamespace(check_adapter_weights=True)
-        self.gemma_path = Path("gemma")
+        self.text_encoder_path = Path("gemma")
         self.weights_path = Path("checkpoint.safetensors")
 
     def require(self, kind: ComponentKind) -> SimpleNamespace:
@@ -110,12 +120,12 @@ class _X0:
         self.video_token_counts: list[int] = []
 
     def __call__(self, video, audio=None):
-        station = (
+        stage = (
             "stage 2" if self._load_index > 0 or len(self.video_token_counts) >= 8 else "stage 1"
         )
-        self._owner._use("transformer", station)
-        if self._owner.fail_at == station:
-            raise RuntimeError(f"{station} failed")
+        self._owner._use("transformer", stage)
+        if self._owner.fail_at == stage:
+            raise RuntimeError(f"{stage} failed")
         if self._fail:
             raise RuntimeError(f"transformer-{self._load_index} failed")
         self.video_token_counts.append(video.latent.shape[1])
@@ -203,10 +213,10 @@ class _RecordingComponents:
         self.active.add(name)
         self.events.append(("load", name, frozenset(self.active)))
 
-    def _use(self, name: str, station: str) -> None:
+    def _use(self, name: str, stage: str) -> None:
         if name not in self.active:
             raise AssertionError(f"use of inactive component: {name}")
-        self.events.append(("use", station, frozenset(self.active)))
+        self.events.append(("use", stage, frozenset(self.active)))
 
     def _close(self, name: str) -> None:
         if name not in self.active:
@@ -242,7 +252,7 @@ class _RecordingComponents:
         del resources
         self.memory_receipts.append(
             _MemoryReceipt(
-                station="before spatial upscaler load",
+                stage="before spatial upscaler load",
                 active_components=frozenset(self.active),
                 active_bytes=mx.get_active_memory(),
             )
@@ -266,13 +276,13 @@ class _RecordingComponents:
         return self._lease("video_decoder", _VideoDecoder(self))
 
 
-def _text(prompt: str = "test", tokens: int = 1) -> EncodedTextConditioning:
-    return EncodedTextConditioning(
+def _text(prompt: str = "test", tokens: int = 1) -> LTX2EncodedTextConditioning:
+    return LTX2EncodedTextConditioning(
         video_encoding=mx.zeros((1, tokens, 4096)),
         audio_encoding=mx.zeros((1, tokens, 2048)),
         attention_mask=mx.ones((1, tokens)),
         prompt=prompt,
-        provenance=TextConditioningProvenance(
+        provenance=LTX2TextConditioningProvenance(
             model_generation="ltx-2.3",
             text_encoder_identity="gemma-3-12b-it",
             projection_identity="connector:test",
@@ -292,7 +302,7 @@ def test_run_stage_elides_only_an_all_valid_connector_mask(
     attention_mask: mx.array,
     expect_elided: bool,
 ) -> None:
-    request = DistilledRequest(
+    request = LTX2Request(
         prompt="test",
         width=64,
         height=64,
@@ -337,7 +347,7 @@ def test_run_stage_elides_only_an_all_valid_connector_mask(
 
 def test_prepare_stage_can_use_reference_audio_latent_length() -> None:
     stage = distilled.prepare_stage(
-        DistilledRequest(
+        LTX2Request(
             prompt="test",
             width=64,
             height=64,
@@ -380,7 +390,7 @@ def _patch_operations(monkeypatch) -> None:
 
 def _generate(
     monkeypatch,
-    request: DistilledRequest,
+    request: LTX2Request,
     *,
     components: _RecordingComponents | None = None,
     resources: _Resources | None = None,
@@ -390,7 +400,7 @@ def _generate(
 ):
     _patch_operations(monkeypatch)
     components = components or _RecordingComponents()
-    output = distilled.generate_distilled(
+    output = distilled.generate_ltx2(
         request,
         resources or _Resources(),
         components=components,
@@ -410,7 +420,7 @@ def _profile_signature(
 def test_public_recipe_runs_eight_plus_three_steps_and_closes_every_lease(monkeypatch) -> None:
     output, components = _generate(
         monkeypatch,
-        DistilledRequest(prompt="test", width=64, height=64, frames=9),
+        LTX2Request(prompt="test", width=64, height=64, frames=9),
     )
 
     assert output.frames.frame_count == 9
@@ -429,18 +439,18 @@ def test_public_recipe_runs_eight_plus_three_steps_and_closes_every_lease(monkey
     assert components.active == set()
 
 
-def test_default_and_injected_providers_follow_the_same_station_graph(monkeypatch) -> None:
-    request = DistilledRequest(prompt="test", width=64, height=64, frames=9)
+def test_default_and_injected_providers_follow_the_same_stage_graph(monkeypatch) -> None:
+    request = LTX2Request(prompt="test", width=64, height=64, frames=9)
     _injected_output, injected = _generate(monkeypatch, request)
     native = _RecordingComponents()
     monkeypatch.setattr(
         distilled,
-        "NativeLTX2Components",
+        "LTX2Components",
         lambda *, reporter: native,
     )
     _patch_operations(monkeypatch)
 
-    default_output = distilled.generate_distilled(
+    default_output = distilled.generate_ltx2(
         request,
         _Resources(),
         text_conditioner=_RecordingTextConditioner(),
@@ -469,8 +479,8 @@ def test_public_recipe_applies_weights_limit_before_prompt(monkeypatch) -> None:
         events.append(("prompt", None))
         return _text(prompt=request.prompt)
 
-    distilled.generate_distilled(
-        DistilledRequest(prompt="test", width=64, height=64, frames=9),
+    distilled.generate_ltx2(
+        LTX2Request(prompt="test", width=64, height=64, frames=9),
         resources,
         components=_RecordingComponents(),
         text_conditioner=condition_text,
@@ -502,7 +512,7 @@ def test_recipe_offers_materialized_artifacts_at_boundaries(monkeypatch) -> None
 
     _generate(
         monkeypatch,
-        DistilledRequest(prompt="test", width=64, height=64, frames=9),
+        LTX2Request(prompt="test", width=64, height=64, frames=9),
         artifact_sink=_Artifacts(),
     )
 
@@ -513,7 +523,7 @@ def test_recipe_offers_materialized_artifacts_at_boundaries(monkeypatch) -> None
     ]
 
 
-def test_recipe_forwards_saved_text_conditioning_to_the_public_station(
+def test_recipe_forwards_saved_text_conditioning_to_the_public_stage(
     tmp_path,
     monkeypatch,
 ) -> None:
@@ -534,8 +544,8 @@ def test_recipe_forwards_saved_text_conditioning_to_the_public_station(
 
     _patch_operations(monkeypatch)
     resources = _Resources()
-    distilled.generate_distilled(
-        DistilledRequest(width=64, height=64, frames=9, text_conditioning=sidecar),
+    distilled.generate_ltx2(
+        LTX2Request(width=64, height=64, frames=9, text_conditioning=sidecar),
         resources,
         components=_RecordingComponents(),
         text_conditioner=condition_text,
@@ -559,13 +569,13 @@ def test_recipe_forwards_the_vae_tiling_policy(monkeypatch) -> None:
         )
 
     monkeypatch.setattr(distilled, "decode_ltx23_sdr_frames", decode_frames)
-    output = distilled.generate_distilled(
-        DistilledRequest(
+    output = distilled.generate_ltx2(
+        LTX2Request(
             prompt="test",
             width=64,
             height=64,
             frames=9,
-            vae_tiling=VideoVAETilingConfig(mode="single"),
+            vae_tiling=LTX2VideoVAETilingConfig(mode="single"),
         ),
         _Resources(),
         components=_RecordingComponents(),
@@ -581,14 +591,14 @@ def test_recipe_forwards_the_vae_tiling_policy(monkeypatch) -> None:
 @pytest.mark.parametrize(
     ("hdr", "override", "expected"),
     [
-        (None, "auto", mx.bfloat16),
+        (None, "auto", mx.float16),
         (None, "float32", mx.float32),
         (None, "float16", mx.float16),
-        ("ACESCG", "auto", mx.float32),
+        ("ACESCG", "auto", mx.float16),
         ("ACESCG", "bfloat16", mx.bfloat16),
     ],
 )
-def test_terminal_resolves_recipe_aware_vae_decode_dtype(
+def test_terminal_resolves_the_vae_decode_dtype(
     monkeypatch,
     hdr: str | None,
     override: str,
@@ -607,14 +617,14 @@ def test_terminal_resolves_recipe_aware_vae_decode_dtype(
         video_vae_config=LTX23_VIDEO_VAE_CONFIG,
     )
     components = _RecordingComponents()
-    image = ImageConditioningConfig(Path("condition.exr")) if hdr is not None else None
-    request = DistilledRequest(
+    images = (LTX2ImageConditioningConfig(Path("condition.exr")),) if hdr is not None else ()
+    request = LTX2Request(
         prompt="test",
         width=64,
         height=64,
         frames=9,
         hdr=hdr,  # type: ignore[arg-type]
-        image=image,
+        images=images,
         vae_decode_dtype=override,  # type: ignore[arg-type]
     )
 
@@ -631,6 +641,41 @@ def test_terminal_resolves_recipe_aware_vae_decode_dtype(
     assert len(list(output.frames)) == 9
     assert components.video_decoder_dtypes == [expected]
     assert output.metadata["dtype_policy"]["video_vae"] == str(expected).removeprefix("mlx.core.")
+
+
+@pytest.mark.parametrize(
+    ("override", "fallback"),
+    [("auto", mx.bfloat16), ("float16", None), ("bfloat16", None)],
+)
+def test_terminal_passes_a_bfloat16_overflow_fallback_for_auto_only(
+    monkeypatch,
+    override: str,
+    fallback: mx.Dtype | None,
+) -> None:
+    _patch_operations(monkeypatch)
+    received = []
+
+    def decode_frames(_latent, _decoder_provider, *, spec, frame_count, **kwargs):
+        received.append(kwargs["overflow_fallback"])
+        return VideoFrameStream(lambda: iter(()), spec=spec, frame_count=frame_count)
+
+    monkeypatch.setattr(distilled, "decode_ltx23_sdr_frames", decode_frames)
+    components = _RecordingComponents()
+    distilled.decode_stage_latents(
+        LTX2Request(prompt="test", width=64, height=64, frames=9, vae_decode_dtype=override),  # type: ignore[arg-type]
+        _Resources(generation="2.5"),
+        distilled.StageLatents(video=mx.zeros((1, 128, 2, 2, 2), dtype=mx.bfloat16)),
+        geometry=VideoPixelShape(batch=1, frames=9, height=64, width=64),
+        components=components,
+        reporter=RecordingReporter(),
+    )
+    (provider,) = received
+    if fallback is None:
+        assert provider is None
+    else:
+        with provider():
+            pass
+        assert components.video_decoder_dtypes == [fallback]
 
 
 @pytest.mark.parametrize("generation", ["2.3", "2.5"])
@@ -660,12 +705,12 @@ def test_image_conditions_use_two_bounded_encoder_leases_and_stage_geometry(
 
     output, components = _generate(
         monkeypatch,
-        DistilledRequest(
+        LTX2Request(
             prompt="test",
             width=64,
             height=64,
             frames=9,
-            image=ImageConditioningConfig(path=image, frame_index=frame_index),
+            images=(LTX2ImageConditioningConfig(path=image, frame_index=frame_index),),
         ),
         resources=_Resources(generation=generation, dtype_policy=policy),
         artifact_sink=_Artifacts(),
@@ -717,6 +762,49 @@ def test_image_conditions_use_two_bounded_encoder_leases_and_stage_geometry(
     output.close()
 
 
+def test_the_request_frame_zero_mode_reaches_both_stages(tmp_path, monkeypatch) -> None:
+    """``guide`` appends the frame-0 condition on both stages and both sidecars say so."""
+    image = tmp_path / "conditioning.png"
+    image.touch()
+
+    def encode_image(_path, _encoder, *, width, height, compute_dtype, **_kwargs):
+        return mx.ones((1, 128, 1, height // 32, width // 32), dtype=compute_dtype)
+
+    monkeypatch.setattr(condition_preparation, "encode_image", encode_image)
+    saved_conditions = []
+
+    class _Artifacts:
+        def save(self, artifact):
+            if artifact.name in {STAGE_1_CONDITIONING, STAGE_2_CONDITIONING}:
+                saved_conditions.append(artifact)
+
+    output, components = _generate(
+        monkeypatch,
+        LTX2Request(
+            prompt="test",
+            width=64,
+            height=64,
+            frames=9,
+            first_frame_mode="guide",
+            images=(LTX2ImageConditioningConfig(path=image, frame_index=0),),
+        ),
+        artifact_sink=_Artifacts(),
+    )
+
+    assert [dict(artifact.metadata)["first_frame_mode"] for artifact in saved_conditions] == [
+        "guide",
+        "guide",
+    ]
+    # The family stays the source's; only the application moved.
+    assert [dict(artifact.metadata)["condition_0_family"] for artifact in saved_conditions] == [
+        "image",
+        "image",
+    ]
+    # An appended slot costs (H/32) * (W/32) tokens on each stage.
+    assert components.transformers[0].video_token_counts == [3] * 8 + [12] * 3
+    output.close()
+
+
 @pytest.mark.parametrize(
     ("reference_aligned_audio", "expected_policy", "expected_audio_tokens"),
     [
@@ -732,7 +820,7 @@ def test_audio_decode_vocode_and_video_decode_are_sequential_leases(
 ) -> None:
     output, components = _generate(
         monkeypatch,
-        DistilledRequest(
+        LTX2Request(
             prompt="test",
             width=64,
             height=64,
@@ -793,7 +881,7 @@ def test_generation_output_rejects_invalid_audio_and_closes_frames(
     sample_rate,
     message: str,
 ) -> None:
-    request = DistilledRequest(
+    request = LTX2Request(
         prompt="test",
         width=64,
         height=64,
@@ -820,7 +908,7 @@ def test_generation_output_rejects_invalid_audio_and_closes_frames(
 
 
 def test_generation_output_aggregates_adapter_warnings() -> None:
-    request = DistilledRequest(
+    request = LTX2Request(
         prompt="test",
         width=64,
         height=64,
@@ -873,7 +961,7 @@ def test_complete_profile_truth_table_for_one_adapter(
     adapter.touch()
     _output, components = _generate(
         monkeypatch,
-        DistilledRequest(
+        LTX2Request(
             prompt="test",
             width=64,
             height=64,
@@ -893,7 +981,7 @@ def test_complete_profile_truth_table_for_one_adapter(
 def test_empty_profiles_reuse_one_pristine_transformer(monkeypatch) -> None:
     _output, components = _generate(
         monkeypatch,
-        DistilledRequest(prompt="test", width=64, height=64, frames=9),
+        LTX2Request(prompt="test", width=64, height=64, frames=9),
     )
     assert components.transformer_profiles == [()]
     assert components.close_counts["transformer"] == 1
@@ -909,7 +997,7 @@ def test_equal_strengths_with_different_adapter_paths_reload_pristine(
     second.touch()
     _output, components = _generate(
         monkeypatch,
-        DistilledRequest(
+        LTX2Request(
             prompt="test",
             width=64,
             height=64,
@@ -941,7 +1029,7 @@ def test_equal_path_and_strength_with_different_exclusions_reloads_pristine(
     )
     _output, components = _generate(
         monkeypatch,
-        DistilledRequest(prompt="test", width=64, height=64, frames=9),
+        LTX2Request(prompt="test", width=64, height=64, frames=9),
     )
     assert [_profile_signature(profile) for profile in components.transformer_profiles] == [
         (("adapter.safetensors", 0.5, ("audio",)),),
@@ -957,7 +1045,7 @@ def test_distinct_profile_memory_receipt_has_no_transformer_at_upscaler_entry(
     adapter.touch()
     _output, components = _generate(
         monkeypatch,
-        DistilledRequest(
+        LTX2Request(
             prompt="test",
             width=64,
             height=64,
@@ -966,7 +1054,7 @@ def test_distinct_profile_memory_receipt_has_no_transformer_at_upscaler_entry(
         ),
     )
     receipt = components.memory_receipts[0]
-    assert receipt.station == "before spatial upscaler load"
+    assert receipt.stage == "before spatial upscaler load"
     assert receipt.active_bytes >= 0
     assert "transformer" not in receipt.active_components
     close_index = components.events.index(
@@ -986,7 +1074,7 @@ def test_identical_profile_intentionally_keeps_transformer_through_upscale(
     adapter.touch()
     _output, components = _generate(
         monkeypatch,
-        DistilledRequest(
+        LTX2Request(
             prompt="test",
             width=64,
             height=64,
@@ -1009,8 +1097,8 @@ def test_transformer_failure_closes_each_active_lease_once(
     components = _RecordingComponents(fail_transformer_loads=frozenset({failed_load}))
     _patch_operations(monkeypatch)
     with pytest.raises(RuntimeError, match=rf"transformer-{failed_load} failed"):
-        distilled.generate_distilled(
-            DistilledRequest(
+        distilled.generate_ltx2(
+            LTX2Request(
                 prompt="test",
                 width=64,
                 height=64,
@@ -1028,7 +1116,7 @@ def test_transformer_failure_closes_each_active_lease_once(
 
 
 @pytest.mark.parametrize(
-    "station",
+    "stage",
     [
         "prompt",
         "stage 1",
@@ -1039,22 +1127,22 @@ def test_transformer_failure_closes_each_active_lease_once(
         "video iteration",
     ],
 )
-def test_product_recipe_station_failure_closes_every_loaded_component_once(
-    station: str,
+def test_product_recipe_stage_failure_closes_every_loaded_component_once(
+    stage: str,
     tmp_path,
     monkeypatch,
 ) -> None:
     adapter = tmp_path / "adapter.safetensors"
     adapter.touch()
-    components = _RecordingComponents(fail_at=station)
+    components = _RecordingComponents(fail_at=stage)
     _patch_operations(monkeypatch)
 
     def condition_text(request, _resources, **_kwargs):
-        if station == "prompt":
+        if stage == "prompt":
             raise RuntimeError("prompt failed")
         return _text(prompt=request.prompt)
 
-    request = DistilledRequest(
+    request = LTX2Request(
         prompt="test",
         width=64,
         height=64,
@@ -1062,8 +1150,8 @@ def test_product_recipe_station_failure_closes_every_loaded_component_once(
         generate_audio=True,
         adapters=(LTX2AdapterConfig(path=adapter, stage1_strength=0.25, stage2_strength=0.75),),
     )
-    if station == "video iteration":
-        output = distilled.generate_distilled(
+    if stage == "video iteration":
+        output = distilled.generate_ltx2(
             request,
             _Resources(),
             components=components,
@@ -1073,8 +1161,8 @@ def test_product_recipe_station_failure_closes_every_loaded_component_once(
         with pytest.raises(RuntimeError, match="video iteration failed"):
             next(output.frames)
     else:
-        with pytest.raises(RuntimeError, match=rf"{station} failed"):
-            distilled.generate_distilled(
+        with pytest.raises(RuntimeError, match=rf"{stage} failed"):
+            distilled.generate_ltx2(
                 request,
                 _Resources(),
                 components=components,
@@ -1093,7 +1181,7 @@ def test_reporter_records_only_real_transformer_loads(tmp_path, monkeypatch) -> 
     reporter = RecordingReporter()
     _output, _components = _generate(
         monkeypatch,
-        DistilledRequest(
+        LTX2Request(
             prompt="test",
             width=64,
             height=64,
@@ -1125,13 +1213,13 @@ def test_unsupported_condition_fails_before_text_or_components(tmp_path, monkeyp
         pytest.fail("capability failure must precede text loading")
 
     with pytest.raises(ValueError, match="keyframe conditioning"):
-        distilled.generate_distilled(
-            DistilledRequest(
+        distilled.generate_ltx2(
+            LTX2Request(
                 prompt="test",
                 width=64,
                 height=64,
                 frames=9,
-                image=ImageConditioningConfig(path=image, frame_index=4),
+                images=(LTX2ImageConditioningConfig(path=image, frame_index=4),),
             ),
             resources,
             components=components,
@@ -1148,7 +1236,7 @@ def test_resolved_profiles_use_canonical_file_identity_and_omit_zero(
     adapter.touch()
     alias.symlink_to(adapter)
     stage_1, stage_2 = distilled.resolve_adapter_profiles(
-        DistilledRequest(
+        LTX2Request(
             prompt="test",
             width=64,
             height=64,
@@ -1163,7 +1251,8 @@ def test_resolved_profiles_use_canonical_file_identity_and_omit_zero(
 
 
 class _RecordingTransitionNoise:
-    def __init__(self) -> None:
+    def __init__(self, seed: int = 10_042) -> None:
+        self.seed = seed
         self.calls: list[tuple[int, int, str, tuple[int, ...], mx.Dtype]] = []
 
     @property
@@ -1171,7 +1260,7 @@ class _RecordingTransitionNoise:
         return NoiseStreamState(
             backend="mlx",
             compatibility_profile="mlx-native",
-            seed=10_042,
+            seed=self.seed,
             draws=len(self.calls),
             elements=0,
             philox_blocks=0,
@@ -1191,21 +1280,22 @@ class _RecordingTransitionNoise:
 
 
 @pytest.mark.parametrize("generate_audio", [False, True])
-def test_ltx25_recipe_uses_seed_plus_10000_only_for_stage1_ancestral_noise(
+def test_ltx25_recipe_draws_each_stage_from_its_own_ancestral_stream(
     generate_audio: bool,
     monkeypatch,
 ) -> None:
-    seeds = []
-    provider = _RecordingTransitionNoise()
+    opened: list[tuple[int, int, int]] = []
+    providers: dict[int, _RecordingTransitionNoise] = {}
 
-    def noise_stream(seed: int, **_kwargs):
-        seeds.append(seed)
-        return provider
+    def noise_stream(seed: int, *, stage: int, transitions: int, **_kwargs):
+        opened.append((seed, stage, transitions))
+        providers[stage] = _RecordingTransitionNoise(seed)
+        return providers[stage]
 
     monkeypatch.setattr(distilled, "SeededGaussianNoise", noise_stream)
     output, components = _generate(
         monkeypatch,
-        DistilledRequest(
+        LTX2Request(
             prompt="test",
             width=64,
             height=64,
@@ -1217,80 +1307,98 @@ def test_ltx25_recipe_uses_seed_plus_10000_only_for_stage1_ancestral_noise(
     )
 
     modalities = ("video", "audio") if generate_audio else ("video",)
-    assert seeds == [10_042]
-    assert [
-        (stage, transition, modality)
-        for stage, transition, modality, _shape, _dtype in provider.calls
-    ] == [(1, transition, modality) for transition in range(7) for modality in modalities]
+    assert opened == [(10_042, 1, 8), (20_042, 2, 3)]
+    # Each stage's final step lands on sigma 0 and returns the prediction without drawing.
+    for stage, draws in ((1, 7), (2, 2)):
+        assert [
+            (call_stage, transition, modality)
+            for call_stage, transition, modality, _shape, _dtype in providers[stage].calls
+        ] == [
+            (stage, transition, modality) for transition in range(draws) for modality in modalities
+        ]
+    samplers = output.metadata["samplers"]
     assert output.metadata["model_generation"] == "2.5"
-    assert output.metadata["sampler_policy"] == "ancestral-stage1-deterministic-stage2"
-    assert output.metadata["ancestral_noise_seed"] == 10_042
+    for stage, seed in (("stage_1", 10_042), ("stage_2", 20_042)):
+        assert samplers[stage]["requested"] == "auto"
+        assert samplers[stage]["effective"] == "ancestral"
+        assert samplers[stage]["noise_seed"] == seed
+        assert samplers[stage]["noise_state"]["seed"] == seed
     assert components.transformer_profiles == [()]
     assert len(list(output.frames)) == 9
     assert components.active == set()
 
 
 @pytest.mark.parametrize(
-    ("generation", "override", "policy", "stage_1", "ancestral_seed"),
+    ("generation", "stage_1", "stage_2", "kinds", "seeds"),
     [
-        ("2.5", "deterministic", "deterministic-euler-two-stage", "deterministic-euler", None),
-        (
-            "2.3",
-            "ancestral",
-            "ancestral-stage1-deterministic-stage2",
-            "ancestral-rf",
-            10_042,
-        ),
+        ("2.3", "auto", "auto", ("deterministic-euler",) * 2, (None, None)),
+        ("2.5", "auto", "auto", ("ancestral-rf",) * 2, (10_042, 20_042)),
+        ("2.5", "deterministic", "auto", ("deterministic-euler", "ancestral-rf"), (None, 20_042)),
+        ("2.5", "auto", "deterministic", ("ancestral-rf", "deterministic-euler"), (10_042, None)),
+        ("2.3", "ancestral", "auto", ("ancestral-rf", "deterministic-euler"), (10_042, None)),
+        ("2.3", "auto", "ancestral", ("deterministic-euler", "ancestral-rf"), (None, 20_042)),
     ],
 )
-def test_sampler_override_replaces_only_the_generation_default(
+def test_each_stage_sampler_replaces_only_its_own_generation_default(
     generation: str,
-    override: str,
-    policy: str,
     stage_1: str,
-    ancestral_seed: int | None,
+    stage_2: str,
+    kinds: tuple[str, str],
+    seeds: tuple[int | None, int | None],
 ) -> None:
-    request = DistilledRequest(
+    request = LTX2Request(
         prompt="test",
         width=64,
         height=64,
         frames=9,
         seed=42,
-        sampler=override,  # type: ignore[arg-type]
+        stage_1_sampler=stage_1,  # type: ignore[arg-type]
+        stage_2_sampler=stage_2,  # type: ignore[arg-type]
     )
 
     plan = distilled.resolve_distilled_sampler_plan(request, _Resources(generation=generation))
 
-    assert plan.policy == policy
-    assert plan.stage_1 == stage_1
-    assert plan.stage_2 == "deterministic-euler"
-    assert plan.ancestral_seed == ancestral_seed
+    assert (plan.stage_1.requested, plan.stage_2.requested) == (stage_1, stage_2)
+    assert (plan.stage_1.step_kind, plan.stage_2.step_kind) == kinds
+    assert (plan.stage_1.noise_seed, plan.stage_2.noise_seed) == seeds
 
 
-def test_ltx25_deterministic_override_is_recorded_without_an_ancestral_seed(
+def test_ltx25_deterministic_overrides_are_recorded_without_ancestral_seeds(
     monkeypatch,
 ) -> None:
+    monkeypatch.setattr(
+        distilled,
+        "SeededGaussianNoise",
+        lambda _seed, **_kwargs: pytest.fail("deterministic stages open no noise stream"),
+    )
     output, components = _generate(
         monkeypatch,
-        DistilledRequest(
+        LTX2Request(
             prompt="test",
             width=64,
             height=64,
             frames=9,
             seed=42,
-            sampler="deterministic",
+            stage_1_sampler="deterministic",
+            stage_2_sampler="deterministic",
         ),
         resources=_Resources(generation="2.5"),
     )
 
-    assert output.metadata["sampler_override"] == "deterministic"
-    assert output.metadata["sampler_policy"] == "deterministic-euler-two-stage"
-    assert output.metadata["ancestral_noise_seed"] is None
+    assert output.metadata["samplers"] == {
+        f"stage_{stage}": {
+            "requested": "deterministic",
+            "effective": "deterministic",
+            "noise_seed": None,
+            "noise_state": None,
+        }
+        for stage in (1, 2)
+    }
     assert len(list(output.frames)) == 9
     assert components.active == set()
 
 
-def test_ltx25_saved_conditioning_and_audio_off_keep_the_public_station_graph(
+def test_ltx25_saved_conditioning_and_audio_off_keep_the_public_stage_graph(
     tmp_path,
     monkeypatch,
 ) -> None:
@@ -1306,7 +1414,7 @@ def test_ltx25_saved_conditioning_and_audio_off_keep_the_public_station_graph(
 
     output, components = _generate(
         monkeypatch,
-        DistilledRequest(
+        LTX2Request(
             width=64,
             height=64,
             frames=9,
@@ -1329,7 +1437,7 @@ def test_ltx25_saved_conditioning_and_audio_off_keep_the_public_station_graph(
 
 
 def _assert_rejected_before_any_provider(
-    request: DistilledRequest,
+    request: LTX2Request,
     message: str,
 ) -> None:
     components = _RecordingComponents()
@@ -1338,7 +1446,7 @@ def _assert_rejected_before_any_provider(
         raise AssertionError("request validation must precede text loading")
 
     with pytest.raises(ValueError, match=message):
-        distilled.generate_distilled(
+        distilled.generate_ltx2(
             request,
             _Resources(generation="2.5"),
             components=components,
@@ -1352,7 +1460,7 @@ def test_ltx25_auto_duration_runs_after_text_and_closes_before_transformer(
 ) -> None:
     output, components = _generate(
         monkeypatch,
-        DistilledRequest(prompt="test", width=64, height=64, frames=None),
+        LTX2Request(prompt="test", width=64, height=64, frames=None),
         resources=_Resources(generation="2.5"),
     )
     assert output.frames.frame_count == 17
@@ -1375,10 +1483,28 @@ def test_ltx25_auto_duration_runs_after_text_and_closes_before_transformer(
     output.close()
 
 
-def test_ltx25_generated_keyframe_slots_run_only_in_stage_one(monkeypatch) -> None:
+def test_ltx25_generated_keyframe_slots_run_in_both_stages_seeded_from_stage_one(
+    monkeypatch,
+) -> None:
+    seeds: list[tuple[int, ...] | None] = []
+    append = distilled.append_generated_keyframe_slots
+
+    def recording_append(state, tools, *, pixel_frames, count, initial=None):
+        seeds.append(None if initial is None else tuple(initial.shape))
+        return append(state, tools, pixel_frames=pixel_frames, count=count, initial=initial)
+
+    class _Artifacts:
+        def __init__(self) -> None:
+            self.tensors: dict[str, dict[str, mx.array]] = {}
+
+        def save(self, artifact) -> None:
+            self.tensors[artifact.name] = dict(artifact.tensors)
+
+    monkeypatch.setattr(distilled, "append_generated_keyframe_slots", recording_append)
+    artifacts = _Artifacts()
     output, components = _generate(
         monkeypatch,
-        DistilledRequest(
+        LTX2Request(
             prompt="test",
             width=64,
             height=64,
@@ -1386,16 +1512,22 @@ def test_ltx25_generated_keyframe_slots_run_only_in_stage_one(monkeypatch) -> No
             generated_keyframes=2,
         ),
         resources=_Resources(generation="2.5"),
+        artifact_sink=artifacts,
     )
     counts = components.transformers[0].video_token_counts
+    # Two one-frame slots of 1 token at stage 1 and of 4 tokens at stage 2.
     assert counts[:8] == [4] * 8
-    assert counts[8:] == [8] * 3
+    assert counts[8:] == [16] * 3
+    assert seeds == [None, (1, 128, 2, 2, 2)]
+    assert artifacts.tensors[STAGE_1_LATENTS]["generated_keyframes"].shape == (1, 128, 2, 1, 1)
+    assert artifacts.tensors[FINAL_LATENTS]["generated_keyframes"].shape == (1, 128, 2, 2, 2)
+    assert artifacts.tensors[FINAL_LATENTS]["video_latent"].shape == (1, 128, 2, 2, 2)
     output.close()
 
 
 def test_ltx25_impossible_generated_keyframes_reject_before_any_provider() -> None:
     _assert_rejected_before_any_provider(
-        DistilledRequest(
+        LTX2Request(
             prompt="test",
             width=64,
             height=64,
@@ -1414,7 +1546,7 @@ def test_ltx25_nonempty_adapter_profile_reaches_transformer_provider(
     adapter.touch()
     output, components = _generate(
         monkeypatch,
-        DistilledRequest(
+        LTX2Request(
             prompt="test",
             width=64,
             height=64,
@@ -1428,16 +1560,25 @@ def test_ltx25_nonempty_adapter_profile_reaches_transformer_provider(
     output.close()
 
 
-def test_ltx25_ancestral_seed_overflow_rejects_before_any_provider_opens() -> None:
+@pytest.mark.parametrize(
+    ("seed", "message"),
+    [
+        (2**64 - 10_000, r"stage-1 ancestral noise seed is seed \+ 10000.*unsigned 64-bit"),
+        (2**64 - 15_000, r"stage-2 ancestral noise seed is seed \+ 20000.*unsigned 64-bit"),
+    ],
+)
+def test_ltx25_ancestral_seed_overflow_rejects_before_any_provider_opens(
+    seed: int, message: str
+) -> None:
     _assert_rejected_before_any_provider(
-        DistilledRequest(
+        LTX2Request(
             prompt="test",
             width=64,
             height=64,
             frames=9,
-            seed=2**64 - 10_000,
+            seed=seed,
         ),
-        r"seed \+ 10000.*unsigned 64-bit",
+        message,
     )
 
 
@@ -1466,8 +1607,8 @@ def test_ltx25_cancellation_inside_ancestral_noise_closes_the_transformer_once(
     )
     _patch_operations(monkeypatch)
     with pytest.raises(RuntimeError, match="canceled"):
-        distilled.generate_distilled(
-            DistilledRequest(prompt="test", width=64, height=64, frames=9),
+        distilled.generate_ltx2(
+            LTX2Request(prompt="test", width=64, height=64, frames=9),
             _Resources(generation="2.5"),
             components=components,
             text_conditioner=_RecordingTextConditioner(),
@@ -1478,7 +1619,7 @@ def test_ltx25_cancellation_inside_ancestral_noise_closes_the_transformer_once(
 
 
 @pytest.mark.parametrize(
-    "station",
+    "stage",
     [
         "prompt",
         "stage 1",
@@ -1489,27 +1630,27 @@ def test_ltx25_cancellation_inside_ancestral_noise_closes_the_transformer_once(
         "video iteration",
     ],
 )
-def test_ltx25_station_failure_closes_every_loaded_component_once(
-    station: str,
+def test_ltx25_stage_failure_closes_every_loaded_component_once(
+    stage: str,
     monkeypatch,
 ) -> None:
-    components = _RecordingComponents(fail_at=station)
+    components = _RecordingComponents(fail_at=stage)
     _patch_operations(monkeypatch)
 
     def condition_text(request, _resources, **_kwargs):
-        if station == "prompt":
+        if stage == "prompt":
             raise RuntimeError("prompt failed")
         return _text(prompt=request.prompt)
 
-    request = DistilledRequest(
+    request = LTX2Request(
         prompt="test",
         width=64,
         height=64,
         frames=9,
         generate_audio=True,
     )
-    if station == "video iteration":
-        output = distilled.generate_distilled(
+    if stage == "video iteration":
+        output = distilled.generate_ltx2(
             request,
             _Resources(generation="2.5"),
             components=components,
@@ -1519,8 +1660,8 @@ def test_ltx25_station_failure_closes_every_loaded_component_once(
         with pytest.raises(RuntimeError, match="video iteration failed"):
             next(output.frames)
     else:
-        with pytest.raises(RuntimeError, match=rf"{station} failed"):
-            distilled.generate_distilled(
+        with pytest.raises(RuntimeError, match=rf"{stage} failed"):
+            distilled.generate_ltx2(
                 request,
                 _Resources(generation="2.5"),
                 components=components,
@@ -1541,23 +1682,41 @@ def test_ltx23_recipe_never_constructs_the_ancestral_noise_stream(monkeypatch) -
     )
     output, components = _generate(
         monkeypatch,
-        DistilledRequest(prompt="test", width=64, height=64, frames=9),
+        LTX2Request(prompt="test", width=64, height=64, frames=9),
         resources=_Resources(generation="2.3"),
     )
     output.close()
     assert components.active == set()
 
 
-@pytest.mark.parametrize("kind", ["native-conv3d", "diffusion-na"])
-def test_fp16_vae_admission_uses_selected_decoder_kind(kind) -> None:
+@pytest.mark.parametrize(
+    ("generation", "kind"),
+    [
+        ("2.3", VideoVAEKind.CONV),
+        ("2.5", VideoVAEKind.CONV),
+        ("2.5", VideoVAEKind.DIFFUSION),
+    ],
+)
+def test_fp16_vae_admission_allows_supported_decoders(generation: str, kind: VideoVAEKind) -> None:
+    resources = _Resources(generation=generation)
+    resources.capabilities.video_vae_kind = kind
+    request = LTX2Request(prompt="test", frames=9, vae_decode_dtype="float16")
+    distilled.validate_distilled_request(request, resources)
+
+
+@pytest.mark.parametrize(
+    ("kind", "admitted"),
+    [(VideoVAEKind.CONV, False), (VideoVAEKind.DIFFUSION, True)],
+)
+def test_vae_sharpening_needs_the_diffusion_video_vae(kind: VideoVAEKind, admitted: bool) -> None:
     resources = _Resources(generation="2.5")
     resources.capabilities.video_vae_kind = kind
-    request = DistilledRequest(prompt="test", frames=9, vae_decode_dtype="float16")
-    if kind == "native-conv3d":
-        with pytest.raises(ValueError, match="requires --video-vae diffusion"):
-            distilled.validate_distilled_request(request, resources, ())
+    request = LTX2Request(prompt="test", frames=9, vae_sharpen=2.0)
+    if admitted:
+        distilled.validate_distilled_request(request, resources)
     else:
-        distilled.validate_distilled_request(request, resources, ())
+        with pytest.raises(ValueError, match="only to the diffusion video VAE"):
+            distilled.validate_distilled_request(request, resources)
 
 
 def test_seed_list_reuses_text_and_both_source_geometry_encodings(monkeypatch, tmp_path):
@@ -1576,13 +1735,13 @@ def test_seed_list_reuses_text_and_both_source_geometry_encodings(monkeypatch, t
     components = _RecordingComponents()
     conditioner = _RecordingTextConditioner()
     host = LTX2Runner(resources=_Resources(), components=components, text_conditioner=conditioner)
-    request = DistilledRequest(
+    request = LTX2Request(
         prompt="test",
         width=64,
         height=64,
         frames=9,
         seeds=(9, 2, 9),
-        image=ImageConditioningConfig(path),
+        images=(LTX2ImageConditioningConfig(path),),
     )
     observed = []
     for output in host.generate(request):
@@ -1593,3 +1752,108 @@ def test_seed_list_reuses_text_and_both_source_geometry_encodings(monkeypatch, t
     assert sizes == [(32, 32), (64, 64)]
     assert len(components.transformers) == 3
     assert not components.active
+
+
+@pytest.mark.parametrize("frames", [17, None])
+def test_a_named_last_frame_records_the_same_index_with_a_given_or_predicted_count(
+    frames: int | None,
+    tmp_path,
+    monkeypatch,
+) -> None:
+    """``last`` resolves after the duration head runs, so both paths reach frame 16."""
+    first = tmp_path / "first.png"
+    last = tmp_path / "last.png"
+    first.touch()
+    last.touch()
+
+    def encode_image(_path, _encoder, *, width, height, compute_dtype, **_kwargs):
+        return mx.ones((1, 128, 1, height // 32, width // 32), dtype=compute_dtype)
+
+    monkeypatch.setattr(condition_preparation, "encode_image", encode_image)
+    saved_conditions = []
+
+    class _Artifacts:
+        def save(self, artifact):
+            if artifact.name in {STAGE_1_CONDITIONING, STAGE_2_CONDITIONING}:
+                saved_conditions.append(artifact)
+
+    output, _components = _generate(
+        monkeypatch,
+        LTX2Request(
+            prompt="test",
+            width=64,
+            height=64,
+            frames=frames,
+            images=(
+                LTX2ImageConditioningConfig(path=first, frame_index="first"),
+                LTX2ImageConditioningConfig(path=last, frame_index="last"),
+            ),
+        ),
+        resources=_Resources(generation="2.5"),
+        artifact_sink=_Artifacts(),
+    )
+    output.close()
+
+    assert output.frames.frame_count == 17
+    assert [
+        dict(artifact.metadata)["condition_1_frame_index"] for artifact in saved_conditions
+    ] == [
+        "16",
+        "16",
+    ]
+    assert [
+        dict(artifact.metadata)["condition_0_frame_index"] for artifact in saved_conditions
+    ] == [
+        "0",
+        "0",
+    ]
+    assert [dict(artifact.metadata)["condition_1_family"] for artifact in saved_conditions] == [
+        "keyframe",
+        "keyframe",
+    ]
+
+
+def test_a_predicted_count_refuses_a_position_it_cannot_hold(monkeypatch, tmp_path) -> None:
+    """The duration head settles the count, so the refusal names the predicted one."""
+    image = tmp_path / "plate.png"
+    image.touch()
+    with pytest.raises(ValueError, match="image frame_index 40 is outside predicted 17 frames"):
+        _generate(
+            monkeypatch,
+            LTX2Request(
+                prompt="test",
+                width=64,
+                height=64,
+                frames=None,
+                images=(LTX2ImageConditioningConfig(path=image, frame_index=40),),
+            ),
+            resources=_Resources(generation="2.5"),
+        )
+
+
+def test_a_duplicate_that_only_materializes_after_prediction_is_refused(
+    monkeypatch, tmp_path
+) -> None:
+    """``last`` and ``16`` are one frame once the head predicts 17."""
+    first = tmp_path / "first.png"
+    last = tmp_path / "last.png"
+    first.touch()
+    last.touch()
+    with pytest.raises(
+        ValueError,
+        match="image frame_index 16 is conditioned more than once: 'last' and '16'",
+    ):
+        _generate(
+            monkeypatch,
+            LTX2Request(
+                prompt="test",
+                width=64,
+                height=64,
+                frames=None,
+                images=(
+                    LTX2ImageConditioningConfig(path=last, frame_index="last"),
+                    LTX2ImageConditioningConfig(path=first, frame_index=16),
+                ),
+            ),
+            resources=_Resources(generation="2.5"),
+        )

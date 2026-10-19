@@ -150,7 +150,7 @@ def test_upscale2x_selector_finds_its_one_file_cached_snapshot(tmp_path: Path) -
     assert resources.vae_decoder.output_scale == 2
     assert resources.vae.source_path == cached.resolve()
     assert resources.vae.consumed_tensor_count == 104
-    assert resources.to_dict()["vae_decoder"] == {"name": "upscale2x", "output_scale": 2}
+    assert resources.describe()["vae_decoder"] == {"name": "upscale2x", "output_scale": 2}
 
 
 def test_explicit_vae_replacement_autodetects_upscale2x_and_checks_selector(
@@ -343,3 +343,53 @@ def test_incomplete_source_shards_fail_during_header_preflight(tmp_path: Path) -
             Krea2Settings(source_path=source),
             infrastructure=_infrastructure(tmp_path),
         )
+
+
+def test_dry_run_report_names_every_source_a_generation_would_consume(tmp_path: Path) -> None:
+    source = make_snapshot(tmp_path / "community", variant="turbo")
+
+    report = prepare_resources(
+        Krea2Settings(source_path=source),
+        infrastructure=_infrastructure(tmp_path),
+    ).describe()
+
+    assert report["model"] == "krea2"
+    assert report["variant"] == "turbo"
+    assert report["source_root"] == str(source.resolve())
+    assert report["is_distilled"] is True
+    assert (report["steps"], report["guidance"]) == (8, 0.0)
+    assert report["vae_decoder"] == {"name": "qwen", "output_scale": 1}
+    assert report["check_adapter_weights"] is True
+    components = report["components"]
+    assert isinstance(components, list)
+    # Every component states its resolved path, both identities, its binding
+    # policy and its tensor accounting, with no key omitted for any kind.
+    expected_keys = {
+        "kind",
+        "dtype",
+        "source",
+        "source_identity",
+        "graph_identity",
+        "layout",
+        "source_tensors",
+        "runtime_tensors",
+        "excluded_tensors",
+    }
+    assert [entry["kind"] for entry in components] == [
+        "tokenizer",
+        "text_encoder",
+        "transformer",
+        "vae",
+    ]
+    assert all(set(entry) == expected_keys for entry in components)
+    assert [entry["dtype"] for entry in components] == [
+        "json",
+        "source",
+        "bfloat16",
+        "bfloat16",
+    ]
+    text_encoder = components[1]
+    assert (text_encoder["source_tensors"], text_encoder["runtime_tensors"]) == (400, 386)
+    assert text_encoder["excluded_tensors"] == 400 - 386
+    assert text_encoder["source"] == str((source / "text_encoder").resolve())
+    assert text_encoder["source_identity"].startswith("sha256:")

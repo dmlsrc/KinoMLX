@@ -6,7 +6,7 @@ from dataclasses import dataclass, replace
 import mlx.core as mx
 
 from kinomlx.adapters.algebra import reconstruct_delta
-from kinomlx.adapters.formats import AdapterOperation
+from kinomlx.adapters.formats import AdapterKind, AdapterOperation
 
 from ..shapes import transformer_shapes
 
@@ -102,10 +102,10 @@ def place_operation(
     """Reuse shared format algebra; transform source output rows exactly once."""
     if len(binding.targets) == 1 and not binding.swap_halves:
         return ((f"{binding.targets[0]}.{operation.part}", operation),)
-    plain = operation.kind == "lora" and not any(
+    plain = operation.kind == AdapterKind.LORA and not any(
         name in operation.factors for name in ("magnitude", "mid", "base_bias")
     )
-    if not plain and operation.kind not in {"full", "norm", "set"}:
+    if not plain and operation.kind not in {AdapterKind.FULL, AdapterKind.NORM, AdapterKind.SET}:
         # Base-dependent formats must be evaluated in their declared source
         # orientation, including fused QKV and BFL final-AdaLN row ordering.
         def source_base(part: str) -> mx.array:
@@ -121,19 +121,19 @@ def place_operation(
             operation,
             source_base(operation.part),
             base_weight=source_base("weight")
-            if operation.kind == "glora_peft" and operation.part == "bias"
+            if operation.kind == AdapterKind.GLORA_PEFT and operation.part == "bias"
             else None,
         )
         operation = replace(
             operation,
-            kind="full",
+            kind=AdapterKind.FULL,
             scalar=1.0,
             factors={"delta" if operation.part == "bias" else "diff": delta},
             linear_options=None,
         )
     role = (
         ("up_bias" if operation.part == "bias" else "up")
-        if operation.kind == "lora"
+        if operation.kind == AdapterKind.LORA
         else "delta"
         if operation.part == "bias"
         else {"full": "diff", "norm": "w_norm", "set": "set_weight"}[operation.kind]

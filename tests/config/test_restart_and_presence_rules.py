@@ -7,6 +7,7 @@ import pytest
 from kinomlx.config_constraints import field_choices
 from kinomlx.config_records import config_record, record_intent, replace_config
 from kinomlx.config_rules import RecordRule, RuleInputs, validate_record
+from kinomlx.model_registry import config_registry
 from kinomlx.models.flux2.adapters.inputs import Flux2AdapterConfig
 from kinomlx.models.flux2.restart import Flux2Restart
 from kinomlx.models.flux2.restart import RestartManifest as FluxManifest
@@ -16,7 +17,7 @@ from kinomlx.models.krea2.restart import Krea2Restart
 from kinomlx.models.krea2.restart import RestartConfig as KreaRestartConfig
 from kinomlx.models.krea2.restart import load_restart_manifest as load_krea
 from kinomlx.models.krea2.types import Krea2GenerateConfig
-from kinomlx.models.ltx2.restart import DistilledRestart
+from kinomlx.models.ltx2.restart import LTX2Restart
 from kinomlx.models.ltx2.restart import RestartConfig as LTXRestartConfig
 from kinomlx.models.ltx2.restart import load_restart_manifest as load_ltx
 
@@ -29,15 +30,15 @@ def test_still_restart_surfaces_share_field_objects():
         second_fields = {item.name: item for item in fields(second)}
         for item in fields(first):
             assert item is second_fields[item.name]
-        assert field_choices(first, "phase") == ("decode", "denoise")
+        assert field_choices(first, "stage") == ("decode", "denoise")
 
 
 @pytest.mark.parametrize("factory", [Flux2RestartConfig, KreaRestartConfig])
 def test_still_selector_conflict_is_final_and_an_override_can_resolve_it(factory):
-    selection = factory(run="absent.json", phase="denoise", latents="latents.safetensors")
+    selection = factory(run="absent.json", stage="denoise", latents="latents.safetensors")
     with pytest.raises(ValueError, match=r"\[restart\]: restart latents apply only"):
         validate_record(selection, location="[restart]")
-    validate_record(replace_config(selection, phase="decode"), location="[restart]")
+    validate_record(replace_config(selection, stage="decode"), location="[restart]")
 
 
 @pytest.mark.parametrize("factory", [Flux2Restart, Krea2Restart])
@@ -45,7 +46,7 @@ def test_still_selector_conflict_is_final_and_an_override_can_resolve_it(factory
     ("values", "override"),
     [
         ({}, {"latents": "latents.safetensors"}),
-        ({"phase": "denoise"}, {"text_conditioning": "text.safetensors"}),
+        ({"stage": "denoise"}, {"text_conditioning": "text.safetensors"}),
         (
             {"latents": "latents.safetensors", "text_conditioning": "text.safetensors"},
             {"text_conditioning": None},
@@ -60,36 +61,43 @@ def test_public_still_artifacts_use_the_same_final_rule(factory, values, overrid
 
 
 @pytest.mark.parametrize(
-    ("factory", "load", "values"),
+    ("factory", "load", "model", "values"),
     [
         (
             Flux2RestartConfig,
             FluxManifest.load,
-            {"phase": "denoise", "latents": "missing.safetensors"},
+            "flux2",
+            {"stage": "denoise", "latents": "missing.safetensors"},
         ),
-        (KreaRestartConfig, load_krea, {"phase": "denoise", "latents": "missing.safetensors"}),
-        (LTXRestartConfig, load_ltx, {"phase": "stage-2", "latent_stage": "final"}),
+        (
+            KreaRestartConfig,
+            load_krea,
+            "krea2",
+            {"stage": "denoise", "latents": "missing.safetensors"},
+        ),
+        (LTXRestartConfig, load_ltx, "ltx2", {"stage": "stage-2", "latent_stage": "stage-2"}),
     ],
 )
-def test_manifest_policy_precedes_missing_source_read(factory, load, values, tmp_path):
+def test_manifest_policy_precedes_missing_source_read(factory, load, model, values, tmp_path):
     selection = factory(run=tmp_path / "absent.json", **values)
     with pytest.raises(
-        ValueError, match=r"\[restart\]: restart latent(?:s apply|_stage applies) only"
+        ValueError,
+        match=r"\[restart\]: (?:restart latents apply only|stage-2 restart cannot read latents)",
     ):
-        load(selection)
+        load(selection, schema=config_registry().model(model))
 
 
 def test_ltx_input_default_is_not_written_into_retained_selection():
     selection = LTXRestartConfig(run="run.json")
     assert selection.latent_stage is None
     assert "latent_stage" not in record_intent(selection)
-    stage_two = replace_config(selection, phase="stage-2")
+    stage_two = replace_config(selection, stage="stage-2")
     validate_record(stage_two, location="[restart]")
     assert stage_two.latent_stage is None
-    public = DistilledRestart(latents="latents.safetensors")
+    public = LTX2Restart(latents="latents.safetensors")
     assert public.latent_stage is None
-    assert public.selected_latent_stage == "final"
-    public = replace_config(public, phase="stage-2", text_conditioning="text.safetensors")
+    assert public.selected_latent_stage == "stage-2"
+    public = replace_config(public, stage="stage-2", text_conditioning="text.safetensors")
     validate_record(public, location="[restart]")
     assert public.selected_latent_stage == "stage-1"
 

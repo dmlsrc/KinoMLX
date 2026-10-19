@@ -36,7 +36,7 @@ def test_real_ltx23_prompt_encoding() -> None:
     try:
         output = encode_prompt(
             "a red cube",
-            gemma_path=gemma,
+            text_encoder_path=gemma,
             connector_path=connector,
             config_path=checkpoint,
         )

@@ -12,11 +12,11 @@ from kinomlx.reporting import NullReporter, Reporter
 from kinomlx.settings import Settings
 
 from .generation import Flux2ImageResult
-from .pipeline import Flux2GenerationOutput, generate_flux2, restart_flux2
-from .resources import Flux2Resources, inspect_resources
+from .pipelines import Flux2GenerationOutput, generate_flux2, restart_flux2
+from .resources import Flux2Resources, prepare_resources
 from .restart import Flux2Restart, PreparedResources
 from .settings import Flux2Settings
-from .stations import Flux2Conditioning
+from .text_conditioning import Flux2Conditioning
 from .types import Flux2Request
 
 _log = logging.getLogger(__name__)
@@ -56,7 +56,7 @@ class Flux2Runner:
             settings = infrastructure if infrastructure is not None else Settings.from_env()
             settings.validate()
             try:
-                resources = inspect_resources(selected, infrastructure=settings)
+                resources = prepare_resources(selected, infrastructure=settings)
             except KinoMLXError, FileNotFoundError:
                 raise
             except (KeyError, OSError, TypeError, ValueError, RuntimeError) as exc:
@@ -141,7 +141,7 @@ API_BOUNDARIES = (
         Flux2Runner.restart,
         (
             configuration("request", Flux2Request, "generate"),
-            runtime("restart", "prepared station handoff"),
+            runtime("restart", "prepared stage handoff"),
             runtime("conditioning", "retained prepared conditioning"),
         ),
     ),

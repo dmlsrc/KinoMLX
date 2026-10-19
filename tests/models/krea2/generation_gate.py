@@ -337,7 +337,7 @@ def run_generation(
     sys.meta_path.insert(0, blocker)
 
     import kinomlx.models.krea2 as krea2_package
-    from kinomlx.models.krea2.components import NativeKrea2Components
+    from kinomlx.models.krea2.components import Krea2Components
     from kinomlx.models.krea2.output import Krea2StillOutputPlan, Krea2StillOutputSink
     from kinomlx.models.krea2.resources import prepare_resources
     from kinomlx.models.krea2.settings import Krea2Settings
@@ -369,7 +369,7 @@ def run_generation(
     if resources["raw"].revision != RAW_REVISION:
         raise AssertionError("Krea generation resolved an unpinned Raw revision")
 
-    components = NativeKrea2Components()
+    components = Krea2Components()
     memory_before = _memory_snapshot(mx)
     trajectories: dict[str, dict[str, object]] = {}
     final_latents: dict[str, Any] = {}

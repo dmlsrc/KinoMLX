@@ -10,7 +10,7 @@ import mlx.core as mx
 from kinomlx.adapters.live import bind_live_adapter_sigmas, set_live_adapter_step
 from kinomlx.adapters.validation import check_adapter_weights
 from kinomlx.errors import KinoMLXError
-from kinomlx.modeling.dtypes import resolve_float_dtype
+from kinomlx.modeling.dtypes import float_dtype_name
 from kinomlx.reporting import NullReporter, Reporter
 from kinomlx.samplers.noise import (
     NoiseStreamState,
@@ -264,10 +264,9 @@ def create_initial_noise(
     geometry: Krea2Geometry,
     *,
     latent_channels: int,
-    dtype_policy: str | mx.Dtype,
+    dtype: mx.Dtype,
 ) -> Krea2NoiseBatch:
     """Create one independent ``seed + image_index`` normal draw per image."""
-    dtype = resolve_float_dtype(dtype_policy, owner="Krea 2 transformer")
     rows: list[mx.array] = []
     states: list[NoiseStreamState] = []
     seeds = request.selected_seeds() * len(request.prompts)
@@ -411,7 +410,7 @@ def krea_cfg(
 
 
 def _nonfinite_latent_message(dtype: mx.Dtype, steps: int) -> str:
-    name = str(dtype).rsplit(".", 1)[-1]
+    name = float_dtype_name(dtype)
     message = f"Krea 2 denoising produced a nonfinite latent at step {steps} in {name}."
     if dtype == mx.float16:
         return (

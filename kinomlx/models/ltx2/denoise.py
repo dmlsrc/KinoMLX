@@ -13,7 +13,8 @@ from kinomlx.errors import KinoMLXError
 from kinomlx.reporting import NullReporter, Reporter
 from kinomlx.samplers.steps import euler_ancestral_rf_step, euler_step
 
-from .components import TransformerPort
+from .components import LTX2TransformerPort
+from .sparse_attention import SparseAttentionStep
 from .state import post_process_latent
 from .transformer import Modality
 from .transformer.execution import TransformerExecution
@@ -27,7 +28,7 @@ class LTX2DenoiseError(KinoMLXError, RuntimeError):
     """A completed denoise step produced nonfinite active latents."""
 
 
-class TransitionNoiseProvider(Protocol):
+class LTX2TransitionNoiseProvider(Protocol):
     """Supply one externally controlled ancestral-noise tensor."""
 
     def __call__(
@@ -42,7 +43,7 @@ class TransitionNoiseProvider(Protocol):
 
 
 def _validated_transition_noise(
-    provider: TransitionNoiseProvider,
+    provider: LTX2TransitionNoiseProvider,
     state: LatentState,
     *,
     stage: int,
@@ -127,6 +128,7 @@ def modality_from_state(
     enabled: bool = True,
     context_mask: mx.array | None = None,
     keyframes_mask: mx.array | None = None,
+    sparse_attention: SparseAttentionStep | None = None,
 ) -> Modality:
     """Build one transformer modality with the scalar-timestep fast path."""
     sigma_tensor = mx.full(
@@ -150,6 +152,7 @@ def modality_from_state(
         enabled=enabled,
         context_mask=context_mask,
         keyframes_mask=keyframes_mask,
+        sparse_attention=sparse_attention,
     )
 
 
@@ -159,7 +162,7 @@ def denoise_step(
     *,
     sigma: float,
     sigma_next: float,
-    transformer: TransformerPort,
+    transformer: LTX2TransformerPort,
     video_context: mx.array,
     audio_context: mx.array | None = None,
     video_context_mask: mx.array | None = None,
@@ -171,6 +174,7 @@ def denoise_step(
     video_noise: mx.array | None = None,
     audio_noise: mx.array | None = None,
     reporter: Reporter | None = None,
+    video_sparse_attention: SparseAttentionStep | None = None,
 ) -> tuple[LatentState, LatentState | None]:
     """Run one X0 transformer call and the selected Euler update."""
     video_modality = modality_from_state(
@@ -180,6 +184,7 @@ def denoise_step(
         enabled=video_enabled,
         context_mask=video_context_mask,
         keyframes_mask=video_keyframes_mask,
+        sparse_attention=video_sparse_attention,
     )
     audio_modality = None
     if audio_state is not None:
@@ -258,7 +263,7 @@ def denoise_loop(
     audio_state: LatentState | None,
     sigmas: Sequence[float],
     *,
-    transformer: TransformerPort,
+    transformer: LTX2TransformerPort,
     video_context: mx.array,
     audio_context: mx.array | None = None,
     video_context_mask: mx.array | None = None,
@@ -269,9 +274,16 @@ def denoise_loop(
     callback: Callable[[int, int], None] | None = None,
     step_kind: DenoiseStepKind = "deterministic-euler",
     stage: int | None = None,
-    noise_provider: TransitionNoiseProvider | None = None,
+    noise_provider: LTX2TransitionNoiseProvider | None = None,
+    video_sparse_attention: Sequence[SparseAttentionStep | None] = (),
+    transformer_dtype: mx.Dtype | None = None,
 ) -> tuple[LatentState, LatentState | None]:
-    """Run one distilled sigma schedule with a materialized step boundary."""
+    """Run one distilled sigma schedule with a materialized step boundary.
+
+    ``video_sparse_attention`` gives each step's sparse video self-attention, None for a
+    dense step; an empty sequence keeps every step dense. ``transformer_dtype`` names the
+    transformer's compute dtype for the message of a nonfinite step.
+    """
     values = tuple(float(value) for value in sigmas)
     if len(values) < 2:
         raise ValueError("a denoise schedule must contain at least two sigmas")
@@ -283,9 +295,15 @@ def denoise_loop(
         raise ValueError("denoise sigmas must be strictly descending")
     if step_kind not in {"deterministic-euler", "ancestral-rf"}:
         raise ValueError(f"unknown denoise step kind {step_kind!r}")
-    if step_kind == "ancestral-rf" and stage != 1:
-        raise ValueError("ancestral RF is only enabled for distilled stage 1")
+    if step_kind == "ancestral-rf" and stage is None:
+        raise ValueError("ancestral RF needs the stage whose transition noise it draws")
     total = len(values) - 1
+    if video_sparse_attention and len(video_sparse_attention) != total:
+        raise ValueError(
+            f"sparse attention lists {len(video_sparse_attention)} steps for a {total}-step "
+            "schedule"
+        )
+    sparse_steps = tuple(video_sparse_attention) or (None,) * total
     sink = reporter if reporter is not None else NullReporter()
     sink.phase_start(phase, total=total, unit="step")
     try:
@@ -329,10 +347,19 @@ def denoise_loop(
                     video_noise=video_noise,
                     audio_noise=audio_noise,
                     reporter=sink,
+                    video_sparse_attention=sparse_steps[transition],
                 )
             except (LTX2DenoiseError, AdapterWeightError) as error:
                 location = f"stage {stage}" if stage is not None else phase
-                raise type(error)(f"{location}, step {index}: {error}") from error
+                message = f"{location}, step {index}: {error}"
+                # MLX dtypes refuse equality with None rather than returning False.
+                fp16 = transformer_dtype is not None and transformer_dtype == mx.float16
+                if isinstance(error, LTX2DenoiseError) and fp16:
+                    message += (
+                        " The float16 transformer's activations may have overflowed;"
+                        " select --transformer-dtype bfloat16 (or float32)."
+                    )
+                raise type(error)(message) from error
             sink.phase_advance(phase)
             if callback is not None:
                 callback(index, total)
@@ -344,7 +371,7 @@ def denoise_loop(
 __all__ = [
     "DenoiseStepKind",
     "LTX2DenoiseError",
-    "TransitionNoiseProvider",
+    "LTX2TransitionNoiseProvider",
     "denoise_loop",
     "denoise_step",
     "modality_from_state",

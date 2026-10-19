@@ -1,4 +1,4 @@
-"""Real tokenizer.json differentials for the shared LTX tokenizer station."""
+"""Real tokenizer.json differentials for the shared LTX tokenizer stage."""
 
 import hashlib
 import json

@@ -9,6 +9,7 @@ import pytest
 
 import kinomlx.samplers.steps as sampler_steps
 from kinomlx.models.ltx2.denoise import denoise_loop
+from kinomlx.models.ltx2.pipelines.distilled import ANCESTRAL_SEED_OFFSETS
 from kinomlx.models.ltx2.sigmas import (
     DISTILLED_STAGE_1_SIGMAS,
     DISTILLED_STAGE_2_SIGMAS,
@@ -100,7 +101,7 @@ class _FixtureNoise:
 
 class _RejectNoise:
     def __call__(self, **_kwargs) -> mx.array:
-        raise AssertionError("deterministic stage 2 must not request noise")
+        raise AssertionError("a deterministic stage must not request noise")
 
 
 def test_fixture_records_the_pinned_scheduler_and_literal_product_schedules() -> None:
@@ -118,7 +119,7 @@ def test_fixture_records_the_pinned_scheduler_and_literal_product_schedules() ->
         np.asarray(fixture["stage_2_sigmas"], dtype=np.float32),
         np.asarray(DISTILLED_STAGE_2_SIGMAS, dtype=np.float32),
     )
-    assert fixture["ancestral_seed"] == fixture["request_seed"] + 10_000
+    assert fixture["ancestral_seed"] == fixture["request_seed"] + ANCESTRAL_SEED_OFFSETS[0]
     assert fixture["draw_order"] == ["video", "audio"]
     assert fixture["eta"] == 1.0
     assert fixture["s_noise"] == 1.0
@@ -181,7 +182,7 @@ def test_injected_joint_stage1_matches_all_eight_reference_transitions() -> None
     )
 
 
-def test_stage2_remains_deterministic_and_never_requests_noise() -> None:
+def test_deterministic_stage2_matches_the_fixture_and_never_requests_noise() -> None:
     fixture = _fixture()
     transitions = fixture["stage_2"]
     transformer = _FixtureTransformer(transitions)
@@ -211,6 +212,71 @@ def test_stage2_remains_deterministic_and_never_requests_noise() -> None:
         atol=2e-6,
         rtol=0.0,
     )
+
+
+def test_ancestral_stage2_draws_its_own_noise_until_the_final_prediction() -> None:
+    """Stage 2 renoises on every transition but the last, which returns the prediction."""
+    fixture = _fixture()
+    transitions = fixture["stage_2"]
+    sigmas = fixture["stage_2_sigmas"]
+    draws = {"video": 0.25, "audio": -0.5}
+    calls: list[tuple[int, int, str]] = []
+
+    def noise(*, stage, transition, modality, shape, dtype):
+        calls.append((stage, transition, modality))
+        return mx.full(shape, draws[modality], dtype=dtype)
+
+    class _Predictions:
+        """Return the fixture's predictions whatever the input, as the step is under test."""
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def __call__(self, video, audio=None):
+            transition = transitions[self.calls]
+            self.calls += 1
+            return _array(transition["video_denoised"]), _array(transition["audio_denoised"])
+
+    video, audio = denoise_loop(
+        _state(transitions[0]["video_input"]),
+        _state(transitions[0]["audio_input"]),
+        sigmas,
+        transformer=_Predictions(),
+        video_context=mx.zeros((1, 1, 4), dtype=mx.float32),
+        audio_context=mx.zeros((1, 1, 4), dtype=mx.float32),
+        step_kind="ancestral-rf",
+        stage=2,
+        noise_provider=noise,
+    )
+
+    assert calls == [(2, transition, modality) for transition in range(2) for modality in draws]
+    for modality, latent in (("video", video.latent), ("audio", audio.latent)):
+        expected = _array(transitions[0][f"{modality}_input"])
+        for index, transition in enumerate(transitions):
+            sigma_next = sigmas[index + 1]
+            expected = sampler_steps.euler_ancestral_rf_step(
+                expected,
+                _array(transition[f"{modality}_denoised"]),
+                None if sigma_next == 0 else mx.full(expected.shape, draws[modality]),
+                sigma=sigmas[index],
+                sigma_next=sigma_next,
+                eta=1.0,
+                s_noise=1.0,
+            )
+        np.testing.assert_allclose(np.asarray(latent), np.asarray(expected), atol=1e-6, rtol=0.0)
+
+
+def test_an_ancestral_schedule_needs_the_stage_whose_noise_it_draws() -> None:
+    with pytest.raises(ValueError, match="needs the stage"):
+        denoise_loop(
+            _state([[[-0.75, 0.5, 1.25]]]),
+            None,
+            (1.0, 0.5, 0.0),
+            transformer=_RejectNoise(),
+            video_context=mx.zeros((1, 1, 4), dtype=mx.float32),
+            step_kind="ancestral-rf",
+            noise_provider=_RejectNoise(),
+        )
 
 
 @pytest.mark.parametrize(

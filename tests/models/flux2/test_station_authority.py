@@ -1,10 +1,11 @@
-"""Klein's complete saved-station and direct API ownership declarations."""
+"""Klein's complete saved-stage and direct API ownership declarations."""
 
 from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
+from kinomlx.cli.resource_operation import Operation
 from kinomlx.config import ConfigError
 from kinomlx.config.assembly import ConfigLayer, InvocationLayers
 from kinomlx.config.overrides import SetOverrides
@@ -13,9 +14,9 @@ from kinomlx.io.output_config import ImageOutputConfig
 from kinomlx.models.flux2 import command
 from kinomlx.models.flux2.arguments import build_parser
 from kinomlx.models.flux2.config import assemble
-from kinomlx.models.flux2.config_schema import CONFIG_SCHEMA, Flux2Operation
-from kinomlx.models.flux2.pipeline import generate_flux2, restart_flux2
-from kinomlx.models.flux2.resources import inspect_resources
+from kinomlx.models.flux2.config_schema import CONFIG_SCHEMA
+from kinomlx.models.flux2.pipelines import generate_flux2, restart_flux2
+from kinomlx.models.flux2.resources import prepare_resources
 from kinomlx.models.flux2.settings import Flux2Settings
 from kinomlx.models.flux2.types import Flux2Request, Flux2RestartConfig
 from kinomlx.settings import Settings
@@ -29,17 +30,17 @@ def _roots() -> dict[str, object]:
         "restart": Flux2RestartConfig(Path("recorded_run.json")),
         "settings": Settings(),
         "model_settings": Flux2Settings(),
-        "operation": Flux2Operation(),
+        "operation": Operation(),
     }
 
 
-def test_every_klein_table_and_field_declares_both_restart_stations():
+def test_every_klein_table_and_field_declares_both_restart_stages():
     schema = CONFIG_SCHEMA
-    assert set(schema.restart_stations or ()) == {"denoise", "decode"}
-    assert all(set(table.stations) == {"denoise", "decode"} for table in schema.tables)
+    assert set(schema.restart_stages or ()) == {"denoise", "decode"}
+    assert all(set(table.stages) == {"denoise", "decode"} for table in schema.tables)
     assert all(
-        {policy.station for policy in field.station_policies} == {"denoise", "decode"}
-        and all(policy.reason for policy in field.station_policies)
+        {policy.stage for policy in field.stage_policies} == {"denoise", "decode"}
+        and all(policy.reason for policy in field.stage_policies)
         for table in schema.tables
         for field in table.fields
         if not field.virtual
@@ -48,47 +49,40 @@ def test_every_klein_table_and_field_declares_both_restart_stations():
     assert schema.environment_variables()[("restart", "index")][0] == ("KINO_FLUX2_RESTART_INDEX")
 
 
-def test_klein_station_admission_distinguishes_mutable_locked_and_unused_controls():
+def test_klein_stage_admission_distinguishes_mutable_locked_and_unused_controls():
     schema = CONFIG_SCHEMA
     parent = _roots()
     current = {**parent, "generate": replace(parent["generate"], steps=6)}
-    assert (
-        schema.station_changes(current, parent, station="denoise", active_explicit=frozenset())
-        == ()
+    assert schema.stage_changes(current, parent, stage="denoise", active_explicit=frozenset()) == ()
+    assert schema.stage_changes(current, parent, stage="decode", active_explicit=frozenset()) == (
+        ("generate", "steps"),
     )
-    assert schema.station_changes(
-        current, parent, station="decode", active_explicit=frozenset()
-    ) == (("generate", "steps"),)
 
     resource = ("model_settings", "source_path")
     replacement = {**parent, "model_settings": Flux2Settings(source_path=Path("elsewhere"))}
-    for station in ("denoise", "decode"):
-        policy = next(
-            item for item in schema.field(resource).station_policies if item.station == station
-        )
+    for stage in ("denoise", "decode"):
+        policy = next(item for item in schema.field(resource).stage_policies if item.stage == stage)
         assert (policy.mode, policy.irrelevant_action) == ("irrelevant", "reject")
-        assert schema.station_changes(
+        assert schema.stage_changes(
             replacement,
             parent,
-            station=station,
+            stage=stage,
             active_explicit=frozenset({resource}),
         ) == (resource,)
         assert (
-            schema.station_changes(
-                _roots(), parent, station=station, active_explicit=frozenset({resource})
+            schema.stage_changes(
+                _roots(), parent, stage=stage, active_explicit=frozenset({resource})
             )
             == ()
         )
         assert (
-            schema.station_changes(
-                replacement, parent, station=station, active_explicit=frozenset()
-            )
+            schema.stage_changes(replacement, parent, stage=stage, active_explicit=frozenset())
             == ()
         )
     output_policy = next(
         item
-        for item in schema.field(("output", "save_text_conditioning")).station_policies
-        if item.station == "decode"
+        for item in schema.field(("output", "save_text_conditioning")).stage_policies
+        if item.stage == "decode"
     )
     assert (output_policy.mode, output_policy.irrelevant_action) == (
         "irrelevant",
@@ -123,10 +117,10 @@ def test_saved_resource_selector_masks_lower_priority_environment_input():
     parent = _roots()
     parent["model_settings"] = Flux2Settings(source_path=Path("recorded"))
     assert (
-        CONFIG_SCHEMA.station_changes(
+        CONFIG_SCHEMA.stage_changes(
             parent,
             parent,
-            station="denoise",
+            stage="denoise",
             active_explicit=inputs.active_explicit_paths(),
         )
         == ()
@@ -135,7 +129,7 @@ def test_saved_resource_selector_masks_lower_priority_environment_input():
 
 def test_klein_direct_public_operations_have_declared_owners():
     operations = {boundary.operation for boundary in CONFIG_SCHEMA.api_boundaries}
-    assert {inspect_resources, generate_flux2, restart_flux2} <= operations
+    assert {prepare_resources, generate_flux2, restart_flux2} <= operations
     for boundary in CONFIG_SCHEMA.api_boundaries:
         boundary.validate_tracked_projections()
 

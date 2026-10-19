@@ -3,6 +3,7 @@
 import argparse
 from dataclasses import dataclass
 
+from kinomlx.cli.resource_operation import Operation, refuse_resource_only_work
 from kinomlx.cli.seed_config import seed_config
 from kinomlx.config import (
     ConfigError,
@@ -22,6 +23,7 @@ from kinomlx.config.persistence import rebase_configuration
 from kinomlx.config.provenance import PreparedConfig
 from kinomlx.config_records import construct_record, derive_config
 from kinomlx.config_rules import validate_record
+from kinomlx.image_restart_config import ImageStage
 from kinomlx.io.output_bundle import BundleOutputError
 from kinomlx.io.output_config import ImageOutputConfig
 from kinomlx.model_registry import config_registry
@@ -47,6 +49,7 @@ class Krea2Invocation:
 
     settings: Settings
     model_settings: Krea2Settings
+    operation: Operation
     variant: Krea2Variant
     generate: Krea2GenerateConfig
     output: ImageOutputConfig
@@ -152,11 +155,11 @@ def assemble(
     restart_base = PreparedConfig({}, {})
     if restart_config is not None:
         with restart_source(restart_config.run):
-            restart = load_restart_manifest(restart_config)
+            restart = load_restart_manifest(restart_config, schema=schema)
             restart_base = schema.normalize_prepared_layer(restart.base_config())
     inputs = sources.prepare(
         rebase_configuration(restart_base, restart_base.values),
-        station="generate" if restart is None else restart.config.phase,
+        stage=ImageStage.TEXT if restart is None else restart.config.stage,
     )
     cli_layer, set_layer = inputs.cli.values, inputs.override.values
     explicit = inputs.supplied_values()
@@ -208,12 +211,27 @@ def assemble(
             f"[restart]: source variant {restart.source_variant!r} cannot restart as "
             f"{variant.value!r}"
         )
+    operation = dataclass_from_mapping(
+        Operation,
+        merged.get("operation", {}),
+        table="[operation]",
+    )
     generate = dataclass_from_mapping(
         Krea2GenerateConfig,
         merged.get("generate", {}),
         table="[generate]",
     )
     generate = _effective_generate(generate, variant)
+    refuse_resource_only_work(
+        dry_run=operation.dry_run,
+        requested=(
+            generate.prompt is not None
+            or generate.prompt_unconditional
+            or restart is not None
+            or generate.text_conditioning is not None
+        ),
+        work="generation or restart",
+    )
     output_values = coerce_dataclass_fields(
         ImageOutputConfig, merged.get("output", {}), table="[output]"
     )
@@ -245,7 +263,7 @@ def assemble(
     if (
         request is not None
         and (request.turbo_4step or request.turbo_sda)
-        and (restart is None or restart.config.phase != "decode")
+        and (restart is None or restart.config.stage != "decode")
     ):
         try:
             _, selected_turbo, _ = resolve_profile_adapters(
@@ -281,7 +299,7 @@ def assemble(
     if restart is not None:
         parent_values = dict(config_table(restart_base.values, "generate"))
         if (
-            restart.config.phase == "denoise"
+            restart.config.stage == "denoise"
             and "text_conditioning" in config_table(explicit, "generate")
             and "prompts" in restart.generation
             and "negative_prompts" in restart.generation
@@ -338,12 +356,18 @@ def assemble(
             config_table(restart_base.values, "output"),
             table="[restart source output]",
         )
+        parent_operation = dataclass_from_mapping(
+            Operation,
+            config_table(restart_base.values, "operation"),
+            table="[restart source operation]",
+        )
         refuse_restart_changes(
             schema,
-            schema.station_changes(
+            schema.stage_changes(
                 {
                     "settings": settings,
                     "model_settings": model_settings,
+                    "operation": operation,
                     "generate": request,
                     "output": output,
                     "restart": restart.config,
@@ -351,22 +375,23 @@ def assemble(
                 {
                     "settings": parent_settings,
                     "model_settings": parent_model_settings,
+                    "operation": parent_operation,
                     "generate": parent_request,
                     "output": parent_output,
                     "restart": restart.config,
                 },
-                station=restart.config.phase,
+                stage=restart.config.stage,
                 active_explicit=inputs.active_explicit_paths(),
             ),
-            station=restart.config.phase,
+            stage=restart.config.stage,
         )
 
         if (
-            restart.config.phase == "denoise"
+            restart.config.stage == "denoise"
             and request.text_conditioning is not None
             and "negative_prompt" not in config_table(explicit, "generate")
         ):
-            # The saved station owns inherited negative rows. Preserve only a
+            # The saved stage owns inherited negative rows. Preserve only a
             # negative supplied in this invocation as an explicit user request.
             generate = derive_config(generate, negative_prompt=None)
             request = resolve_request_sources(derive_config(request, negative_prompt=None))
@@ -375,6 +400,7 @@ def assemble(
         "model": "krea2",
         "settings": dataclass_to_mapping(settings),
         "model_settings": dataclass_to_mapping(model_settings),
+        "operation": dataclass_to_mapping(operation),
         "output": dataclass_to_mapping(output),
     }
     if request is not None or "generate" in explicit:
@@ -386,6 +412,7 @@ def assemble(
     return Krea2Invocation(
         settings=settings,
         model_settings=model_settings,
+        operation=operation,
         variant=variant,
         generate=generate,
         output=output,
@@ -398,19 +425,22 @@ def assemble(
 
 
 def validate_for_execution(invocation: Krea2Invocation) -> None:
-    """Validate fields allowed to remain absent for preparation/config output."""
+    """Validate fields allowed to remain absent for a dry run or config output."""
     if invocation.request is None:
-        raise ConfigError("Krea 2 generation needs --prompt or --text-conditioning")
+        raise ConfigError(
+            "Krea 2 generation needs --prompt or --text-conditioning; "
+            "use --dry-run to inspect resources without generating"
+        )
     validate_record(invocation.request, location="[generate]")
     if invocation.request.source_images:
         validate_edit_request(invocation.request)
     if invocation.restart is not None:
-        config_registry().model("krea2").validate_station_outputs(
+        config_registry().model("krea2").validate_stage_outputs(
             {"output": dataclass_to_mapping(invocation.output)},
-            station=invocation.restart.config.phase,
+            stage=invocation.restart.config.stage,
         )
         if (
-            invocation.restart.config.phase == "denoise"
+            invocation.restart.config.stage == "denoise"
             and invocation.request.text_conditioning is None
         ):
             raise ConfigError(
@@ -422,7 +452,9 @@ def validate_for_execution(invocation: Krea2Invocation) -> None:
             invocation.request,
             invocation.variant,
             invocation.output,
-            station="generate" if invocation.restart is None else invocation.restart.config.phase,
+            stage=ImageStage.TEXT
+            if invocation.restart is None
+            else invocation.restart.config.stage,
         )
     except (ValueError, BundleOutputError) as exc:
         raise ConfigError(f"[output]: {exc}") from exc
@@ -437,7 +469,7 @@ def validate_for_execution(invocation: Krea2Invocation) -> None:
             invocation.restart.source_run,
             *invocation.restart.source_outputs,
         }
-        if invocation.restart.config.phase == "decode":
+        if invocation.restart.config.stage == "decode":
             source_outputs.add(invocation.restart.selected_latents)
         elif text_input is not None:
             source_outputs.add(text_input.expanduser().absolute())

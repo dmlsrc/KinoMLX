@@ -6,6 +6,8 @@ from functools import lru_cache
 
 import mlx.core as mx
 
+from kinomlx.kernels import split_rope
+
 
 class LTXRopeType(Enum):
     """Position-embedding layouts supported by implemented LTX-2 graphs."""
@@ -18,9 +20,15 @@ def apply_split_rotary_emb(
     cos_freqs: mx.array,
     sin_freqs: mx.array,
 ) -> mx.array:
-    """Apply split-half RoPE and preserve the activation dtype."""
+    """Apply split-half RoPE and preserve the activation dtype.
+
+    Flattened-head activations with FP32 head-major tables, the transformer's case, take one
+    Metal pass with this graph's bits (``kinomlx.kernels.split_rope``).
+    """
     if cos_freqs.shape != sin_freqs.shape:
         raise ValueError("RoPE cosine and sine tensors must have matching shapes")
+    if split_rope.applies(value, cos_freqs, sin_freqs):
+        return split_rope.rotate(value, cos_freqs, sin_freqs)
     input_dtype = value.dtype
     reshape_heads = value.ndim != 4 and cos_freqs.ndim == 4
     if reshape_heads:

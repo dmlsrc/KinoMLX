@@ -4,11 +4,11 @@ from .adapters.inputs import Krea2AdapterConfig
 from .catalog import Krea2VAEDecoder, Krea2Variant, Krea2VariantSpec
 from .components import (
     Krea2Components,
+    Krea2ComponentsProvider,
     Krea2ImageDecoderPort,
     Krea2ImageDecoderProvider,
     Krea2TransformerPort,
     Krea2TransformerProvider,
-    NativeKrea2Components,
 )
 from .output import (
     Krea2OutputPlan,
@@ -32,9 +32,9 @@ from .settings import Krea2Settings
 from .text_conditioning import (
     Krea2PromptConditioning,
     Krea2TextConditioner,
+    Krea2TextConditionerPort,
     Krea2TextConditioning,
     Krea2TextConditioningProvenance,
-    NativeKrea2TextConditioner,
     load_text_conditioning,
     read_text_conditioning_prompts,
     text_conditioning_artifact,
@@ -47,6 +47,7 @@ __all__ = [
     "Krea2AdapterConfig",
     "Krea2Capabilities",
     "Krea2Components",
+    "Krea2ComponentsProvider",
     "Krea2DecodedRGB",
     "Krea2Error",
     "Krea2GeneratedImage",
@@ -64,6 +65,7 @@ __all__ = [
     "Krea2StillOutputPlan",
     "Krea2StillOutputSink",
     "Krea2TextConditioner",
+    "Krea2TextConditionerPort",
     "Krea2TextConditioning",
     "Krea2TextConditioningProvenance",
     "Krea2TransformerPort",
@@ -72,8 +74,6 @@ __all__ = [
     "Krea2VAETilingConfig",
     "Krea2Variant",
     "Krea2VariantSpec",
-    "NativeKrea2Components",
-    "NativeKrea2TextConditioner",
     "generate_krea2",
     "generate_krea2_edit",
     "load_text_conditioning",

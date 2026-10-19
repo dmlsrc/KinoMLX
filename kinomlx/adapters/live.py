@@ -34,7 +34,7 @@ from kinomlx.modeling.layers import PretransposedLinear
 from kinomlx.modeling.loading import WeightTarget
 
 from .algebra import intrinsic_scale, loha_pairs, lokr_factors, plain_lora_entry
-from .formats import AdapterOperation
+from .formats import AdapterKind, AdapterOperation
 from .lora import validated_lora_scale
 from .schedule import AdapterSchedule, AdapterSigmaWindow
 
@@ -191,7 +191,7 @@ def _loha_applier(
 def _kronecker_applier(
     operation: AdapterOperation, shape: tuple[int, ...], dtype: mx.Dtype
 ) -> tuple[LiveApply, int] | None:
-    if operation.kind != "lokr" or operation.part != "weight" or len(shape) != 2:
+    if operation.kind != AdapterKind.LOKR or operation.part != "weight" or len(shape) != 2:
         return None
     if "magnitude" in operation.factors:
         return None

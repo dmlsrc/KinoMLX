@@ -1,19 +1,20 @@
 """Klein resource-discovery contribution to the model-owned configuration registry."""
 
-from dataclasses import dataclass, replace
+from dataclasses import replace
 from pathlib import Path
 
 from kinomlx.api_boundaries import APIBoundary, configuration, runtime
 from kinomlx.cli.config_schema import settings_table
 from kinomlx.cli.image_schema import (
-    RESTART_PHASE_CLI,
     RESTART_RUN_CLI,
+    RESTART_STAGE_CLI,
     SIGMAS_CLI,
     SOURCE_ASPECT_CLI,
     SOURCE_IMAGE_CLI,
     image_output_table,
 )
 from kinomlx.cli.prompt_arguments import prompt_unconditional_field
+from kinomlx.cli.resource_operation import operation_table
 from kinomlx.cli.seed_arguments import seed_fields
 from kinomlx.config import (
     CliBinding,
@@ -24,50 +25,56 @@ from kinomlx.config import (
     ModelConfigSpec,
 )
 from kinomlx.config.source_rules import PROMPT_FILE
-from kinomlx.config.stations import StationPolicy
+from kinomlx.config.stages import IrrelevantAction, StageMode, StagePolicy
+from kinomlx.config_bindings import CliAction
 from kinomlx.config_constraints import field_choices
-from kinomlx.config_records import config_record
 from kinomlx.config_surfaces import CONFIG_SURFACES, MODEL_SURFACES, SOURCE_SURFACES
+from kinomlx.image_restart_config import IMAGE_STAGES, ImageStage
 from kinomlx.invocation_controls import MODEL_CONTROL
 from kinomlx.settings import Settings
 
 from .adapters.config_schema import ADAPTERS
 from .output_policies import OUTPUT_POLICIES
-from .pipeline import generate_flux2, restart_flux2
-from .resources import inspect_resources
+from .pipelines import generate_flux2, restart_flux2
+from .resources import prepare_resources
 from .runner import API_BOUNDARIES as RUNNER_API_BOUNDARIES
 from .settings import Flux2Settings
 from .types import Flux2Request, Flux2RestartConfig
 
-_RESTART_STATIONS = field_choices(Flux2RestartConfig, "phase")
+_RESTART_STAGES = field_choices(Flux2RestartConfig, "stage")
 
 
-def _locked(reason: str) -> tuple[StationPolicy, ...]:
-    return tuple(StationPolicy(station, "locked", reason=reason) for station in _RESTART_STATIONS)
+def _locked(reason: str) -> tuple[StagePolicy, ...]:
+    return tuple(StagePolicy(stage, StageMode.LOCKED, reason=reason) for stage in _RESTART_STAGES)
 
 
-def _denoise(reason: str) -> tuple[StationPolicy, ...]:
+def _denoise(reason: str) -> tuple[StagePolicy, ...]:
     return (
-        StationPolicy("denoise", "mutable", reason=reason),
-        StationPolicy("decode", "locked", reason=reason),
+        StagePolicy(ImageStage.DENOISE, StageMode.MUTABLE, reason=reason),
+        StagePolicy(ImageStage.DECODE, StageMode.LOCKED, reason=reason),
     )
 
 
-def _mutable(reason: str) -> tuple[StationPolicy, ...]:
-    return tuple(StationPolicy(station, "mutable", reason=reason) for station in _RESTART_STATIONS)
+def _mutable(reason: str) -> tuple[StagePolicy, ...]:
+    return tuple(StagePolicy(stage, StageMode.MUTABLE, reason=reason) for stage in _RESTART_STAGES)
 
 
-def _recorded_resource(reason: str) -> tuple[StationPolicy, ...]:
+def _recorded_resource(reason: str) -> tuple[StagePolicy, ...]:
     return tuple(
-        StationPolicy(station, "irrelevant", reason=reason, irrelevant_action="reject")
-        for station in _RESTART_STATIONS
+        StagePolicy(
+            stage,
+            StageMode.IRRELEVANT,
+            reason=reason,
+            irrelevant_action=IrrelevantAction.REJECT,
+        )
+        for stage in _RESTART_STAGES
     )
 
 
 DIRECT_API_BOUNDARIES = (
     APIBoundary(
         "flux2",
-        inspect_resources,
+        prepare_resources,
         (
             configuration("settings", Flux2Settings, "model_settings"),
             configuration("infrastructure", Settings, "settings"),
@@ -82,6 +89,7 @@ DIRECT_API_BOUNDARIES = (
             runtime("reporter", "progress reporter"),
             runtime("conditioning", "retained prepared conditioning"),
             runtime("on_image", "image callback"),
+            runtime("components", "component provider"),
         ),
     ),
     APIBoundary(
@@ -89,10 +97,11 @@ DIRECT_API_BOUNDARIES = (
         restart_flux2,
         (
             configuration("request", Flux2Request, "generate"),
-            runtime("resources", "recorded station components and memory policy"),
-            runtime("restart", "prepared station handoff"),
+            runtime("resources", "recorded stage components and memory policy"),
+            runtime("restart", "prepared stage handoff"),
             runtime("reporter", "progress reporter"),
             runtime("conditioning", "retained prepared conditioning"),
+            runtime("components", "component provider"),
         ),
     ),
 )
@@ -111,17 +120,12 @@ _CHOICE_HELP = {
 }
 
 
-@config_record
-@dataclass(frozen=True)
-class Flux2Operation:
-    dry_run: bool = False
-
-
 CONFIG_SCHEMA = ModelConfigSpec(
     model="flux2",
     title="KinoMLX FLUX.2 Klein image generation and restart",
     introduction=("Generate Klein base, distilled, and KV still images from local resources.",),
-    restart_stations=_RESTART_STATIONS,
+    stages=IMAGE_STAGES,
+    restart_stages=_RESTART_STAGES,
     api_boundaries=(*RUNNER_API_BOUNDARIES, *DIRECT_API_BOUNDARIES),
     root_fields=(
         ConfigFieldSpec(
@@ -144,13 +148,13 @@ CONFIG_SCHEMA = ModelConfigSpec(
             path=("generate",),
             cli_generated=True,
             record=Flux2Request,
-            stations=_RESTART_STATIONS,
-            station_record=Flux2Request,
+            stages=_RESTART_STAGES,
+            stage_record=Flux2Request,
             fields=(
                 *(
                     replace(
                         field,
-                        station_policies={
+                        stage_policies={
                             "seed": _denoise(
                                 "Denoise can draw new noise; decode consumes the saved latent image."
                             ),
@@ -158,7 +162,7 @@ CONFIG_SCHEMA = ModelConfigSpec(
                                 "A restart selects one recorded image, not a new seed collection."
                             ),
                             "seed_mode": _locked(
-                                "The recorded single-image station has no new multi-seed execution mode."
+                                "The recorded single-image stage has no new multi-seed execution mode."
                             ),
                         }[field.name],
                     )
@@ -166,13 +170,13 @@ CONFIG_SCHEMA = ModelConfigSpec(
                 ),
                 replace(
                     prompt_unconditional_field(),
-                    station_policies=_locked(
+                    stage_policies=_locked(
                         "Saved conditioning fixes whether the selected prompt was unconditional."
                     ),
                 ),
                 replace(
                     ADAPTERS,
-                    station_policies=_denoise(
+                    stage_policies=_denoise(
                         "Denoise can apply a new adapter stack; decode consumes final latents."
                     ),
                 ),
@@ -193,9 +197,7 @@ CONFIG_SCHEMA = ModelConfigSpec(
                 ConfigFieldSpec(
                     persistence="intent",
                     name="prompt",
-                    station_policies=_locked(
-                        "The saved conditioning fixes the selected prompt row."
-                    ),
+                    stage_policies=_locked("The saved conditioning fixes the selected prompt row."),
                     purpose="Set one prompt or an ordered prompt array",
                     valid="nonempty text",
                     example="A cinematic portrait in afternoon light",
@@ -203,7 +205,7 @@ CONFIG_SCHEMA = ModelConfigSpec(
                     # Klein activates the one generation input that command needs.
                     starter="A cinematic portrait in afternoon light",
                     cli_dest="prompt",
-                    cli=CliBinding("Generation", action="append"),
+                    cli=CliBinding("Generation", action=CliAction.APPEND),
                     surfaces=CONFIG_SURFACES,
                 ),
                 *(
@@ -211,7 +213,7 @@ CONFIG_SCHEMA = ModelConfigSpec(
                         persistence="intent",
                         cli=cli,
                         name=name,
-                        station_policies=station_policies,
+                        stage_policies=stage_policies,
                         purpose=purpose,
                         valid=valid,
                         example=example,
@@ -220,7 +222,7 @@ CONFIG_SCHEMA = ModelConfigSpec(
                         choice_help=tuple((choice, _CHOICE_HELP[choice]) for choice in choices),
                         surfaces=CONFIG_SURFACES,
                     )
-                    for name, station_policies, purpose, valid, example, choices, cli in (
+                    for name, stage_policies, purpose, valid, example, choices, cli in (
                         (
                             "negative_prompt",
                             _locked(
@@ -230,7 +232,7 @@ CONFIG_SCHEMA = ModelConfigSpec(
                             "one string or one per prompt; base with guidance >1 only",
                             "blurry",
                             (),
-                            CliBinding("Generation", action="append"),
+                            CliBinding("Generation", action=CliAction.APPEND),
                         ),
                         (
                             "width",
@@ -238,7 +240,8 @@ CONFIG_SCHEMA = ModelConfigSpec(
                                 "The saved conditioning and latents fix the output grid width."
                             ),
                             "Set output width before optional source-aspect matching",
-                            "a multiple of 16 >=64",
+                            "an integer >=64; a multiple of 16 unless source-aspect matching "
+                            "rounds it up",
                             1024,
                             (),
                             CliBinding("Generation"),
@@ -249,7 +252,8 @@ CONFIG_SCHEMA = ModelConfigSpec(
                                 "The saved conditioning and latents fix the output grid height."
                             ),
                             "Set output height before optional source-aspect matching",
-                            "a multiple of 16 >=64",
+                            "an integer >=64; a multiple of 16 unless source-aspect matching "
+                            "rounds it up",
                             1024,
                             (),
                             CliBinding("Generation"),
@@ -257,16 +261,16 @@ CONFIG_SCHEMA = ModelConfigSpec(
                         (
                             "recompute_reference_kv",
                             (
-                                StationPolicy(
+                                StagePolicy(
                                     "denoise",
-                                    "mutable",
+                                    StageMode.MUTABLE,
                                     reason="Denoise reruns the sampler and its reference extraction.",
                                 ),
-                                StationPolicy(
+                                StagePolicy(
                                     "decode",
-                                    "irrelevant",
+                                    StageMode.IRRELEVANT,
                                     reason="Decode does not sample.",
-                                    irrelevant_action="ignore",
+                                    irrelevant_action=IrrelevantAction.IGNORE,
                                 ),
                             ),
                             "Extract the reference K/V again at every denoise step",
@@ -275,7 +279,7 @@ CONFIG_SCHEMA = ModelConfigSpec(
                             "references",
                             True,
                             (),
-                            CliBinding("Generation", action="boolean"),
+                            CliBinding("Generation", action=CliAction.BOOLEAN),
                         ),
                         (
                             "steps",
@@ -301,7 +305,7 @@ CONFIG_SCHEMA = ModelConfigSpec(
                         ),
                         (
                             "images_per_prompt",
-                            _locked("A saved-station restart resumes exactly one selected image."),
+                            _locked("A saved-stage restart resumes exactly one selected image."),
                             "Generate sequential images for each prompt",
                             "a positive integer",
                             1,
@@ -355,7 +359,7 @@ CONFIG_SCHEMA = ModelConfigSpec(
                         (
                             "reference_fit",
                             _locked(
-                                "Saved reference geometry fixes source fitting before this station."
+                                "Saved reference geometry fixes source fitting before this stage."
                             ),
                             "Set reference fitting against the output grid",
                             "",
@@ -390,7 +394,7 @@ CONFIG_SCHEMA = ModelConfigSpec(
         image_output_table(
             "flux2",
             output_policies=OUTPUT_POLICIES,
-            stations=_RESTART_STATIONS,
+            stages=_RESTART_STAGES,
             noise_help="Save packed initial noise and the Euler schedule",
             latents_help="Save packed final VAE latents and their output grid",
             conditioning_help="Save complete text, negative text, and ordered reference conditioning",
@@ -399,8 +403,8 @@ CONFIG_SCHEMA = ModelConfigSpec(
             path=("restart",),
             cli_generated=True,
             record=Flux2RestartConfig,
-            stations=_RESTART_STATIONS,
-            station_record=Flux2RestartConfig,
+            stages=_RESTART_STAGES,
+            stage_record=Flux2RestartConfig,
             default_present=False,
             fields=(
                 ConfigFieldSpec(
@@ -415,16 +419,16 @@ CONFIG_SCHEMA = ModelConfigSpec(
                     cli=RESTART_RUN_CLI,
                     notes=("Omit the whole [restart] table to start a fresh run.",),
                     surfaces=CONFIG_SURFACES,
-                    station_policies=_mutable(
+                    stage_policies=_mutable(
                         "This selector identifies the completed source run for the new restart."
                     ),
                 ),
                 ConfigFieldSpec(
                     persistence="intent",
-                    name="phase",
-                    purpose="Select the first station to repeat",
+                    name="stage",
+                    purpose="Select the first stage to repeat",
                     valid="",
-                    choices=field_choices(Flux2RestartConfig, "phase"),
+                    choices=field_choices(Flux2RestartConfig, "stage"),
                     choice_help=(
                         ("decode", "Decode saved final latents"),
                         (
@@ -433,13 +437,13 @@ CONFIG_SCHEMA = ModelConfigSpec(
                         ),
                     ),
                     example="decode",
-                    cli_dest="restart_phase",
-                    environment_key="restart_phase",
+                    cli_dest="restart_stage",
+                    environment_key="restart_stage",
                     groups=frozenset({ConfigGroup.SOURCE_SELECTOR}),
-                    cli=RESTART_PHASE_CLI,
+                    cli=RESTART_STAGE_CLI,
                     surfaces=CONFIG_SURFACES,
-                    station_policies=_mutable(
-                        "This selector chooses which saved station the new invocation repeats."
+                    stage_policies=_mutable(
+                        "This selector chooses which saved stage the new invocation repeats."
                     ),
                 ),
                 ConfigFieldSpec(
@@ -454,7 +458,7 @@ CONFIG_SCHEMA = ModelConfigSpec(
                     cli=CliBinding("Restart"),
                     default_text="the final latents artifact recorded in the run log",
                     surfaces=CONFIG_SURFACES,
-                    station_policies=_mutable(
+                    stage_policies=_mutable(
                         "This optional selector chooses compatible final latents for decode."
                     ),
                 ),
@@ -470,23 +474,23 @@ CONFIG_SCHEMA = ModelConfigSpec(
                     cli=CliBinding("Restart"),
                     default_text="the only image, which a single-image source run implies",
                     surfaces=CONFIG_SURFACES,
-                    station_policies=_mutable(
+                    stage_policies=_mutable(
                         "This selector chooses one recorded image from a multi-image source run."
                     ),
                 ),
             ),
         ),
         settings_table(
-            stations=_RESTART_STATIONS,
-            adapter_weight_check_stations=frozenset({"denoise"}),
+            stages=_RESTART_STAGES,
+            adapter_weight_check_stages=frozenset({"denoise"}),
         ),
         ConfigTableSpec(
             path=("model_settings",),
             cli_generated=True,
             cli_group="Klein settings (override env vars)",
             record=Flux2Settings,
-            stations=_RESTART_STATIONS,
-            station_record=Flux2Settings,
+            stages=_RESTART_STAGES,
+            stage_record=Flux2Settings,
             fields=(
                 ConfigFieldSpec(
                     persistence="intent",
@@ -501,7 +505,7 @@ CONFIG_SCHEMA = ModelConfigSpec(
                     ),
                     example="distilled",
                     cli_dest="variant",
-                    station_policies=_locked(
+                    stage_policies=_locked(
                         "The checkpoint variant determines the recorded resource profile and recipe."
                     ),
                     surfaces=CONFIG_SURFACES,
@@ -518,7 +522,24 @@ CONFIG_SCHEMA = ModelConfigSpec(
                     ),
                     example="bfloat16",
                     cli_dest="transformer_dtype",
-                    station_policies=_recorded_resource(
+                    stage_policies=_recorded_resource(
+                        "Replay reopens the recorded component dtype; use fresh generation to change it."
+                    ),
+                    surfaces=CONFIG_SURFACES,
+                ),
+                ConfigFieldSpec(
+                    persistence="intent",
+                    name="vae_dtype",
+                    purpose="Select the decoder weight and execution dtype",
+                    valid="",
+                    choices=field_choices(Flux2Settings, "vae_dtype"),
+                    choice_help=(
+                        ("bfloat16", "Preserve the bundled BF16 decoder precision"),
+                        ("float32", "Decode at FP32 for diagnostic comparison"),
+                    ),
+                    example="bfloat16",
+                    cli_dest="vae_dtype",
+                    stage_policies=_recorded_resource(
                         "Replay reopens the recorded component dtype; use fresh generation to change it."
                     ),
                     surfaces=CONFIG_SURFACES,
@@ -533,7 +554,7 @@ CONFIG_SCHEMA = ModelConfigSpec(
                         valid="an existing local source path",
                         example=Path("local") / name.removesuffix("_path"),
                         cli_dest=name,
-                        station_policies=_recorded_resource(reason),
+                        stage_policies=_recorded_resource(reason),
                         surfaces=CONFIG_SURFACES,
                     )
                     for name, reason in (
@@ -561,28 +582,7 @@ CONFIG_SCHEMA = ModelConfigSpec(
                 ),
             ),
         ),
-        ConfigTableSpec(
-            path=("operation",),
-            cli_generated=True,
-            record=Flux2Operation,
-            stations=_RESTART_STATIONS,
-            station_record=Flux2Operation,
-            fields=(
-                ConfigFieldSpec(
-                    persistence="intent",
-                    name="dry_run",
-                    purpose="Describe validated local resources",
-                    valid="true or false",
-                    example=True,
-                    cli_dest="dry_run",
-                    cli=CliBinding("Klein execution", action="store_true"),
-                    surfaces=CONFIG_SURFACES,
-                    station_policies=_locked(
-                        "A saved-station restart executes a generation stage, so resource-only dry-run stays false."
-                    ),
-                ),
-            ),
-        ),
+        operation_table(cli_group="Klein execution", stages=_RESTART_STAGES),
     ),
     implications=(
         ConfigImplication(

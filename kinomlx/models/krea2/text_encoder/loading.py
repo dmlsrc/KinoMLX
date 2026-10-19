@@ -17,7 +17,7 @@ KREA2_QWEN_CONSUMED_TENSORS = 386
 
 @dataclass(frozen=True)
 class Qwen3VLLoadReceipt:
-    """Stable identity of the exact Qwen target graph bound for one station."""
+    """Stable identity of the exact Qwen target graph bound for one stage."""
 
     target_count: int
     target_digest: str

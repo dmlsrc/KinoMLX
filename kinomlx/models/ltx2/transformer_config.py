@@ -2,12 +2,14 @@
 
 from dataclasses import dataclass
 
+from .vocabularies import LTX2ModelGeneration
+
 
 @dataclass(frozen=True)
 class TransformerConstructorConfig:
     """Graph facts shared by metadata inspection and resource construction."""
 
-    model_generation: str
+    model_generation: LTX2ModelGeneration
     declared_model_version: str | None
     num_layers: int
     video_in_channels: int

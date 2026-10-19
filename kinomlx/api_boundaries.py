@@ -6,8 +6,8 @@ from dataclasses import dataclass
 from types import FunctionType, UnionType
 from typing import Union, cast, get_args, get_origin, get_type_hints
 
+from kinomlx._config_record_state import tracks_presence
 from kinomlx.config_constraints import field_constraints
-from kinomlx.config_record_state import tracks_presence
 
 
 @dataclass(frozen=True)

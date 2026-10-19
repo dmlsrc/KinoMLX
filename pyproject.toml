@@ -4,10 +4,10 @@ build-backend = "hatchling.build"
 
 [project]
 name = "kinomlx"
-version = "0.0.2"
+version = "0.0.3"
 description = "Native multimodal MLX inference for video generation and HDR still expansion"
 readme = "README.md"
-requires-python = ">=3.14"
+requires-python = ">=3.15"
 license = "MIT"
 license-files = ["LICENSE", "THIRD_PARTY_LICENSES.md"]
 authors = [
@@ -18,19 +18,19 @@ classifiers = [
     "Intended Audience :: Developers",
     "Operating System :: MacOS",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.14",
+    "Programming Language :: Python :: 3.15",
     "Topic :: Multimedia :: Graphics",
     "Topic :: Multimedia :: Video",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 dependencies = [
     # MLX runtime - Apple Silicon array framework + Metal backend.
-    "mlx>=0.32.2",
+    "mlx>=0.32.4",
 
     # Tokenizer - SentencePiece backs the native Gemma tokenizer.
     "sentencepiece>=0.2.2",
     # Tokenizer derivation serializes SentencePiece ModelProto in memory.
-    "protobuf>=7.36.0",
+    "protobuf>=7.36.2",
 
     # UX (terminal output, progress).
     "rich>=15.0.0",
@@ -49,19 +49,22 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
-    "mypy>=2.3.1",
+    # The [build-system] backend. Offline release builds run
+    # `uv build --no-build-isolation`, which uses this environment's copy.
+    "hatchling>=1.32.4",
+    "mypy>=2.4.0",
     "pytest>=9.1.1",
     # Parallel test execution; the suite runs -n auto by default (see
     # [tool.pytest.ini_options]). Real-weight tests always run in one process.
     "pytest-xdist>=3.8.0",
-    "ruff>=0.16.4",
+    "ruff>=0.17.1",
     # Occasional dead-code sweep, configured under [tool.vulture]; not a gate.
     "vulture>=2.16",
     # Differential oracle for derived SentencePiece models; never imported by kinomlx/.
-    "tokenizers>=0.22.2",
+    "tokenizers>=0.23.3",
     # numpy is a test-only oracle (test files build reference arrays with it),
     # not a runtime dependency - the package runs MLX-native without it.
-    "numpy>=2.5.2",
+    "numpy>=2.5.4",
 ]
 
 [project.urls]
@@ -87,6 +90,7 @@ exclude = [
 [tool.hatch.build.targets.wheel]
 packages = ["kinomlx"]
 exclude = [
+    "**/.*",
     "**/*.safetensors",
     "**/*.gguf",
     "**/*.bin",
@@ -98,7 +102,7 @@ exclude = [
 
 [tool.ruff]
 line-length = 100
-target-version = "py314"
+target-version = "py315"
 
 [tool.ruff.lint]
 # E/W/F: pycodestyle + pyflakes. I: import sorting. B: bugbear (likely bugs).
@@ -134,8 +138,11 @@ ignore = ["E501", "RUF043"]
 extend-immutable-calls = [
     "kinomlx.memory_policy.MLXMemoryPolicy",
     "kinomlx.config_constraints.IntegerConstraint",
+    "kinomlx.adapters.scaling.ScaleDetermination",
 ]
 
+# kinomlx/.ruff.toml extends this list for the package with name-based import bans;
+# tests may import modules by name.
 [tool.ruff.lint.flake8-tidy-imports.banned-api]
 "__future__.annotations".msg = "Use Python 3.14 native deferred annotations, not PEP 563 stringization."
 "typing.TYPE_CHECKING".msg = "Import annotation dependencies normally and keep one import graph."
@@ -174,7 +181,7 @@ markers = [
 ]
 
 [tool.mypy]
-python_version = "3.14"
+python_version = "3.15"
 files = [
     "kinomlx",
     "tests/typecheck/assembly_line_contracts.py",
@@ -268,6 +275,10 @@ extend-enable = ["MD084", "MD088"]
 [tool.rumdl.MD013]
 code-blocks = false
 tables = false
+
+[tool.rumdl.MD033]
+# Argument catalogs use HTML tables with rowspans to keep each value with its argument.
+allowed-elements = ["table", "thead", "tbody", "tr", "th", "td", "code", "em", "a"]
 
 [tool.rumdl.MD084]
 strict = true

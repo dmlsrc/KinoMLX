@@ -14,7 +14,7 @@ from .output import (
 )
 from .settings import Settings
 
-__version__ = "0.0.2"
+__version__ = "0.0.3"
 
 __all__ = [
     "ArtifactSet",

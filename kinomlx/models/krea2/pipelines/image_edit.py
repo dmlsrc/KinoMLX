@@ -16,6 +16,7 @@ from kinomlx.config_records import derive_config
 from kinomlx.io.image import load_image
 from kinomlx.io.resampling import fit_reference, reference_fit_geometry
 from kinomlx.memory_policy import memory_managed
+from kinomlx.modeling.dtypes import resolve_bound_dtype
 from kinomlx.reporting import NullReporter, Reporter, reported_phase
 from kinomlx.settings import Settings
 
@@ -24,9 +25,9 @@ from ..adapters.loading import Krea2AdapterPlan
 from ..adapters.turbo_profile import resolve_turbo_adapters
 from ..components import (
     Krea2Components,
+    Krea2ComponentsProvider,
     Krea2ImageDecoderPort,
     Krea2TransformerPort,
-    NativeKrea2Components,
 )
 from ..edit_validation import validate_edit_request
 from ..grounding import GroundedKrea2TextConditioner
@@ -36,7 +37,7 @@ from ..reference_regions import parse_reference_region, reference_region_selecti
 from ..resource_types import Krea2Resources
 from ..sampling import Krea2Checkpoint, pack_latents
 from ..sizing import resolve_source_sizing
-from ..text_conditioning import Krea2TextConditioner
+from ..text_conditioning import Krea2TextConditionerPort
 from ..transformer import Krea2BoundaryObserver, Krea2TransformerOutput
 from ..transformer.model import Krea2PreparedConditioning, Krea2Transformer
 from ..transformer.reference import ReferenceAttention
@@ -226,7 +227,7 @@ class ReferenceConditionedTransformer:
 
 @dataclass(frozen=True)
 class ReferenceKrea2Components:
-    base: Krea2Components
+    base: Krea2ComponentsProvider
     references: tuple[Krea2ReferenceTokens, ...]
     target_grid: tuple[int, int]
     centered: bool
@@ -249,8 +250,8 @@ def generate_krea2_edit(
     request: Krea2Request,
     resources: Krea2Resources,
     *,
-    components: Krea2Components | None = None,
-    text_conditioner: Krea2TextConditioner | None = None,
+    components: Krea2ComponentsProvider | None = None,
+    text_conditioner: Krea2TextConditionerPort | None = None,
     reporter: Reporter | None = None,
     checkpoint: Krea2Checkpoint | None = None,
     on_image: Callable[[int, Krea2GenerationOutput], None] | None = None,
@@ -302,7 +303,8 @@ def generate_krea2_edit(
 
     vae_root = resources.source_root / "vae"
     encoder = Krea2ImageEncoder(
-        parse_vae_config(vae_root / "config.json"), compute_dtype=resources.vae.dtype_policy
+        parse_vae_config(vae_root / "config.json"),
+        compute_dtype=resolve_bound_dtype(resources.vae.dtype_policy, owner="Krea 2 VAE"),
     )
     references: list[Krea2ReferenceTokens] = []
     try:
@@ -345,7 +347,7 @@ def generate_krea2_edit(
         del encoder
         gc.collect()
         mx.clear_cache()
-    base = components if components is not None else NativeKrea2Components(reporter=sink)
+    base = components if components is not None else Krea2Components(reporter=sink)
     ports = ReferenceKrea2Components(
         base,
         tuple(references),

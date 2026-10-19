@@ -10,6 +10,8 @@ from typing import Literal, Self
 from kinomlx.io.safetensors import read_metadata
 from kinomlx.types import SpatioTemporalScaleFactors
 
+from .kinds import VideoVAEKind
+
 _ENCODER_BLOCKS = frozenset(
     {
         "res_x",
@@ -389,7 +391,7 @@ class VideoVAEConfig:
     scaling_factor: float = 1.0
     use_quant_conv: bool = False
     signal_domain: str = "normalized-sdr"
-    decoder_kind: Literal["native-conv3d", "diffusion-na"] = "native-conv3d"
+    decoder_kind: VideoVAEKind = VideoVAEKind.CONV
     diffusion_decoder: DiffusionVideoDecoderConfig | None = None
     latent_log_var: Literal["uniform", "constant"] = "uniform"
     latent_log_var_value: float | None = None
@@ -456,7 +458,7 @@ class VideoVAEConfig:
             raise ValueError("latent_log_var must be 'uniform' or 'constant'")
         if self.latent_log_var == "constant" and self.latent_log_var_value is None:
             raise ValueError("constant latent_log_var requires latent_log_var_value")
-        if self.decoder_kind == "native-conv3d":
+        if self.decoder_kind == VideoVAEKind.CONV:
             if not self.decoder_blocks:
                 raise ValueError("native Conv3d decoder_blocks must not be empty")
             if self.diffusion_decoder is not None:
@@ -465,7 +467,7 @@ class VideoVAEConfig:
                 raise ValueError("native Conv3d video decoding does not use timestep conditioning")
             if self.latent_log_var != "uniform":
                 raise ValueError("native Conv3d video VAE requires uniform latent log variance")
-        elif self.decoder_kind == "diffusion-na":
+        elif self.decoder_kind == VideoVAEKind.DIFFUSION:
             if self.decoder_blocks:
                 raise ValueError("diffusion video VAE cannot carry Conv3d decoder blocks")
             if self.diffusion_decoder is None:
@@ -667,7 +669,7 @@ class VideoVAEConfig:
             scaling_factor=1.0,
             use_quant_conv=False,
             signal_domain=str(raw.get("signal_domain", "normalized-sdr")),
-            decoder_kind="diffusion-na",
+            decoder_kind=VideoVAEKind.DIFFUSION,
             diffusion_decoder=diffusion,
             latent_log_var=latent_log_var,  # type: ignore[arg-type]
             latent_log_var_value=latent_log_var_value,

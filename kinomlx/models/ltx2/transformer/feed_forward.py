@@ -5,7 +5,7 @@ import mlx.core as mx
 import kinomlx._mlx_nn as nn
 from kinomlx.kernels import gelu_approx
 
-from .attention import _linear_shell, _projection
+from .attention import _linear_shell, _mpp_projection
 
 
 class GELUApprox(nn.Module):
@@ -55,6 +55,8 @@ class FeedForward(nn.Module):
         self.project_out = _linear_shell(bias=bias)
         self._project_in_weight_t: mx.array | None = None
         self._project_out_weight_t: mx.array | None = None
+        # Set by the loader for a resident transformer; see ``_mpp_projection``.
+        self.convert_mpp_weights = False
 
     def _target_dtype(self) -> mx.Dtype | None:
         if self._project_in_weight_t is not None:
@@ -64,15 +66,16 @@ class FeedForward(nn.Module):
         return None
 
     def _project_in(self, value: mx.array) -> mx.array:
-        projected = _projection(
+        projected = _mpp_projection(
             self.project_in.proj,
             value,
             self._project_in_weight_t,
+            convert=self.convert_mpp_weights,
         )
         return gelu_approx(projected)
 
     def _project_out(self, value: mx.array) -> mx.array:
-        return _projection(self.project_out, value, self._project_out_weight_t)
+        return _mpp_projection(self.project_out, value, self._project_out_weight_t)
 
     def __call__(self, value: mx.array) -> mx.array:
         if value.shape[-1] != self.dim:

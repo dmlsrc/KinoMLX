@@ -4,7 +4,8 @@ import mlx.core as mx
 
 from kinomlx.models.ltx2.precision import (
     LTX2DTypePolicy,
-    resolve_video_vae_decode_dtype,
+    VideoVAEDecodePrecision,
+    resolve_video_vae_decode_precision,
 )
 
 
@@ -34,9 +35,13 @@ def test_default_reference_policy_preserves_the_all_bfloat16_contract() -> None:
     }
 
 
-def test_video_vae_decode_dtype_is_recipe_aware_and_overridable() -> None:
-    assert resolve_video_vae_decode_dtype("auto", hdr=False, default=mx.bfloat16) == mx.bfloat16
-    assert resolve_video_vae_decode_dtype("auto", hdr=True, default=mx.bfloat16) == mx.float32
-    assert resolve_video_vae_decode_dtype("bfloat16", hdr=True, default=mx.float32) == mx.bfloat16
-    assert resolve_video_vae_decode_dtype("float16", hdr=False, default=mx.bfloat16) == mx.float16
-    assert resolve_video_vae_decode_dtype("float32", hdr=False, default=mx.bfloat16) == mx.float32
+def test_video_vae_decode_is_fp16_with_a_bfloat16_fallback_unless_requested() -> None:
+    assert resolve_video_vae_decode_precision("auto") == VideoVAEDecodePrecision(
+        mx.float16, mx.bfloat16
+    )
+    for requested, dtype in (
+        ("float16", mx.float16),
+        ("bfloat16", mx.bfloat16),
+        ("float32", mx.float32),
+    ):
+        assert resolve_video_vae_decode_precision(requested) == VideoVAEDecodePrecision(dtype, None)

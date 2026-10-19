@@ -38,7 +38,7 @@ assert "kinomlx.cli.config_arguments" in sys.modules
 assert "kinomlx.models.ltx2" in sys.modules
 assert not any(name.startswith("_kinomlx_") for name in sys.modules)
 
-from kinomlx.cli._registry import config_registry
+from kinomlx.model_registry import config_registry
 
 registry = config_registry()
 assert registry.models() == ("flux2", "gmnet", "krea2", "ltx2")

@@ -2,25 +2,24 @@
 
 import copy
 from collections.abc import Mapping
-from types import MappingProxyType
 from typing import cast
 
 from kinomlx.config_values import ConfigError
-from kinomlx.model_registry import config_registry
 
 from .paths import TargetPath, format_target_path
 from .provenance import FieldOrigin, PreparedConfig, SourceLocation
+from .registry import ModelConfigSpec
 
 RUN_SCHEMA_VERSION = 2
 CONFIGURATION_FORMAT = "kinomlx.configuration.v1"
 
 
-def configuration_payload(model: str, intent: PreparedConfig) -> dict[str, object]:
+def configuration_payload(schema: ModelConfigSpec, intent: PreparedConfig) -> dict[str, object]:
     """Serialize canonical intent, without substituting execution observations."""
-    config_registry().model(model).validate_persisted_values(intent.values)
+    schema.validate_persisted_values(intent.values)
     return {
         "format": CONFIGURATION_FORMAT,
-        "model": model,
+        "model": schema.model,
         "values": copy.deepcopy(intent.values),
         "explicit": [list(path) for path in sorted(intent.explicit, key=format_target_path)],
         "replacements": [
@@ -72,7 +71,9 @@ def _paths(value: object, values: Mapping[str, object], location: str) -> frozen
     return frozenset(paths)
 
 
-def read_configuration(payload: Mapping[str, object], *, model: str, source: str) -> PreparedConfig:
+def read_configuration(
+    payload: Mapping[str, object], *, schema: ModelConfigSpec, source: str
+) -> PreparedConfig:
     """Require the current run and configuration formats; no snapshot fallback exists."""
     if (
         type(payload.get("schema_version")) is not int
@@ -85,25 +86,25 @@ def read_configuration(payload: Mapping[str, object], *, model: str, source: str
     required = {"format", "model", "values", "explicit", "replacements"}
     if raw.keys() != required:
         raise ConfigError(f"{source}.configuration: expected fields {', '.join(sorted(required))}")
-    if raw["format"] != CONFIGURATION_FORMAT or raw["model"] != model:
+    if raw["format"] != CONFIGURATION_FORMAT or raw["model"] != schema.model:
         raise ConfigError(f"{source}.configuration: unsupported format or model")
     values = _mapping(raw["values"], f"{source}.configuration.values")
-    config_registry().model(model).validate_persisted_values(values)
+    schema.validate_persisted_values(values)
     explicit = _paths(raw["explicit"], values, f"{source}.configuration.explicit")
     replacements = _paths(raw["replacements"], values, f"{source}.configuration.replacements")
     origins = {
         path: FieldOrigin(path, "inherited", True, SourceLocation("saved", source))
         for path in explicit
     }
-    return PreparedConfig(values, MappingProxyType(origins), replacements)
+    return PreparedConfig(values, frozendict(origins), replacements)
 
 
 def rebase_configuration(intent: PreparedConfig, values: dict[str, object]) -> PreparedConfig:
-    """Retain metadata for surviving inputs after a station derives its replay context."""
+    """Retain metadata for surviving inputs after a stage derives its replay context."""
 
     return PreparedConfig(
         copy.deepcopy(values),
-        MappingProxyType(
+        frozendict(
             {path: origin for path, origin in intent.origins.items() if _contains(values, path)}
         ),
         frozenset(path for path in intent.replacements if _contains(values, path)),

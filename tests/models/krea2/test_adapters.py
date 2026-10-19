@@ -11,6 +11,7 @@ import pytest
 
 import kinomlx.models.krea2.adapters.loading as adapter_loading
 from kinomlx.adapters.live import live_adapters
+from kinomlx.adapters.scaling import UNKNOWN_SCALE_WARNING
 from kinomlx.adapters.schedule import AdapterSchedule, parse_sigma_window
 from kinomlx.adapters.selection import AdapterSelection
 from kinomlx.io.safetensors import save_weights
@@ -25,8 +26,9 @@ from kinomlx.models.krea2.sampling import Krea2PreparedBranch, Krea2Recipe, deno
 from kinomlx.models.krea2.transformer.loading import transformer_weight_targets
 from kinomlx.models.krea2.transformer.model import Krea2Transformer
 from kinomlx.models.krea2.types import Krea2Request
+from tests.adapters._snapshot import link_as_snapshot
 
-from ._transformer_fixtures import populate_transformer, tiny_transformer_config
+from .transformer._fixtures import populate_transformer, tiny_transformer_config
 
 
 def _model(*, reference=False, dtype=mx.float32):
@@ -479,15 +481,53 @@ def test_embedded_diffusers_export_uses_peft_alpha_over_rank(tmp_path, component
     assert receipt.variant_pairing == "recommended-raw-to-turbo"
 
 
-def test_peft_export_requires_scaling_configuration(tmp_path) -> None:
+def test_peft_export_without_configuration_warns_and_applies_unscaled(tmp_path, caplog) -> None:
     model = _model()
     original = model.transformer_blocks[0].attn.to_k.weight
     selected = _adapter(
         tmp_path / "adapter_model.safetensors", "base_model.model.transformer_blocks.0.attn.to_k"
     )
-    with pytest.raises(ValueError, match="requires the adjacent adapter_config.json"):
-        _apply_krea2_adapters(model, (selected,), variant="turbo")
-    assert model.transformer_blocks[0].attn.to_k.weight is original
+    with caplog.at_level(logging.INFO, logger="kinomlx.models.krea2.adapters.loading"):
+        (receipt,) = _apply_krea2_adapters(model, (selected,), variant="turbo")
+    assert mx.allclose(model.transformer_blocks[0].attn.to_k.weight, original + 0.04).item()
+    assert receipt.warnings == (UNKNOWN_SCALE_WARNING,)
+    assert receipt.scale_source is None
+    assert f"adapter_model.safetensors: {UNKNOWN_SCALE_WARNING}" in caplog.text
+    assert not [message for message in caplog.messages if ": scale " in message]
+
+
+def test_snapshot_linked_peft_export_applies_its_configured_scale(tmp_path, caplog) -> None:
+    model = _model()
+    original = model.transformer_blocks[0].attn.to_k.weight
+    export = tmp_path / "export"
+    export.mkdir()
+    _adapter(
+        export / "adapter_model.safetensors", "base_model.model.transformer_blocks.0.attn.to_k"
+    )
+    (export / "adapter_config.json").write_text(
+        json.dumps({"peft_type": "LORA", "r": 2, "lora_alpha": 8})
+    )
+    weights, _config = link_as_snapshot(
+        tmp_path / "hub",
+        export / "adapter_model.safetensors",
+        export / "adapter_config.json",
+        folder="lora",
+    )
+    with caplog.at_level(logging.INFO, logger="kinomlx.models.krea2.adapters.loading"):
+        (receipt,) = _apply_krea2_adapters(
+            model, (AdapterSelection(weights, 0.5),), variant="turbo"
+        )
+    assert mx.allclose(
+        model.transformer_blocks[0].attn.to_k.weight, original + 0.5 * 0.04 * 4
+    ).item()
+    assert receipt.scale_source == "adapter_config.json"
+    assert receipt.intrinsic_scales == (4.0,)
+    assert receipt.to_metadata()["intrinsic_scales"] == [4.0]
+    assert receipt.warnings == ()
+    assert (
+        "Krea 2 adapter adapter_model.safetensors: scale 4 from adapter_config.json "
+        "(lora_alpha=8, r=2); effective 2 at strength 0.5" in caplog.messages
+    )
 
 
 @pytest.mark.parametrize("on_input", [False, True])

@@ -17,10 +17,10 @@ from kinomlx.media.signals import (
     ColorPrimaries,
     ColorTransfer,
     ExrDeliverySpec,
-    ExrSampleType,
     OutputColorPlan,
+    SampleDType,
 )
-from kinomlx.models.ltx2.generation import GenerationOutput
+from kinomlx.models.ltx2.generation import LTX2GenerationOutput
 from kinomlx.models.ltx2.signals import ltx_hdr_working_signal
 from kinomlx.output import HDRGenerationSink
 from kinomlx.videotoolbox.exr import read_exr_frame
@@ -49,7 +49,7 @@ def test_hdr_working_stream_reaches_lossless_exr_and_tagged_hlg(
         height=64,
         fps=24.0,
     )
-    generation = GenerationOutput(
+    generation = LTX2GenerationOutput(
         frames=VideoFrameStream(lambda: iter((codes,)), spec=signal, frame_count=1)
     )
     output = tmp_path / f"{transfer.value}.mp4"
@@ -59,7 +59,7 @@ def test_hdr_working_stream_reaches_lossless_exr_and_tagged_hlg(
             ExrDeliverySpec(
                 primaries=primaries,
                 transfer=ColorTransfer.LINEAR,
-                sample_type=ExrSampleType.FLOAT16,
+                sample_type=SampleDType.FLOAT16,
                 color_space_tag="linear-master",
             ),
             BT2020_HLG_DELIVERY,

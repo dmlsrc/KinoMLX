@@ -8,9 +8,10 @@ from kinomlx.models.ltx2.sigmas import (
     DISTILLED_STAGE_2_SIGMAS,
     stage_sigmas,
 )
-from kinomlx.models.ltx2.types import DistilledRequest
+from kinomlx.models.ltx2.types import LTX2Request
+from kinomlx.models.ltx2.vocabularies import LTX2StageSampler
 
-_DECLARED = "deterministic"
+_PUBLISHED = (LTX2StageSampler.DETERMINISTIC, LTX2StageSampler.DETERMINISTIC)
 
 
 def test_no_override_returns_both_pinned_schedules() -> None:
@@ -52,7 +53,7 @@ def test_a_malformed_stage_array_is_rejected(values, stage) -> None:
 
 
 def test_announced_facts_report_both_schedules_and_their_step_counts() -> None:
-    facts = sampling_facts(DistilledRequest(prompt="p"), _DECLARED)
+    facts = sampling_facts(LTX2Request(prompt="p"), _PUBLISHED)
     assert facts["stage_1_sigmas"] == list(DISTILLED_STAGE_1_SIGMAS)
     assert facts["stage_2_sigmas"] == list(DISTILLED_STAGE_2_SIGMAS)
     assert (facts["stage_1_steps"], facts["stage_2_steps"]) == (8, 3)
@@ -60,8 +61,8 @@ def test_announced_facts_report_both_schedules_and_their_step_counts() -> None:
 
 
 def test_announced_facts_mark_an_override_and_its_new_step_count() -> None:
-    request = DistilledRequest(prompt="p", stage_2_sigmas=(0.9, 0.5, 0.0))
-    facts = sampling_facts(request, _DECLARED)
+    request = LTX2Request(prompt="p", stage_2_sigmas=(0.9, 0.5, 0.0))
+    facts = sampling_facts(request, _PUBLISHED)
     assert facts["sigma_source"] == "explicit"
     assert facts["stage_2_sigmas"] == [0.9, 0.5, 0.0]
     assert (facts["stage_1_steps"], facts["stage_2_steps"]) == (8, 2)

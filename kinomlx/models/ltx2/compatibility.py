@@ -30,6 +30,7 @@ from .metadata import (
     validate_transformer_header,
 )
 from .video_vae.config import VideoVAEConfig
+from .vocabularies import LTX2ModelGeneration
 
 
 @dataclass(frozen=True)
@@ -70,7 +71,7 @@ class LTX2CompatibilityReport:
     duration_head: DurationHeadConfig | None
 
     @property
-    def model_generation(self) -> str:
+    def model_generation(self) -> LTX2ModelGeneration:
         return self.checkpoint.model_generation
 
 

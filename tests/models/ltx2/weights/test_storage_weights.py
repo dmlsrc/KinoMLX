@@ -11,8 +11,7 @@ from kinomlx.io.safetensors import load_weights, read_dtypes, read_header
 from kinomlx.models.ltx2.weights.dtypes import normalize_transformer_dtypes
 from kinomlx.models.ltx2.weights.schema import (
     QUANT_KEY_PREFIX,
-    TRANSFORMER_QUANTIZE_MXFP8_BLOCKS,
-    TRANSFORMER_QUANTIZE_MXFP8_BLOCKS_PRETRANSPOSE,
+    TransformerQuantize,
 )
 from kinomlx.models.ltx2.weights.tensors import (
     checkpoint_has_fp8_tensors,
@@ -181,7 +180,7 @@ def test_quant_routing_covers_whole_block_and_targeted_ff_modes() -> None:
     assert (
         quant_mode_for_key(
             attention,
-            transformer_quantize=TRANSFORMER_QUANTIZE_MXFP8_BLOCKS,
+            transformer_quantize=TransformerQuantize.MXFP8_BLOCKS,
             video_ff_quantize_specs=(),
             video_ff_quantize_layers=(),
         )
@@ -205,7 +204,7 @@ def test_quant_routing_covers_whole_block_and_targeted_ff_modes() -> None:
         )
         is None
     )
-    assert quant_pretransposed(TRANSFORMER_QUANTIZE_MXFP8_BLOCKS_PRETRANSPOSE)
+    assert quant_pretransposed(TransformerQuantize.MXFP8_BLOCKS_PRETRANSPOSE)
     assert quant_defaults("mxfp8", None, None) == (32, 8)
     assert quant_defaults("affine", 128, 6) == (128, 6)
     with pytest.raises(ValueError, match="must be positive"):

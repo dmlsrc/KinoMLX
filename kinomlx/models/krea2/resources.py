@@ -16,6 +16,7 @@ from kinomlx.modeling.artifacts import (
     inspect_tokenizer_source,
     inspect_weight_source,
 )
+from kinomlx.modeling.dtypes import DTypeDirective, DTypePolicy
 from kinomlx.settings import Settings
 from kinomlx.tokenizers.byte_bpe import QWEN_TOKENIZER_TABLE_POLICY
 
@@ -270,7 +271,7 @@ def _component_resource(
     source: WeightSource,
     bindings: tuple[KeyBinding, ...],
     graph_fingerprint: str,
-    dtype_policy: str,
+    dtype_policy: DTypePolicy,
     layout: str | None = None,
 ) -> Krea2ComponentResource:
     return Krea2ComponentResource(
@@ -296,7 +297,7 @@ def _tokenizer_resource(
         layout=SourceLayout.TOKENIZER.value,
         source_fingerprint=source.source_fingerprint,
         graph_fingerprint=QWEN_TOKENIZER_TABLE_POLICY,
-        dtype_policy="json",
+        dtype_policy=DTypeDirective.JSON,
         tensor_count=0,
         tokenizer_json=source.tokenizer_json,
         tokenizer_config=source.tokenizer_config,
@@ -443,7 +444,7 @@ def prepare_resources(
         source=text_source,
         bindings=text_keys,
         graph_fingerprint=text_graph,
-        dtype_policy="source",
+        dtype_policy=DTypeDirective.SOURCE,
     )
     transformer = _component_resource(
         kind=Krea2ComponentKind.TRANSFORMER,

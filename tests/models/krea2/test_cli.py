@@ -1,6 +1,7 @@
 """Complete Krea 2 command configuration, sidecar, and failure behavior."""
 
 import json
+import logging
 import tomllib
 from pathlib import Path
 
@@ -10,13 +11,17 @@ import pytest
 from kinomlx.cli.main import main
 from kinomlx.config import ConfigError
 from kinomlx.io.fingerprints import file_sha256
+from kinomlx.model_registry import config_registry
 from kinomlx.models.krea2.arguments import build_parser
 from kinomlx.models.krea2.command import _log_request
 from kinomlx.models.krea2.config import assemble
+from kinomlx.models.krea2.resources import prepare_resources
 from kinomlx.models.krea2.restart import RestartConfig, load_restart_manifest
-from kinomlx.models.krea2.settings import Krea2Settings
+from kinomlx.models.krea2.settings import OPTIMIZED_DENOISE_MODE, Krea2Settings
 from kinomlx.settings import Settings
 from tests.config.saved_records import saved_run_configuration
+
+from ._fixtures import make_snapshot
 
 
 class _FakeReporter:
@@ -387,8 +392,7 @@ def test_krea_cli_restart_records_parent_and_skips_generated_tensors(
 
     record = json.loads((tmp_path / "decoded_run.json").read_text(encoding="utf-8"))
     assert record["status"] == "completed"
-    assert record["restart"]["phase"] == "decode"
-    assert record["restart"]["latent_stage"] == "final"
+    assert record["restart"]["stage"] == "decode"
     assert record["restart"]["source_run"] == str(source_run)
     assert record["restart"]["inputs"]["final_latents"]["path"] == str(latent)
     assert record["generation"]["execution_mode"] == "restart-decode"
@@ -451,7 +455,7 @@ def test_krea_cli_denoise_restart_records_saved_text_input(
 
     def fake_run(invocation, _reporter, *, plan, reservation, output_sink):
         assert invocation.restart is not None
-        assert invocation.restart.config.phase == "denoise"
+        assert invocation.restart.config.stage == "denoise"
         assert invocation.request.text_conditioning == text
         assert reservation.active
         assert plan.artifacts.text_conditioning == ()
@@ -487,13 +491,12 @@ def test_krea_cli_denoise_restart_records_saved_text_input(
     )
 
     record = json.loads((tmp_path / "rerolled_run.json").read_text(encoding="utf-8"))
-    assert record["restart"]["phase"] == "denoise"
-    assert record["restart"]["latent_stage"] is None
+    assert record["restart"]["stage"] == "denoise"
     assert record["restart"]["inputs"]["text_conditioning"]["path"] == str(text)
     assert record["generation"]["execution_mode"] == "restart-denoise"
 
 
-@pytest.mark.parametrize("mode", ["sequential", "station", "resident"])
+@pytest.mark.parametrize("mode", ["sequential", "stage", "resident"])
 @pytest.mark.parametrize("failure", [None, KeyboardInterrupt, RuntimeError])
 def test_per_seed_outputs_and_logs_survive_success_or_interrupt(
     tmp_path, monkeypatch, mode, failure
@@ -583,7 +586,10 @@ def test_per_seed_outputs_and_logs_survive_success_or_interrupt(
     if failure is KeyboardInterrupt:
         # A canceled run is restartable for the image it finished. Its digests
         # were keyed by the planned count, so the receipt still matches.
-        manifest = load_restart_manifest(RestartConfig(run=source, phase="decode", index=1))
+        manifest = load_restart_manifest(
+            RestartConfig(run=source, stage="decode", index=1),
+            schema=config_registry().model("krea2"),
+        )
         assert manifest.selected_latents == (
             tmp_path / "result-001-seed9_final_latents.safetensors"
         )
@@ -591,9 +597,122 @@ def test_per_seed_outputs_and_logs_survive_success_or_interrupt(
         assert manifest.base_config().values["generate"]["seed"] == 9
         # Image 2 was planned and never written.
         with pytest.raises(ConfigError, match="image 2 of 2 was not published before cancellation"):
-            load_restart_manifest(RestartConfig(run=source, phase="decode", index=2))
+            load_restart_manifest(
+                RestartConfig(run=source, stage="decode", index=2),
+                schema=config_registry().model("krea2"),
+            )
     elif failure is RuntimeError:
         # A failed run stopped for a reason it cannot describe; nothing it left
         # behind is offered to a restart.
         with pytest.raises(ConfigError, match="no completed final_latents output"):
-            load_restart_manifest(RestartConfig(run=source, phase="decode", index=1))
+            load_restart_manifest(
+                RestartConfig(run=source, stage="decode", index=1),
+                schema=config_registry().model("krea2"),
+            )
+
+
+def test_krea_dry_run_reports_the_inventory_and_reserves_no_output(
+    tmp_path: Path, capsys, caplog
+) -> None:
+    source = make_snapshot(tmp_path / "community", variant="turbo")
+    outputs = tmp_path / "renders"
+    arguments = [
+        "--model",
+        "krea2",
+        "--dry-run",
+        "--source-path",
+        str(source),
+        "--output-dir",
+        str(outputs),
+    ]
+
+    with caplog.at_level(logging.INFO, logger="kinomlx"):
+        assert main(arguments) == 0
+    assert "Resources" in caplog.text
+    assert capsys.readouterr().out == ""
+
+    assert main([*arguments, "--json"]) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["model"] == "krea2"
+    assert [entry["kind"] for entry in report["components"]] == [
+        "tokenizer",
+        "text_encoder",
+        "transformer",
+        "vae",
+    ]
+    assert not outputs.exists()
+
+
+def test_krea_without_generation_input_asks_for_a_prompt_or_a_dry_run(caplog) -> None:
+    """One resource-only entry point, named the way the other three name theirs.
+
+    A prompt-less Krea invocation used to inspect resources, which made the
+    flag and the omission two ways to reach one behavior. It is now the
+    located configuration error Klein, LTX and GMNet already produced, and it
+    names the flag that does inspect.
+    """
+    with caplog.at_level(logging.ERROR, logger="kinomlx"):
+        exit_code = main(["--model", "krea2"])
+
+    assert exit_code == 2
+    assert "config error: Krea 2 generation needs --prompt" in caplog.text
+    assert "--dry-run" in caplog.text
+    assert "Traceback" not in caplog.text
+
+
+def test_krea_dry_run_refuses_a_decoder_the_checkpoint_contradicts(tmp_path: Path, caplog) -> None:
+    """A rule only checkable against the checkpoint is still the user's mistake.
+
+    Krea detects its decoder from the VAE source, so this contradiction can
+    only surface inside preparation. The dry run reports it as a configuration
+    error rather than as a Krea failure.
+    """
+    source = make_snapshot(tmp_path / "community", variant="turbo")
+
+    with caplog.at_level(logging.ERROR, logger="kinomlx"):
+        exit_code = main(
+            [
+                "--model",
+                "krea2",
+                "--dry-run",
+                "--source-path",
+                str(source),
+                "--vae-path",
+                str(source / "vae"),
+                "--vae-decoder",
+                "upscale2x",
+            ]
+        )
+
+    assert exit_code == 2
+    assert "config error: [model_settings]:" in caplog.text
+    assert "contradicts" in caplog.text
+    assert "preparation failed" not in caplog.text
+
+
+def test_krea_console_and_report_name_the_denoiser_the_same_way(tmp_path: Path) -> None:
+    source = make_snapshot(tmp_path / "community", variant="turbo")
+    resources = prepare_resources(
+        Krea2Settings(source_path=source),
+        infrastructure=Settings(hf_home=tmp_path / "hf"),
+    )
+
+    assert resources.denoise_mode == OPTIMIZED_DENOISE_MODE
+    assert resources.describe()["denoise_mode"] == OPTIMIZED_DENOISE_MODE
+    assert Krea2Settings().denoise_mode == resources.denoise_mode
+
+
+@pytest.mark.parametrize(
+    "generation",
+    [
+        ["--prompt", "a still"],
+        ["--prompt-unconditional"],
+        ["--text-conditioning", "saved.safetensors"],
+    ],
+)
+def test_krea_dry_run_refuses_generation_input(generation: list[str]) -> None:
+    with pytest.raises(ConfigError, match="Resource-only operations"):
+        assemble(
+            build_parser().parse_args(["--dry-run", *generation]),
+            base_settings=Settings(),
+        )

@@ -15,6 +15,7 @@ import pytest
 
 from kinomlx.config_records import config_record, record_intent, supplied_fields
 from kinomlx.model_registry import config_registry
+from kinomlx.modeling.dtypes import FloatDType
 from kinomlx.models.flux2.settings import Flux2Settings
 from kinomlx.models.gmnet.settings import GMNetSettings
 from kinomlx.models.krea2.settings import Krea2Settings
@@ -97,11 +98,9 @@ def test_from_env_no_env_uses_field_defaults() -> None:
     assert infrastructure.profile_signposts is False
     assert infrastructure.profile_signpost_log is None
     assert model.fast_mode is True
-    assert model.transformer_dtype == "bfloat16"
-    assert model.steel_attention is True
-    assert model.steel_attention_d64 is True
-    assert model.steel_attention_probe is False
+    assert model.transformer_dtype == "float16"
     assert model.compile_attention is True
+    assert model.dense_attention_kernel is True
     assert model.weights_path is None
 
 
@@ -142,10 +141,8 @@ def test_from_env_parses_typed_values() -> None:
     os.environ["KINO_LTX2_FAST_MODE"] = "0"
     os.environ["KINO_LTX2_TRANSFORMER_RESIDENT_BLOCKS"] = "4"
     os.environ["KINO_LTX2_TRANSFORMER_DTYPE"] = "float16"
-    os.environ["KINO_LTX2_STEEL_ATTENTION"] = "0"
-    os.environ["KINO_LTX2_STEEL_ATTENTION_D64"] = "0"
-    os.environ["KINO_LTX2_STEEL_ATTENTION_PROBE"] = "1"
     os.environ["KINO_LTX2_COMPILE_ATTENTION"] = "0"
+    os.environ["KINO_LTX2_DENSE_ATTENTION_KERNEL"] = "0"
     os.environ["KINO_MLX_CACHE_LIMIT_GB"] = "2.5"
     os.environ["KINO_MLX_WIRED_LIMIT_GB"] = "48"
     os.environ["KINO_LTX2_VIDEO_FF_LAYOUT_SPECS"] = (
@@ -159,10 +156,8 @@ def test_from_env_parses_typed_values() -> None:
     assert model.fast_mode is False
     assert model.transformer_resident_blocks == 4
     assert model.transformer_dtype == "float16"
-    assert model.steel_attention is False
-    assert model.steel_attention_d64 is False
-    assert model.steel_attention_probe is True
     assert model.compile_attention is False
+    assert model.dense_attention_kernel is False
     assert infrastructure.mlx_cache_limit_gb == pytest.approx(2.5)
     assert infrastructure.mlx_wired_limit_gb == pytest.approx(48.0)
     assert Settings().mlx_wired_limit_gb is None
@@ -208,14 +203,6 @@ def test_pack_root_and_transformer_override_are_valid_config_intent() -> None:
     assert settings.uses_split_checkpoint
 
 
-def test_gemma_and_split_text_encoder_are_mutually_exclusive() -> None:
-    with pytest.raises(ValueError, match="cannot be combined"):
-        LTX2Settings(
-            gemma_path=Path("gemma"),
-            text_encoder_path=Path("text.safetensors"),
-        ).validate()
-
-
 def test_video_vae_override_does_not_select_split_pack() -> None:
     override = Path("video-vae.safetensors")
     settings = LTX2Settings(
@@ -246,7 +233,7 @@ def test_monolithic_primary_accepts_independent_component_overrides() -> None:
 
 
 def test_model_generation_rejects_unknown_binder() -> None:
-    with pytest.raises(ValueError, match="model_generation: must be one of: 2.3, 2.5"):
+    with pytest.raises(ValueError, match="expected one of '2.3', '2.5', got 'future'"):
         LTX2Settings(model_generation="future").validate()
 
 
@@ -278,11 +265,6 @@ def test_stream_transformer_preset_keeps_explicit_low_level_values() -> None:
     assert resolved.transformer_resident_blocks == 3
     assert resolved.transformer_compile_group_size == 2
     resolved.validate()
-
-
-def test_steel_probe_requires_steel_backend() -> None:
-    with pytest.raises(ValueError, match="steel_attention_probe requires"):
-        LTX2Settings(steel_attention=False, steel_attention_probe=True).validate()
 
 
 def test_signpost_log_requires_signposts() -> None:
@@ -447,7 +429,7 @@ def test_argparse_generation_can_skip_an_owned_setting() -> None:
 
 
 def test_gemma_variant_rejects_unknown_value() -> None:
-    with pytest.raises(ValueError, match="gemma_variant: must be one of: qat, plain"):
+    with pytest.raises(ValueError, match="expected one of 'qat', 'plain', got 'quantized'"):
         LTX2Settings(gemma_variant="quantized").validate()
 
 
@@ -518,27 +500,35 @@ def test_environment_boolean_rejects_misspellings(monkeypatch) -> None:
 
 
 def test_adapter_accumulation_choices_validation_and_auto_resolution() -> None:
-    with pytest.raises(ValueError, match="adapter_accumulation: must be one of"):
+    # Two refusals, reported differently: "half" is not in the vocabulary at
+    # all, so the type rejects it and names the members; "float16" is a member
+    # the transformer dtype does not admit, so the field rule rejects it.
+    with pytest.raises(ValueError, match="expected one of 'auto', 'float32', 'float16'"):
         LTX2Settings(adapter_accumulation="half").validate()
     with pytest.raises(ValueError, match="requires transformer_dtype=float16"):
-        LTX2Settings(adapter_accumulation="float16").validate()
-    LTX2Settings(adapter_accumulation="float16", transformer_dtype="float16").validate()
+        LTX2Settings(adapter_accumulation="float16", transformer_dtype="bfloat16").validate()
+    LTX2Settings(adapter_accumulation="float16").validate()
 
-    def resolved(**overrides: object) -> str:
+    def resolved(**overrides: object) -> FloatDType:
         return LTX2Settings(**overrides).resolved_adapter_accumulation()
 
-    assert resolved() == "float32"
-    assert resolved(transformer_dtype="float16") == "float32"
-    assert resolved(stream_transformer=True) == "float32"
-    assert resolved(stream_transformer=True, transformer_dtype="float16") == "float16"
-    assert resolved(transformer_resident_blocks=8, transformer_dtype="float16") == "float16"
+    # ``auto`` never survives resolution, so every answer is a dtype.
+    assert resolved() is FloatDType.FLOAT32
+    assert resolved(transformer_dtype="bfloat16") is FloatDType.FLOAT32
+    assert resolved(stream_transformer=True, transformer_dtype="bfloat16") is FloatDType.FLOAT32
+    assert resolved(stream_transformer=True) is FloatDType.FLOAT16
+    assert resolved(transformer_resident_blocks=8, transformer_dtype="float16") is (
+        FloatDType.FLOAT16
+    )
     assert (
         resolved(
             stream_transformer=True, transformer_dtype="float16", adapter_accumulation="float32"
         )
-        == "float32"
+        is FloatDType.FLOAT32
     )
-    assert resolved(transformer_dtype="float16", adapter_accumulation="float16") == "float16"
+    assert resolved(transformer_dtype="float16", adapter_accumulation="float16") is (
+        FloatDType.FLOAT16
+    )
 
 
 def test_environment_value_resolves_each_selected_source_once(monkeypatch):

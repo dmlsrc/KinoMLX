@@ -1,10 +1,13 @@
-"""Independent LTX station, output-context and public API ownership cases."""
+"""Independent LTX stage, output-context and public API ownership cases."""
 
+import json
+import logging
 from pathlib import Path
 from unittest.mock import Mock
 
 import pytest
 
+from kinomlx.cli.main import main
 from kinomlx.config import ConfigError
 from kinomlx.config_rules import validate_capabilities
 from kinomlx.models.ltx2 import config as ltx2_config
@@ -14,40 +17,41 @@ from kinomlx.models.ltx2.config import assemble, validate_for_execution
 from kinomlx.models.ltx2.config_schema import CONFIG_SCHEMA
 from kinomlx.models.ltx2.output import write_generation
 from kinomlx.models.ltx2.output_config import OutputConfig
-from kinomlx.models.ltx2.restart_rules import RESTART_PHASE_CHOICES
+from kinomlx.models.ltx2.restart_rules import RESTARTS
 from kinomlx.models.ltx2.settings import LTX2Settings
 from kinomlx.settings import Settings
 from tests.cli.test_restart import _assemble, _source_run
+from tests.models.ltx2.test_resources import _stub_compatibility
 
 
 def test_all_ltx_fields_have_explicit_reasons_and_direct_api_owners() -> None:
-    # The restart phase choices are the station names; nothing restates them.
-    assert CONFIG_SCHEMA.restart_stations is RESTART_PHASE_CHOICES
-    assert set(CONFIG_SCHEMA.restart_stations) == {"stage-2", "decode"}
+    # The restart stage choices are the stage names; nothing restates them.
+    assert CONFIG_SCHEMA.restart_stages is RESTARTS
+    assert set(CONFIG_SCHEMA.restart_stages) == {"stage-2", "decode"}
     for table in CONFIG_SCHEMA.tables:
         for field in table.fields:
             if field.virtual:
                 continue
-            assert {policy.station for policy in field.station_policies} == {
+            assert {policy.stage for policy in field.stage_policies} == {
                 "stage-2",
                 "decode",
             }, (*table.path, field.name)
-            assert all(policy.reason.strip() for policy in field.station_policies)
+            assert all(policy.reason.strip() for policy in field.stage_policies)
     operations = {
         boundary.operation.__qualname__: boundary.describe()
         for boundary in CONFIG_SCHEMA.api_boundaries
     }
     assert {
         "prepare_resources",
-        "generate_distilled",
-        "restart_distilled",
+        "generate_ltx2",
+        "restart_ltx2",
     } <= operations.keys()
-    generated = operations["generate_distilled"]["parameters"]
+    generated = operations["generate_ltx2"]["parameters"]
     conditioning = next(item for item in generated if item["name"] == "conditioning")
     assert conditioning["classification"] == "runtime"
     assert conditioning["serializable"] is False
     assert next(item for item in generated if item["name"] == "request")["table"] == "generate"
-    restart = operations["restart_distilled"]["parameters"]
+    restart = operations["restart_ltx2"]["parameters"]
     assert next(item for item in restart if item["name"] == "restart")["classification"] == (
         "runtime"
     )
@@ -57,20 +61,20 @@ def test_decode_keeps_equal_explicit_transformer_policy_but_rejects_change(
     tmp_path: Path,
 ) -> None:
     run, _ = _source_run(tmp_path)
-    same = _assemble(run, "--transformer-dtype", "bfloat16")
-    assert same.model_settings.transformer_dtype == "bfloat16"
+    same = _assemble(run, "--transformer-dtype", "float16")
+    assert same.model_settings.transformer_dtype == "float16"
     with pytest.raises(ConfigError, match=r"\[model_settings\]\.transformer_dtype"):
-        _assemble(run, "--transformer-dtype", "float16")
+        _assemble(run, "--transformer-dtype", "bfloat16")
     with pytest.raises(ConfigError, match=r"\[model_settings\]\.transformer_dtype"):
-        _assemble(run, "--set", 'model_settings.transformer_dtype="float16"')
+        _assemble(run, "--set", 'model_settings.transformer_dtype="bfloat16"')
 
 
 def test_stage_2_can_change_transformer_policy_but_not_parent_generation(
     tmp_path: Path,
 ) -> None:
     run, _ = _source_run(tmp_path)
-    resumed = _assemble(run, "--restart-from", "stage-2", "--transformer-dtype", "float16")
-    assert resumed.model_settings.transformer_dtype == "float16"
+    resumed = _assemble(run, "--restart-from", "stage-2", "--transformer-dtype", "bfloat16")
+    assert resumed.model_settings.transformer_dtype == "bfloat16"
     with pytest.raises(ConfigError, match=r"\[model_settings\]\.model_generation"):
         _assemble(run, "--restart-from", "stage-2", "--model-generation", "2.3")
 
@@ -88,8 +92,8 @@ def test_whole_record_toml_change_reaches_the_same_decode_lock(tmp_path: Path) -
     run, _ = _source_run(tmp_path)
     config = tmp_path / "replay.toml"
     config.write_text(
-        f'[restart]\nrun = "{run}"\nphase = "decode"\n'
-        '[model_settings]\ntransformer_dtype = "float16"\n',
+        f'[restart]\nrun = "{run}"\nstage = "decode"\n'
+        '[model_settings]\ntransformer_dtype = "bfloat16"\n',
         encoding="utf-8",
     )
     from kinomlx.models.ltx2.arguments import build_parser
@@ -198,8 +202,59 @@ def test_direct_resource_record_rule_runs_before_source_file_discovery(
         "_discover_generation_selection",
         lambda *_args: pytest.fail("invalid record reached source discovery"),
     )
-    with pytest.raises(ValueError, match="gemma_path and text_encoder_path cannot be combined"):
+    with pytest.raises(ValueError, match="transformer_retain requires transformer streaming"):
         resources.prepare_resources(
-            LTX2Settings(gemma_path=Path("gemma"), text_encoder_path=Path("text.safetensors")),
+            LTX2Settings(transformer_retain=("blocks.*",)),
             infrastructure=Settings(),
         )
+
+
+@pytest.mark.parametrize(
+    "generation",
+    [
+        ["--prompt", "a clip"],
+        ["--prompt-unconditional"],
+        ["--text-conditioning", "saved.safetensors"],
+    ],
+)
+def test_ltx_dry_run_refuses_generation_input(generation: list[str]) -> None:
+    with pytest.raises(ConfigError, match="Resource-only operations"):
+        assemble(
+            build_parser().parse_args(["--dry-run", *generation]),
+            base_settings=Settings(),
+        )
+
+
+def test_ltx_dry_run_reports_the_inventory_and_reserves_no_output(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys,
+    caplog,
+) -> None:
+    checkpoint = tmp_path / "model.safetensors"
+    checkpoint.touch()
+    outputs = tmp_path / "renders"
+    _stub_compatibility(monkeypatch, generation="2.3", embedded_video_vae=True)
+    monkeypatch.setattr(resources, "cached_snapshots", lambda *args: ())
+    monkeypatch.setenv("HF_HOME", str(tmp_path / "hf"))
+    arguments = [
+        "--model",
+        "ltx2",
+        "--dry-run",
+        "--weights-path",
+        str(checkpoint),
+        "--output-dir",
+        str(outputs),
+    ]
+
+    with caplog.at_level(logging.INFO, logger="kinomlx"):
+        assert main(arguments) == 0
+    assert "Resources" in caplog.text
+    assert capsys.readouterr().out == ""
+
+    assert main([*arguments, "--json"]) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["model"] == "ltx2"
+    assert report["source"] == str(checkpoint.absolute())
+    assert {entry["kind"] for entry in report["components"]} >= {"transformer", "video_vae"}
+    assert not outputs.exists()

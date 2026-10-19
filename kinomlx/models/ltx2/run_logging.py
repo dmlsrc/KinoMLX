@@ -16,10 +16,12 @@ from kinomlx.samplers.sigmas import render_sigmas
 
 from .adapters.selection import LTX2AdapterSelection
 from .config import Invocation
-from .pipelines.distilled import sampling_facts
+from .frame_position import parse_frame_position, resolve_frame_position
+from .pipelines.distilled import sampling_facts, stage_sampler_choices
 from .settings import LTX2Settings
 from .sigmas import stage_sigmas
-from .types import DistilledRequest
+from .types import LTX2ImageConditioningConfig, LTX2Request
+from .vocabularies import LTX2StageSampler
 
 
 def _stage_strength_details(selection: AdapterSelection) -> tuple[str, ...]:
@@ -36,6 +38,22 @@ def _stage_strength_details(selection: AdapterSelection) -> tuple[str, ...]:
     return tuple(
         f"stage {stage} strength={selection.strength_for_stage(stage):g}" for stage in (1, 2)
     )
+
+
+def _image_strength_detail(image: LTX2ImageConditioningConfig) -> str:
+    """Name one strength when both stages hold it, and both when they differ."""
+    stage_1, stage_2 = image.strength_for_stage(1), image.strength_for_stage(2)
+    if stage_1 == stage_2:
+        return f"strength={stage_1:g}"
+    return f"strength={stage_1:g} (stage 1) / {stage_2:g} (stage 2)"
+
+
+def _image_frame_detail(image: LTX2ImageConditioningConfig, frames: int | None) -> str:
+    """Spell the position the user wrote, adding the frame a name resolves to."""
+    spelling = image.frame_index
+    if frames is None or isinstance(parse_frame_position(spelling), int):
+        return spelling
+    return f"{spelling} ({resolve_frame_position(spelling, frames)})"
 
 
 def log_request(logger: logging.Logger, invocation: Invocation) -> None:
@@ -88,7 +106,7 @@ def log_request(logger: logging.Logger, invocation: Invocation) -> None:
         "Compute",
         (
             ("Transformer dtype", settings.transformer_dtype),
-            ("Attention", "STEEL" if settings.steel_attention else "MLX SDPA"),
+            ("Dense attention kernel", str(settings.dense_attention_kernel).lower()),
             ("Compile attention", str(settings.compile_attention).lower()),
             ("Fast mode", str(settings.fast_mode).lower()),
             ("Transformer residency", residency),
@@ -98,7 +116,19 @@ def log_request(logger: logging.Logger, invocation: Invocation) -> None:
             ("Quantization excluded layers", settings.transformer_quantize_exclude_layers),
             ("Video VAE", settings.video_vae),
             ("VAE decode dtype", request.vae_decode_dtype),
+            (
+                "VAE allocator cache",
+                request.vae_cache_limit_gb if request.vae_cache_limit_gb is not None else "auto",
+            ),
             ("VAE tiling", tiling),
+            (
+                "VAE sharpening",
+                (
+                    f"amount {request.vae_sharpen:g}, radius {request.vae_sharpen_radius:g} px"
+                    if request.vae_sharpen
+                    else "off"
+                ),
+            ),
             ("Prompt layout", "padded" if request.pad_prompt_to_max else "compact"),
         ),
     )
@@ -112,13 +142,14 @@ def log_request(logger: logging.Logger, invocation: Invocation) -> None:
         ),
         ("HDR authoring", request.hdr or "off"),
         ("Generated keyframes", request.generated_keyframes),
+        ("First frame mode", request.first_frame_mode),
     ]
-    if request.image is not None:
+    for index, image in enumerate(request.images, start=1):
         conditioning.append(
             (
-                "Input image",
-                f"{request.image.path}; frame={request.image.frame_index}; "
-                f"strength={request.image.strength:g}",
+                "Input image" if len(request.images) == 1 else f"Input image {index}",
+                f"{image.path}; frame={_image_frame_detail(image, request.frames)}; "
+                f"{_image_strength_detail(image)}",
             )
         )
     if request.hdr_reference is not None:
@@ -164,7 +195,7 @@ def log_request(logger: logging.Logger, invocation: Invocation) -> None:
             "Restart",
             (
                 ("Source run", invocation.restart.source_run),
-                ("Phase", invocation.restart.config.phase),
+                ("Stage", invocation.restart.config.stage),
                 ("Latent stage", invocation.restart.selected_latent_stage),
                 ("Latents", invocation.restart.selected_latents),
             ),
@@ -184,9 +215,57 @@ def _gemma_variant_label(family: str, model_settings: LTX2Settings | None) -> st
     """Name the Gemma 3 variant a run is conditioned with, or None when not applicable."""
     if model_settings is None or not family.startswith("gemma3"):
         return None
-    if model_settings.gemma_path is not None:
-        return f"explicit gemma_path ({model_settings.gemma_path})"
+    if model_settings.text_encoder_path is not None:
+        return f"explicit text_encoder_path ({model_settings.text_encoder_path})"
     return model_settings.gemma_variant
+
+
+def log_resources(
+    logger: logging.Logger,
+    resources: LTX2Resources,
+    *,
+    model_settings: LTX2Settings | None = None,
+) -> None:
+    """Announce one prepared inventory, for a run or for a resource-only dry run."""
+    checkpoint = resources.checkpoint
+    family = resources.capabilities.text_encoder_family
+    fields: list[tuple[str, object]] = [
+        ("Model", f"LTX-{checkpoint.model_generation} Distilled"),
+        ("Model generation", checkpoint.model_generation),
+        ("Model version", checkpoint.model_version or "undeclared"),
+        ("Checkpoint layout", checkpoint.layout.value),
+        ("Checkpoint", checkpoint.source_path),
+        ("Checkpoint fingerprint", checkpoint.source_fingerprint),
+        ("Text encoder", family),
+    ]
+    variant = _gemma_variant_label(family, model_settings)
+    if variant is not None:
+        fields.append(("Gemma variant", variant))
+    fields.append(("Video VAE", resources.capabilities.video_vae_kind))
+    log_section(logger, "Resources", fields)
+    log_section(
+        logger,
+        "Components",
+        (
+            (
+                component.kind.value,
+                "source="
+                + (
+                    "checkpoint"
+                    if component.source_path == checkpoint.source_path
+                    else str(component.source_path)
+                ),
+            )
+            for component in resources.components
+        ),
+    )
+    logger.debug(
+        "Component fingerprints: %s",
+        "; ".join(
+            f"{component.kind.value}={component.source_fingerprint}"
+            for component in resources.components
+        ),
+    )
 
 
 def log_runtime_resources(
@@ -194,62 +273,28 @@ def log_runtime_resources(
     runner: object,
     *,
     model_settings: LTX2Settings | None = None,
-    request: DistilledRequest | None = None,
+    request: LTX2Request | None = None,
 ) -> None:
     """Log prepared LTX-2 resources, when the runner exposes them, and the run's sampling."""
 
     resources = getattr(runner, "resources", None)
-    if not isinstance(resources, LTX2Resources):
-        resources = None
-    if resources is not None:
-        checkpoint = resources.checkpoint
-        family = resources.capabilities.text_encoder_family
-        fields: list[tuple[str, object]] = [
-            ("Model", f"LTX-{checkpoint.model_generation} Distilled"),
-            ("Model generation", checkpoint.model_generation),
-            ("Model version", checkpoint.model_version or "undeclared"),
-            ("Checkpoint layout", checkpoint.layout.value),
-            ("Checkpoint", checkpoint.source_path),
-            ("Checkpoint fingerprint", checkpoint.source_fingerprint),
-            ("Text encoder", family),
-        ]
-        variant = _gemma_variant_label(family, model_settings)
-        if variant is not None:
-            fields.append(("Gemma variant", variant))
-        fields.append(("Video VAE", resources.capabilities.video_vae_kind))
-        log_section(logger, "Resources", fields)
-        log_section(
-            logger,
-            "Components",
-            (
-                (
-                    component.kind.value,
-                    "source="
-                    + (
-                        "checkpoint"
-                        if component.source_path == checkpoint.source_path
-                        else str(component.source_path)
-                    ),
-                )
-                for component in resources.components
-            ),
-        )
-        logger.debug(
-            "Component fingerprints: %s",
-            "; ".join(
-                f"{component.kind.value}={component.source_fingerprint}"
-                for component in resources.components
-            ),
-        )
-    _log_sampling(logger, request, declared_sampler_policy(runner))
+    if isinstance(resources, LTX2Resources):
+        log_resources(logger, resources, model_settings=model_settings)
+    _log_sampling(logger, request, published_stage_samplers(runner))
+
+
+def _render_sampler(choice: Mapping[str, object]) -> str:
+    """``ancestral (auto)`` when the generation chose it, ``(requested)`` when the run did."""
+    origin = "auto" if choice.get("requested") == "auto" else "requested"
+    return f"{choice.get('effective')} ({origin})"
 
 
 def _log_sampling(
     logger: logging.Logger,
-    request: DistilledRequest | None,
-    declared_policy: str | None,
+    request: LTX2Request | None,
+    published: tuple[LTX2StageSampler, LTX2StageSampler] | None,
 ) -> None:
-    """Announce the run's sampling once: request facts always, policy when declared."""
+    """Announce the run's sampling once: request facts always, resolved samplers when known."""
     fields: list[tuple[str, object]] = []
     if request is not None:
         first, second = stage_sigmas(request.stage_1_sigmas, request.stage_2_sigmas)
@@ -261,58 +306,77 @@ def _log_sampling(
                 ("Stage 2 sigmas", render_sigmas(second)),
             )
         )
-        fields.append(("Requested sampler", request.sampler))
-        if declared_policy is not None:
-            facts = sampling_facts(request, declared_policy)
-            fields.append(("Policy", facts["sampler_policy"]))
-            fields.append(("Override", facts["sampler_override"] or "none"))
+        for stage, schedule in enumerate(request.sparse_attention_schedules(), start=1):
+            if schedule.active:
+                fields.append((f"Stage {stage} sparse attention", schedule.render()))
+        if published is None:
+            for stage, requested in enumerate(request.stage_samplers(), start=1):
+                fields.append((f"Stage {stage} sampler", requested.value))
+        else:
+            for stage, choice in enumerate(
+                stage_sampler_choices(request, published).values(), start=1
+            ):
+                fields.append((f"Stage {stage} sampler", _render_sampler(choice)))
         fields.append(("Noise backend", request.noise_backend))
         fields.append(("Noise compatibility", noise_compatibility_profile(request.noise_backend)))
-    elif declared_policy is not None:
-        fields.append(("Policy", declared_policy))
+    elif published is not None:
+        for stage, sampler in enumerate(published, start=1):
+            fields.append((f"Stage {stage} sampler", sampler.value))
     log_section(logger, "Sampling", fields)
 
 
-def declared_sampler_policy(runner: object) -> str | None:
-    """Return the prepared checkpoint's sampler policy when the runner exposes resources."""
+def published_stage_samplers(
+    runner: object,
+) -> tuple[LTX2StageSampler, LTX2StageSampler] | None:
+    """Return the prepared checkpoint's published samplers when the runner exposes resources."""
     resources = getattr(runner, "resources", None)
     if not isinstance(resources, LTX2Resources):
         return None
-    return resources.capabilities.sampler_policy
+    return resources.capabilities.stage_samplers
 
 
 def log_effective_sampling(
     logger: logging.Logger,
     metadata: Mapping[str, object],
     *,
-    request: DistilledRequest,
-    declared_policy: str | None,
+    request: LTX2Request,
+    published: tuple[LTX2StageSampler, LTX2StageSampler] | None,
 ) -> None:
     """Warn when a recipe's recorded sampler facts differ from the announced ones.
 
-    Without a declared policy nothing was announced, so there is nothing to check.
+    Without published samplers nothing was resolved and announced, so there is
+    nothing to check.
     """
-    if declared_policy is None:
+    if published is None:
         return
-    announced = sampling_facts(request, declared_policy)
+    announced = sampling_facts(request, published)
+    changed = []
+    recorded_samplers = metadata.get("samplers")
+    for stage, (key, choice) in enumerate(stage_sampler_choices(request, published).items(), 1):
+        recorded = recorded_samplers.get(key) if isinstance(recorded_samplers, Mapping) else None
+        if not isinstance(recorded, Mapping) or any(
+            recorded.get(field) != value for field, value in choice.items()
+        ):
+            shown = _render_sampler(recorded) if isinstance(recorded, Mapping) else recorded
+            changed.append(
+                f"Stage {stage} sampler: announced {_render_sampler(choice)!r}, recorded {shown!r}"
+            )
     labels = (
-        ("sampler_policy", "Policy"),
-        ("sampler_override", "Override"),
         ("noise_backend", "Noise backend"),
         ("noise_compatibility_profile", "Noise compatibility"),
     )
-    changed = [
+    changed.extend(
         f"{label}: announced {announced[key]!r}, recorded {metadata.get(key)!r}"
         for key, label in labels
         if metadata.get(key) != announced[key]
-    ]
+    )
     if changed:
         logger.warning("Sampling changed at run time: %s", "; ".join(changed))
 
 
 __all__ = [
-    "declared_sampler_policy",
     "log_effective_sampling",
     "log_request",
     "log_runtime_resources",
+    "published_stage_samplers",
 ]

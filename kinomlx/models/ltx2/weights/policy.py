@@ -30,16 +30,18 @@ def ensure_ff_pretranspose_for_dtype(
     specs: LayoutSpecs,
     dtype: mx.Dtype | None,
 ) -> LayoutSpecs:
-    """Add both FF pretranspose targets required by an FP16 FF path."""
+    """Add the FF down-projection pretranspose an FP16 FF path needs.
+
+    On the checkpoint's (out, in) weight MLX's FP16 GEMM reads the down projection along
+    16,384-element rows, 1.5 to 1.7 times slower from about 1,000 rows up. The up projection
+    keeps the checkpoint's layout, on which MPP runs it faster than MLX runs it pretransposed,
+    with the same bits.
+    """
     if dtype is None or dtype != mx.float16:
         return tuple(specs)
-    existing = {target for target, _layout in specs}
-    additions = tuple(
-        (target, "pretranspose")
-        for target in ("project_in", "project_out")
-        if target not in existing
-    )
-    return additions + tuple(specs)
+    if "project_out" in {target for target, _layout in specs}:
+        return tuple(specs)
+    return (("project_out", "pretranspose"), *specs)
 
 
 def normalize_layout_layers(

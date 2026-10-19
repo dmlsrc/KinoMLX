@@ -1,4 +1,4 @@
-"""Structural Krea text-conditioning station and reusable sidecar product."""
+"""Structural Krea text-conditioning stage and reusable sidecar product."""
 
 import gc
 import json
@@ -230,7 +230,7 @@ class Krea2TextConditioning:
     replay_receipt: Mapping[str, object] | None = None
 
 
-class Krea2TextConditioner(Protocol):
+class Krea2TextConditionerPort(Protocol):
     """Structural host port for native or caller-provided Krea conditioning."""
 
     def __call__(
@@ -708,7 +708,7 @@ def load_text_conditioning(
         )
 
 
-class NativeKrea2TextConditioner:
+class Krea2TextConditioner:
     """Load Qwen once, encode requested branches sequentially, then release it."""
 
     def __call__(
@@ -800,9 +800,9 @@ __all__ = [
     "TEXT_CONDITIONING",
     "Krea2PromptConditioning",
     "Krea2TextConditioner",
+    "Krea2TextConditionerPort",
     "Krea2TextConditioning",
     "Krea2TextConditioningProvenance",
-    "NativeKrea2TextConditioner",
     "PromptInput",
     "ReplayIdentityPolicy",
     "load_text_conditioning",

@@ -1,5 +1,6 @@
 """Installed LTX-2 generation command and operational error boundary."""
 
+import functools
 import logging
 import time
 from collections.abc import Mapping
@@ -19,6 +20,7 @@ from kinomlx.cli.presentation import (
     render_model_error,
     render_run_success,
 )
+from kinomlx.cli.resource_operation import report_resources
 from kinomlx.config import ConfigError
 from kinomlx.config.persistence import rebase_configuration
 from kinomlx.debug import (
@@ -40,7 +42,10 @@ from kinomlx.output import (
 from kinomlx.reporter_stack import command_reporter
 from kinomlx.reporting import Reporter, ScopedReporter, TimingReporter
 from kinomlx.settings import Settings
-from kinomlx.ui import configure_logging, configure_logging_from_settings
+from kinomlx.ui import (
+    configure_logging,
+    configure_logging_from_settings,
+)
 
 from .arguments import build_parser
 from .artifacts import (
@@ -48,17 +53,19 @@ from .artifacts import (
     sidecar_paths,
 )
 from .config import Invocation, assemble, effective_generate_config, resolve_for_execution
-from .generation import GenerationOutput
-from .kernels.steel_attention import steel_attention_summary
+from .generation import LTX2GenerationOutput
 from .output import write_generation
 from .output_config import sidecar_selection
-from .pipelines.distilled import DistilledConditioning, generate_distilled, prepare_distilled_recipe
-from .restart import DistilledRestart
+from .pipelines.distilled import DistilledConditioning, generate_ltx2, prepare_distilled_recipe
+from .resources import prepare_resources
+from .restart import LTX2Restart
+from .restart_rules import LTX2Stage
 from .run_logging import (
-    declared_sampler_policy,
     log_effective_sampling,
     log_request,
+    log_resources,
     log_runtime_resources,
+    published_stage_samplers,
 )
 from .runner import LTX2Runner
 from .settings import LTX2Settings
@@ -144,20 +151,17 @@ def _completed_outputs(
 
 
 def _runtime_diagnostics(
-    model_settings: LTX2Settings,
     *,
     reporter: TimingReporter,
-    generation: GenerationOutput | None,
+    generation: LTX2GenerationOutput | None,
 ) -> dict[str, object]:
-    """Collect allocator, lazy-output, and opt-in kernel diagnostics."""
+    """Collect allocator and lazy-output diagnostics."""
     diagnostics: dict[str, object] = {}
     memory = reporter.memory_to_dict()
     if memory:
         diagnostics["memory"] = memory
     if generation is not None:
         diagnostics.update(generation.runtime_diagnostics())
-    if model_settings.steel_attention_probe:
-        diagnostics["steel_attention"] = steel_attention_summary()
     return diagnostics
 
 
@@ -212,10 +216,20 @@ def run_ltx2_command(arguments: list[str]) -> int:
     if config_exit is not None:
         return config_exit
 
+    if invocation.operation.dry_run:
+        return report_resources(
+            invocation.model,
+            functools.partial(
+                prepare_resources, invocation.model_settings, infrastructure=invocation.settings
+            ),
+            log=functools.partial(log_resources, _log, model_settings=invocation.model_settings),
+            json_output=invocation.settings.json_output,
+        )
+
     seeds = invocation.request.selected_seeds()
     if invocation.restart is not None and len(seeds) != 1:
         return render_error(
-            "config error: saved-station restart requires one seed",
+            "config error: saved-stage restart requires one seed",
             json_output=invocation.settings.json_output,
         )
     planned: list[Invocation] = []
@@ -350,11 +364,11 @@ def _execute_invocation(
         invocation.model_artifacts,
         save_all=invocation.output.save_all_sidecars,
         has_media_conditioning=(
-            invocation.request.image is not None or invocation.request.hdr_reference is not None
+            bool(invocation.request.images) or invocation.request.hdr_reference is not None
         ),
-        station="generate" if invocation.restart is None else invocation.restart.config.phase,
+        stage=LTX2Stage.TEXT if invocation.restart is None else invocation.restart.config.stage,
         source_latent_stage=(
-            "final" if invocation.restart is None else invocation.restart.selected_latent_stage
+            None if invocation.restart is None else invocation.restart.selected_latent_stage
         ),
     )
     preexisting_sidecars = {
@@ -428,7 +442,7 @@ def _execute_invocation(
                 try:
                     run_record = RunRecord(
                         paths.run_log,
-                        model=invocation.model,
+                        schema=config_registry().model(invocation.model),
                         effective_config=invocation.resolved_config,
                         config_intent=invocation.config_intent,
                         argv=command_argv,
@@ -441,7 +455,7 @@ def _execute_invocation(
                 except SidecarError as exc:
                     sidecar_errors.append(sidecar_failure("run_log", paths.run_log, exc))
                     _log.warning("Could not initialize run log %s: %s", paths.run_log, exc)
-            generation: GenerationOutput | None = None
+            generation: LTX2GenerationOutput | None = None
             generation_warnings: tuple[str, ...] = ()
             reporter.memory_checkpoint("runner_start")
             try:
@@ -463,13 +477,13 @@ def _execute_invocation(
                     request=invocation.request,
                 )
                 if invocation.restart is not None:
-                    restart = DistilledRestart(
-                        phase=invocation.restart.config.phase,
+                    restart = LTX2Restart(
+                        stage=invocation.restart.config.stage,
                         latent_stage=invocation.restart.selected_latent_stage,
                         latents=invocation.restart.selected_latents,
                         text_conditioning=(
                             invocation.request.text_conditioning
-                            if invocation.restart.config.phase == "stage-2"
+                            if invocation.restart.config.stage == LTX2Stage.STAGE_2
                             else None
                         ),
                         source_model_generation=invocation.restart.source_model_generation,
@@ -477,7 +491,7 @@ def _execute_invocation(
                     generation = runner.restart(invocation.request, restart)
                 else:
                     generation = runner.run(
-                        partial(generate_distilled, conditioning=shared), invocation.request
+                        partial(generate_ltx2, conditioning=shared), invocation.request
                     )
                 reporter.memory_checkpoint("generation_ready")
                 generation_metadata = dict(generation.metadata)
@@ -496,7 +510,7 @@ def _execute_invocation(
                     _log,
                     generation_metadata,
                     request=invocation.request,
-                    declared_policy=declared_sampler_policy(runner),
+                    published=published_stage_samplers(runner),
                 )
                 output_path = write_generation(
                     generation,
@@ -530,7 +544,6 @@ def _execute_invocation(
                     sidecar_errors=sidecar_errors,
                 )
                 diagnostics = _runtime_diagnostics(
-                    invocation.model_settings,
                     reporter=reporter,
                     generation=generation,
                 )
@@ -575,7 +588,6 @@ def _execute_invocation(
                             output_fingerprints=artifact_sink.fingerprints,
                             output_fingerprint_errors=artifact_sink.fingerprint_errors,
                             diagnostics=_runtime_diagnostics(
-                                invocation.model_settings,
                                 reporter=reporter,
                                 generation=generation,
                             ),

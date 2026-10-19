@@ -4,7 +4,6 @@ import math
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from functools import partial
-from typing import Literal, Protocol
 
 import mlx.core as mx
 
@@ -22,25 +21,10 @@ from kinomlx.samplers.config import SigmaScheduleConstraint
 from kinomlx.samplers.sigmas import resolved_sigmas
 
 from .catalog import Flux2Variant
-from .conditioning import PreparableVelocityModel, PreparedVelocity
 from .kv import ReferenceKV
 from .recipe_rules import SAMPLING_RECIPE, recipe_values
-from .request_constraints import CFG_MODE, DENOISE_STEPS, GUIDANCE
-
-
-class VelocityModel(Protocol):
-    def __call__(
-        self,
-        image: mx.array,
-        text: mx.array,
-        timestep: mx.array,
-        image_ids: mx.array,
-        text_ids: mx.array,
-        *,
-        reference_kv: ReferenceKV | None = None,
-    ) -> mx.array: ...
-
-    def new_reference_kv(self, reference_tokens: int) -> ReferenceKV: ...
+from .request_constraints import CFG_MODE, DENOISE_STEPS, GUIDANCE, Flux2CFGMode
+from .velocity import PreparableVelocityModel, PreparedVelocity, VelocityModel
 
 
 def _unprepared_velocity(
@@ -77,8 +61,8 @@ class SamplingRecipe:
     )
     steps: int | None = field(default=None, metadata={"config_constraints": (DENOISE_STEPS,)})
     guidance: float | None = field(default=None, metadata={"config_constraints": (GUIDANCE,)})
-    cfg_mode: Literal["sequential", "batched"] = field(
-        default="sequential", metadata={"config_constraints": (CFG_MODE,)}
+    cfg_mode: Flux2CFGMode = field(
+        default=Flux2CFGMode.SEQUENTIAL, metadata={"config_constraints": (CFG_MODE,)}
     )
     recompute_reference_kv: bool = False
     sigmas: tuple[float, ...] = field(
@@ -213,7 +197,7 @@ def denoise(
             )
             conditioned = (
                 mx.concatenate([text, negative])
-                if negative is not None and recipe.cfg_mode == "batched"
+                if negative is not None and recipe.cfg_mode == Flux2CFGMode.BATCHED
                 else text
             )
             (predict,) = _prepare_velocities(model, conditioned, (ids,), text_ids)
@@ -250,7 +234,7 @@ def denoise(
                     current,
                     timestep,
                     references,
-                    negative is not None and recipe.cfg_mode == "batched",
+                    negative is not None and recipe.cfg_mode == Flux2CFGMode.BATCHED,
                     guidance,
                 )
             current = euler_step(current, velocity, sigmas[index + 1] - sigmas[index])

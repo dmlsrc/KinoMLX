@@ -8,6 +8,7 @@ import mlx.core as mx
 import kinomlx._mlx_nn as nn
 
 from ..adapters.receipt import LTX2AdapterReceipt
+from ..sparse_attention import SparseAttentionStep
 
 
 @dataclass(frozen=True)
@@ -16,7 +17,8 @@ class Modality:
 
     ``timesteps`` remains per token because conditioning can freeze only part
     of a latent. ``sigma`` remains a separate batch scalar for prompt AdaLN and
-    the other stream's A/V cross-attention gate.
+    the other stream's A/V cross-attention gate. ``sparse_attention`` makes this
+    stream's self-attention sparse outside its dense layers; only video uses it.
     """
 
     latent: mx.array
@@ -30,6 +32,7 @@ class Modality:
     keyframes_mask: mx.array | None = None
     positional_embeddings: tuple[mx.array, mx.array] | None = None
     cross_positional_embeddings: tuple[mx.array, mx.array] | None = None
+    sparse_attention: SparseAttentionStep | None = None
 
 
 class _VelocityModel(Protocol):

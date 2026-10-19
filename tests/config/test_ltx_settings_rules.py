@@ -15,24 +15,14 @@ from kinomlx.models.ltx2.settings import LTX2Settings
     ("invalid", "repair", "message"),
     [
         (
-            {"gemma_path": "gemma", "text_encoder_path": "encoder"},
-            {"gemma_path": None},
-            "gemma_path and text_encoder_path cannot be combined",
-        ),
-        (
             {"transformer_retain": ("blocks.*",)},
             {"stream_transformer": True},
             "transformer_retain requires transformer streaming",
         ),
         (
-            {"adapter_accumulation": "float16"},
+            {"adapter_accumulation": "float16", "transformer_dtype": "bfloat16"},
             {"transformer_dtype": "float16"},
             "adapter_accumulation=float16 requires transformer_dtype=float16",
-        ),
-        (
-            {"steel_attention_probe": True, "steel_attention": False},
-            {"steel_attention": True},
-            "steel_attention_probe requires steel_attention=true",
         ),
         (
             {"audio_ff_layout_specs": ("project_out:pretranspose",)},
@@ -60,10 +50,8 @@ def test_each_ltx_policy_runs_after_local_admission_and_can_be_repaired(invalid,
 
 def test_all_ltx_settings_policies_have_one_declared_identity():
     assert {rule.name for rule in record_rules(LTX2Settings)} == {
-        "text_sources",
         "retention",
         "adapter_precision",
-        "attention_probe",
         "audio_layout",
         "quantization",
         "compile_groups",

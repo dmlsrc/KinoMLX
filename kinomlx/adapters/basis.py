@@ -4,7 +4,7 @@ import math
 
 import mlx.core as mx
 
-from .formats import AdapterOperation
+from .formats import AdapterKind, AdapterOperation
 
 
 def _shape(value: mx.array, shape: tuple[int, ...], name: str) -> mx.array:
@@ -20,15 +20,15 @@ def basis_delta(operation: AdapterOperation, base: mx.array) -> mx.array:
     out, inp = base.shape
     rank = options.rank
     factors = operation.factors
-    if operation.kind == "tinylora":
+    if operation.kind == AdapterKind.TINYLORA:
         down = _shape(factors["A"], (rank, inp), "TinyLoRA A")
         up = _shape(factors["B"], (out, rank), "TinyLoRA B")
         rotation = mx.einsum(
             "i,ijk->jk", factors["v"].astype(mx.float32), factors["P"].astype(mx.float32)
         )
         return (up @ rotation) @ down
-    if operation.kind in ("vera", "pvera"):
-        count = rank * (2 if operation.kind == "pvera" else 1)
+    if operation.kind in (AdapterKind.VERA, AdapterKind.PVERA):
+        count = rank * (2 if operation.kind == AdapterKind.PVERA else 1)
         down, up = factors["A"], factors["B"]
         if (
             down.ndim != 2
@@ -44,7 +44,7 @@ def basis_delta(operation: AdapterOperation, base: mx.array) -> mx.array:
         return (up[:out].astype(mx.float32) * scale_b[:, None]) @ (
             down[:rank, :inp].astype(mx.float32) * scale_d[:, None]
         )
-    if operation.kind == "randlora":
+    if operation.kind == AdapterKind.RANDLORA:
         small, large = min(inp, out), max(inp, out)
         count = math.ceil(small / rank)
         down, up = factors["A"], factors["B"]
@@ -67,7 +67,7 @@ def basis_delta(operation: AdapterOperation, base: mx.array) -> mx.array:
         # (basis, rank). Preserve that ordering, including unequal dimensions.
         delta = b.reshape(large, -1) @ a.reshape(-1, small)
         return (delta if inp == small else delta.T) * options.scale
-    if operation.kind == "unilora":
+    if operation.kind == AdapterKind.UNILORA:
         theta = factors["theta_d"].astype(mx.float32)
         matrices = []
         for side, shape in (("A", (rank, inp)), ("B", (out, rank))):
@@ -77,7 +77,7 @@ def basis_delta(operation: AdapterOperation, base: mx.array) -> mx.array:
             scales = _shape(factors[f"scales_{side}"], shape, f"UniLoRA {side} scales")
             matrices.append(theta[indices.astype(mx.int32)] * scales)
         return matrices[1] @ matrices[0]
-    if operation.kind != "vblora":
+    if operation.kind != AdapterKind.VBLORA:
         raise ValueError(f"{operation.kind} has no shared-basis equation")
     width = options.block_size
     if inp % width or out % width:

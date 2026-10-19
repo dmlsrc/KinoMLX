@@ -1,9 +1,17 @@
 """Ordered seed selection shared by every generation family."""
 
-from typing import Literal
+from enum import StrEnum
 
-SeedMode = Literal["sequential", "station", "resident"]
-SEED_MODES = ("sequential", "station", "resident")
+
+class SeedMode(StrEnum):
+    """How component lifetimes are shared across the seeds of one request."""
+
+    SEQUENTIAL = "sequential"
+    STAGE = "stage"
+    RESIDENT = "resident"
+
+
+SEED_MODES = tuple(item.value for item in SeedMode)
 
 
 def resolve_seeds(seed: int, seeds: tuple[int, ...] | None, count: int = 1) -> tuple[int, ...]:

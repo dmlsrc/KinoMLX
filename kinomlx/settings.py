@@ -23,7 +23,7 @@ from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import ClassVar, Self, Union, cast, get_args, get_origin, get_type_hints
 
-from kinomlx.config_bindings import CliBinding
+from kinomlx.config_bindings import CliAction, CliBinding
 from kinomlx.config_constraints import NumberConstraint
 from kinomlx.config_records import config_record, construct_record, replace_config
 from kinomlx.config_rules import RecordRule, validate_record
@@ -180,7 +180,7 @@ def _settings_cli_binding(
     return CliBinding(
         group=title,
         flags=_cli_flags(item),
-        action="paired_boolean" if is_bool else "store",
+        action=CliAction.PAIRED_BOOLEAN if is_bool else CliAction.STORE,
         parse=None if is_bool else _parser_for(annotation),
     )
 

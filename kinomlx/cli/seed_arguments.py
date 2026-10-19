@@ -85,8 +85,8 @@ def seed_fields(*, image: bool) -> tuple[ConfigFieldSpec, ...]:
                 cli=CliBinding("Generation"),
                 choices=SEED_MODES,
                 choice_help=(
-                    ("sequential", "Complete each seed with normal station lifetimes"),
-                    ("station", "Process seeds sequentially inside each loaded station"),
+                    ("sequential", "Complete each seed with normal stage lifetimes"),
+                    ("stage", "Process seeds sequentially inside each loaded stage"),
                     ("resident", "Complete each seed while retaining transformer and VAE"),
                 ),
                 surfaces=CONFIG_SURFACES,

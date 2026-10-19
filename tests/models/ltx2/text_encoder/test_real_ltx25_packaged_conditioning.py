@@ -267,7 +267,7 @@ def test_real_ltx25_packaged_projection_and_connectors_match_reference() -> None
 
 
 @pytest.mark.heavy
-def test_real_ltx25_prompt_station_matches_packaged_context(tmp_path: Path) -> None:
+def test_real_ltx25_prompt_stage_matches_packaged_context(tmp_path: Path) -> None:
     text_checkpoint = _required_path("KINO_LTX25_TEXT_ENCODER_PATH")
     transformer_checkpoint = _required_path("KINO_LTX25_TRANSFORMER_PATH")
     fixture_dir = _required_path("KINO_LTX25_CONDITIONING_FIXTURE_DIR", directory=True)
@@ -279,7 +279,7 @@ def test_real_ltx25_prompt_station_matches_packaged_context(tmp_path: Path) -> N
         )
         output = encode_prompt(
             "A lighthouse in sea mist",
-            gemma_path=text_checkpoint,
+            text_encoder_path=text_checkpoint,
             projection_path=text_checkpoint,
             connector_path=transformer_checkpoint,
             config_path=transformer_checkpoint,
@@ -343,7 +343,7 @@ def test_real_ltx25_prompt_corpus_matches_reference(tmp_path: Path) -> None:
 
             output = encode_prompt(
                 prompt,
-                gemma_path=text_checkpoint,
+                text_encoder_path=text_checkpoint,
                 projection_path=text_checkpoint,
                 connector_path=transformer_checkpoint,
                 config_path=transformer_checkpoint,
@@ -394,7 +394,7 @@ def test_real_ltx25_default_padding_geometry_matches_reference(tmp_path: Path) -
         )
         output = encode_prompt(
             "A lighthouse in sea mist",
-            gemma_path=text_checkpoint,
+            text_encoder_path=text_checkpoint,
             projection_path=text_checkpoint,
             connector_path=transformer_checkpoint,
             config_path=transformer_checkpoint,

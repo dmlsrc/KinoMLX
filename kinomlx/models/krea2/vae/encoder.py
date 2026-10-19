@@ -4,6 +4,7 @@ import mlx.core as mx
 
 import kinomlx._mlx_nn as nn
 from kinomlx.kernels import silu
+from kinomlx.modeling.dtypes import FloatDType
 from kinomlx.reporting import NullReporter, Reporter
 
 from ..metadata import Krea2VAEConfig
@@ -63,7 +64,7 @@ class Krea2ImageEncoder(nn.Module):
     """
 
     def __init__(
-        self, config: Krea2VAEConfig, *, compute_dtype: str | mx.Dtype = mx.bfloat16
+        self, config: Krea2VAEConfig, *, compute_dtype: FloatDType | mx.Dtype = mx.bfloat16
     ) -> None:
         super().__init__()
         _validate_config(config)

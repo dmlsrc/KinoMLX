@@ -66,7 +66,18 @@ class ChromaSubsampling(StrEnum):
     YUV422 = "4:2:2"
 
 
-class ExrSampleType(StrEnum):
+class SampleDType(StrEnum):
+    """The float type a frame stream's samples carry.
+
+    This duplicates two of :class:`kinomlx.modeling.dtypes.FloatDType`'s
+    members on purpose. Importing that module executes the modeling package,
+    which reaches ``mlx.nn``, and ``mlx.nn`` calls ``mx.compile`` twenty-five
+    times at module scope for its activations. Those calls only build wrappers
+    and trace nothing until first use, so the cost is small; what a frame
+    conversion keeps is the narrower invariant that importing it reaches no
+    graph-building module at all, which ``tests/videotoolbox`` pins.
+    """
+
     FLOAT16 = "float16"
     FLOAT32 = "float32"
 
@@ -76,7 +87,7 @@ class VideoSignalSpec:
     """Immutable interpretation and geometry for one frame stream."""
 
     layout: VideoLayout
-    dtype: str
+    dtype: SampleDType
     value_domain: VideoValueDomain
     primaries: ColorPrimaries
     transfer: ColorTransfer
@@ -117,7 +128,7 @@ class ExrDeliverySpec:
 
     primaries: ColorPrimaries
     transfer: ColorTransfer
-    sample_type: ExrSampleType
+    sample_type: SampleDType
     color_space_tag: str
 
 
@@ -238,7 +249,7 @@ def validate_sdr_output_plan(plan: OutputColorPlan) -> None:
     source = plan.source
     if (
         source.layout is not VideoLayout.HWC_RGB
-        or source.dtype != "float16"
+        or source.dtype != SampleDType.FLOAT16
         or source.value_domain is not VideoValueDomain.NORMALIZED_SDR
         or source.primaries is not ColorPrimaries.REC709
         or source.transfer is not ColorTransfer.SRGB
@@ -266,8 +277,8 @@ __all__ = [
     "ColorTransfer",
     "EncodedVideoDeliverySpec",
     "ExrDeliverySpec",
-    "ExrSampleType",
     "OutputColorPlan",
+    "SampleDType",
     "UnsupportedSignalError",
     "VideoCodec",
     "VideoCodecProfile",

@@ -1,4 +1,4 @@
-"""Public Klein runner follows the shared host and saved-station contracts."""
+"""Public Klein runner follows the shared host and saved-stage contracts."""
 
 from dataclasses import replace
 from pathlib import Path
@@ -14,15 +14,16 @@ from kinomlx.models.flux2 import (
     Flux2Restart,
     Flux2Runner,
     Flux2Settings,
-    pipeline,
     runner,
 )
 from kinomlx.models.flux2.catalog import profile
 from kinomlx.models.flux2.generation import Flux2ImageResult
+from kinomlx.models.flux2.pipelines import restart as restart_pipeline
+from kinomlx.models.flux2.pipelines import text_to_image as pipeline
 from kinomlx.models.flux2.restart import PreparedResources
 from kinomlx.reporting import NullReporter
 
-from .test_stations import conditioning
+from .test_text_conditioning import conditioning
 
 
 def resources():
@@ -43,7 +44,7 @@ def test_settings_prepare_once_and_resources_never_reprepare(monkeypatch):
     prepared = resources()
     calls = []
     monkeypatch.setattr(
-        runner, "inspect_resources", lambda *a, **k: calls.append("inspect") or prepared
+        runner, "prepare_resources", lambda *a, **k: calls.append("inspect") or prepared
     )
     host = Flux2Runner(Flux2Settings())
     assert host.resources is prepared
@@ -63,7 +64,7 @@ def test_generate_batches_seed_order_and_retains_no_outputs(monkeypatch):
         yield None
         return result()
 
-    monkeypatch.setattr(pipeline, "image_stations", generate)
+    monkeypatch.setattr(pipeline, "image_stages", generate)
     reporter = NullReporter()
     host = Flux2Runner(resources=resources(), reporter=reporter)
     output = host.generate(Flux2Request(prompt=("first", "second"), images_per_prompt=2, seed=10))
@@ -93,9 +94,9 @@ def test_custom_recipe_and_operational_errors():
     assert error.value.__context__ is None
 
 
-def test_denoise_restart_loads_station_and_rejects_context_change(monkeypatch):
-    station = conditioning()
-    monkeypatch.setattr(pipeline, "load_conditioning", lambda *a: station)
+def test_denoise_restart_loads_stage_and_rejects_context_change(monkeypatch):
+    stage = conditioning()
+    monkeypatch.setattr(pipeline, "load_conditioning", lambda *a: stage)
     calls = []
 
     def generate(*args, **kwargs):
@@ -104,12 +105,12 @@ def test_denoise_restart_loads_station_and_rejects_context_change(monkeypatch):
         yield None
         return result()
 
-    monkeypatch.setattr(pipeline, "image_stations", generate)
+    monkeypatch.setattr(pipeline, "image_stages", generate)
     host = Flux2Runner(resources=resources())
-    restart = Flux2Restart(phase="denoise", text_conditioning=Path("text.safetensors"))
+    restart = Flux2Restart(stage="denoise", text_conditioning=Path("text.safetensors"))
     host.restart(Flux2Request(), restart)
-    assert calls[0]["conditioning"] is station
-    assert calls[0]["capture_stations"] is True
+    assert calls[0]["conditioning"] is stage
+    assert calls[0]["capture_stages"] is True
     with pytest.raises(Flux2Error, match="prompt does not match"):
         host.restart(Flux2Request(prompt="different"), restart)
 
@@ -117,9 +118,9 @@ def test_denoise_restart_loads_station_and_rejects_context_change(monkeypatch):
 def test_decode_restart_uses_only_vae_and_does_not_load_text(monkeypatch):
     prepared = replace(resources(), components=(resources().component("vae"),))
     latent = mx.zeros((1, 16, 128))
-    monkeypatch.setattr(pipeline, "load_final_latents", lambda path: (latent, 64, 64))
+    monkeypatch.setattr(restart_pipeline, "load_final_latents", lambda path: (latent, 64, 64))
     monkeypatch.setattr(pipeline, "load_conditioning", lambda *a: pytest.fail("text reopened"))
-    monkeypatch.setattr(pipeline, "decode_latents", lambda *a, **k: mx.zeros((64, 64, 3)))
+    monkeypatch.setattr(restart_pipeline, "decode_latents", lambda *a, **k: mx.zeros((64, 64, 3)))
     host = Flux2Runner(resources=prepared)
     output = host.restart(
         Flux2Request(text_conditioning=Path("deleted.safetensors")),
@@ -133,26 +134,26 @@ def test_decode_restart_uses_only_vae_and_does_not_load_text(monkeypatch):
 @pytest.mark.parametrize("editing", [False, True])
 def test_variations_reuse_conditioning_only_within_each_prompt(monkeypatch, editing):
     calls = []
-    stations = []
+    stages = []
 
     def generate(_resources, prompt, **kwargs):
-        station = kwargs["conditioning"]
-        calls.append((prompt, station, kwargs["images"], kwargs["reference_fit"]))
-        if station is None:
-            station = replace(conditioning(edit=editing), prompt=prompt)
-            stations.append(station)
-        yield station
+        stage = kwargs["conditioning"]
+        calls.append((prompt, stage, kwargs["images"], kwargs["reference_fit"]))
+        if stage is None:
+            stage = replace(conditioning(edit=editing), prompt=prompt)
+            stages.append(stage)
+        yield stage
         yield None
-        return replace(result(), conditioning=station)
+        return replace(result(), conditioning=stage)
 
-    monkeypatch.setattr(pipeline, "image_stations", generate)
+    monkeypatch.setattr(pipeline, "image_stages", generate)
     images = (Path("reference.png"),) if editing else ()
     request = Flux2Request(prompt=("first", "second"), images_per_prompt=2, source_images=images)
     output = pipeline.generate_flux2(request, resources())
     assert len(output.images) == 4
     assert calls == [
         ("first", None, images, request.reference_fit),
-        ("first", stations[0], (), None),
+        ("first", stages[0], (), None),
         ("second", None, images, request.reference_fit),
-        ("second", stations[1], (), None),
+        ("second", stages[1], (), None),
     ]

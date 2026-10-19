@@ -3,7 +3,9 @@
 The graph follows the Apache-2.0 Diffusers implementation. Neighborhood
 attention is evaluated with bounded query tiles and exact inward-shifted
 windows on stock MLX scaled-dot-product attention; no NATTEN, Triton, CuTe, or
-CUDA runtime is required.
+CUDA runtime is required. FP16 blocks of batch one take the kernel route of
+``diffusion_fused`` instead, which scores only the keys inside each window;
+the attention receipt records which path each call took.
 """
 
 import gc
@@ -21,6 +23,8 @@ import kinomlx._mlx_nn as nn
 from kinomlx._tensor_tree import TensorTree
 from kinomlx.io.safetensors import load_weights
 from kinomlx.kernels import rms_norm, silu
+from kinomlx.models.ltx2.kernels import diffusion_passes, neighborhood_attention
+from kinomlx.models.ltx2.vocabularies import DiffusionAttentionBackend, DiffusionKernelFallback
 from kinomlx.reporting import NullReporter, Reporter
 from kinomlx.samplers.noise import (
     NoiseStreamState,
@@ -29,9 +33,12 @@ from kinomlx.samplers.noise import (
 )
 from kinomlx.types import DEFAULT_NOISE_BACKEND, NoiseBackend
 
+from . import diffusion_fused
 from .config import VideoVAEConfig
+from .kinds import VideoVAEKind
 from .ops import PerChannelStatistics
-from .tiling import TilingConfig, TilingPlanReceipt
+from .sharpening import ContextSharpening
+from .tiling import TilingConfig, TilingPlanReceipt, tile_intervals
 
 _log = logging.getLogger(__name__)
 
@@ -172,9 +179,16 @@ def plan_attention_tiles(
 
 @dataclass
 class AttentionTilingStats:
-    """Runtime receipt for all neighborhood-attention calls in one decode."""
+    """Runtime receipt for all neighborhood-attention calls in one decode.
+
+    ``invocations`` counts every call and ``kernel_invocations`` those of the FP16 kernel
+    route; the tile and score maxima describe the masked path's calls, the only ones that
+    build scores. ``fallback_reason`` is the first reason a block kept the masked path.
+    """
 
     invocations: int = 0
+    kernel_invocations: int = 0
+    fallback_reason: DiffusionKernelFallback | None = None
     query_tiles: int = 0
     max_query_tokens: int = 0
     max_key_tokens: int = 0
@@ -183,6 +197,8 @@ class AttentionTilingStats:
 
     def reset(self) -> None:
         self.invocations = 0
+        self.kernel_invocations = 0
+        self.fallback_reason = None
         self.query_tiles = 0
         self.max_query_tokens = 0
         self.max_key_tokens = 0
@@ -195,10 +211,27 @@ class AttentionTilingStats:
         self.max_key_tokens = max(self.max_key_tokens, plan.max_key_tokens)
         self.max_score_elements = max(self.max_score_elements, plan.max_score_elements)
 
+    def record_kernel(self) -> None:
+        self.invocations += 1
+        self.kernel_invocations += 1
+
+    def record_fallback(self, reason: DiffusionKernelFallback) -> None:
+        if self.fallback_reason is None:
+            self.fallback_reason = reason
+
+    @property
+    def backend(self) -> DiffusionAttentionBackend:
+        if self.kernel_invocations == 0:
+            return DiffusionAttentionBackend.MASKED_SDPA
+        if self.kernel_invocations == self.invocations:
+            return DiffusionAttentionBackend.FP16_KERNELS
+        return DiffusionAttentionBackend.MIXED
+
     def to_dict(self) -> dict[str, int | str]:
-        return {
-            "backend": "mlx-sdpa-exact-neighborhood",
+        receipt: dict[str, int | str] = {
+            "backend": self.backend,
             "invocations": self.invocations,
+            "kernel_invocations": self.kernel_invocations,
             "query_tiles": self.query_tiles,
             "score_budget": self.score_budget,
             "max_query_tokens": self.max_query_tokens,
@@ -206,6 +239,9 @@ class AttentionTilingStats:
             "max_score_elements": self.max_score_elements,
             "max_boolean_mask_bytes": self.max_query_tokens * self.max_key_tokens,
         }
+        if self.fallback_reason is not None:
+            receipt["fallback_reason"] = self.fallback_reason
+        return receipt
 
 
 @dataclass(frozen=True)
@@ -300,6 +336,17 @@ class RotaryPosition3D:
     def _inverse_frequencies(self, dims: int) -> mx.array:
         exponents = mx.arange(0, dims, 2, dtype=mx.float32) / dims
         return mx.power(mx.array(self.base, dtype=mx.float32), -exponents)
+
+    def tables(self, grid: tuple[int, int, int]) -> diffusion_passes.RotaryTables:
+        """The FP32 cosines and sines of each axis's rotation over a ``grid`` volume from
+        position zero, ``(length, size / 2)`` per axis: the angles ``_rotate_axis`` takes."""
+        tables: list[mx.array] = []
+        for length, size in zip(grid, self.dim_split, strict=True):
+            positions = mx.arange(0, length, dtype=mx.float32)
+            angles = positions[:, None] * self._inverse_frequencies(size)[None, :]
+            tables.extend((mx.cos(angles), mx.sin(angles)))
+        cos_t, sin_t, cos_h, sin_h, cos_w, sin_w = tables
+        return cos_t, sin_t, cos_h, sin_h, cos_w, sin_w
 
     def _rotate_axis(
         self,
@@ -585,6 +632,85 @@ class NeighborhoodAttention3D(nn.Module):
         mx.eval(result)
         return result
 
+    def kernel_fallback(self, hidden_states: mx.array) -> DiffusionKernelFallback | None:
+        """Why a block of ``hidden_states`` keeps the masked path, or ``None`` when its
+        attention takes the FP16 kernel route."""
+        return diffusion_fused.kernel_fallback(
+            hidden_states,
+            heads=self.heads,
+            head_dim=self.head_dim,
+            window=self.kernel_size,
+        )
+
+    def kernel_residual(
+        self,
+        owned: list[mx.array],
+        residual: mx.array,
+        *,
+        grid: tuple[int, int, int],
+    ) -> mx.array:
+        """``residual`` plus this attention of the FP16 ``(tokens, C)`` rows of a ``grid``
+        volume popped from ``owned``, on the kernel route; call this where ``kernel_fallback``
+        returns ``None``.
+
+        The rows are taken out of ``owned`` so that no caller frame holds them: Q, K and V are
+        evaluated as soon as they are built, which frees the rows before the attention output
+        is allocated, and the attention is evaluated before the proj, whose output then takes
+        one of Q, K and V's buffers. Each of those evaluations is followed by ``mx.synchronize``
+        because ``mx.eval`` returns on the GPU's event, ahead of the completion handler that
+        frees the evaluated inputs, and an allocation encoded before it runs misses them. The
+        proj product is left to the caller's evaluation.
+        """
+        if self.qkv.bias is None:
+            raise RuntimeError("diffusion attention QKV projection requires a bias")
+        x = owned.pop()
+        weight, bias, width = self.qkv.weight, self.qkv.bias, self.dims
+        qk = diffusion_passes.QKWeights(
+            weight[:width],
+            bias[:width],
+            weight[width : 2 * width],
+            bias[width : 2 * width],
+            self.q_norm.weight,
+            self.k_norm.weight,
+        )
+        split = self.rope.dim_split
+        if diffusion_passes.qk_norm_rope_applies(x, qk, heads=self.heads, dim_split=split):
+            query, key = diffusion_passes.qk_norm_rope(
+                x,
+                qk,
+                grid=grid,
+                heads=self.heads,
+                dim_split=split,
+                tables=self.rope.tables(grid),
+            )
+            value = diffusion_fused.linear(x, weight[2 * width :], bias[2 * width :])
+        else:
+            query, key, value, _key_time = self._project_temporal_partition(
+                x.reshape(1, *grid, width),
+                (0, grid[0]),
+                grid=grid,
+            )
+        del x
+        mx.eval(query, key, value)
+        mx.synchronize()
+        shape = (1, *grid, self.heads, self.head_dim)
+        attended = neighborhood_attention.neighborhood_attention(
+            query.reshape(shape),
+            key.reshape(shape),
+            value.reshape(shape),
+            window=self.kernel_size,
+        )
+        del query, key, value
+        mx.eval(attended)
+        mx.synchronize()
+        self._stats.record_kernel()
+        return diffusion_fused.linear(
+            attended.reshape(-1, width),
+            self.proj.weight,
+            self.proj.bias,
+            residual=residual,
+        )
+
 
 class TiledSwiGLU(nn.Module):
     """Pointwise SwiGLU evaluated with a fixed token working set."""
@@ -609,6 +735,17 @@ class TiledSwiGLU(nn.Module):
             outputs.append(output)
         result = outputs[0] if len(outputs) == 1 else mx.concatenate(outputs, axis=1)
         return result.reshape(hidden_states.shape)
+
+    def kernel_residual(self, x: mx.array, residual: mx.array) -> mx.array:
+        """``residual`` plus this SwiGLU of FP16 ``(tokens, C)`` rows, on the kernel route,
+        evaluated (``diffusion_fused.swiglu``)."""
+        return diffusion_fused.swiglu(
+            x,
+            self.w_gate.weight,
+            self.w_up.weight,
+            self.w_down.weight,
+            residual,
+        )
 
 
 def _swiglu_hidden_dims(dims: int) -> int:
@@ -643,11 +780,38 @@ class DeterministicNABlock(nn.Module):
         )
 
     def __call__(self, hidden_states: mx.array) -> mx.array:
+        return self.forward_owned([hidden_states])
+
+    def forward_owned(self, held: list[mx.array]) -> mx.array:
+        """``self(held.pop())``. The block takes its input out of ``held``, so no caller frame
+        keeps it once the block has consumed it, and its buffer returns to MLX's cache for the
+        next allocation instead of staying live through the block's later evaluations."""
+        hidden_states = held.pop()
+        reason = self.attn.kernel_fallback(hidden_states)
+        if reason is None:
+            held.append(hidden_states)
+            del hidden_states
+            return self._kernel_forward(held)
+        self.attn._stats.record_fallback(reason)
         hidden_states = hidden_states + self.attn(self.norm1(hidden_states))
         mx.eval(hidden_states)
         hidden_states = hidden_states + self.mlp(self.norm2(hidden_states))
         mx.eval(hidden_states)
         return hidden_states
+
+    def _kernel_forward(self, held: list[mx.array]) -> mx.array:
+        hidden_states = held.pop()
+        shape = hidden_states.shape
+        grid = (int(shape[1]), int(shape[2]), int(shape[3]))
+        flat = hidden_states.reshape(-1, shape[-1])
+        del hidden_states
+        # The attention takes the normalized rows out of the list, so this frame does not
+        # hold them through its evaluations.
+        owned = [diffusion_fused.norm(flat, self.norm1.weight)]
+        flat = self.attn.kernel_residual(owned, flat, grid=grid)
+        mx.eval(flat)
+        flat = self.mlp.kernel_residual(diffusion_fused.norm(flat, self.norm2.weight), flat)
+        return flat.reshape(shape)
 
 
 class SharedAdaLN(nn.Module):
@@ -696,11 +860,33 @@ class DiffusionNABlock(nn.Module):
         latent_context: mx.array,
         modulation: tuple[mx.array, ...],
     ) -> mx.array:
+        return self.forward_owned([hidden_states], latent_context, modulation)
+
+    def forward_owned(
+        self,
+        held: list[mx.array],
+        latent_context: mx.array,
+        modulation: tuple[mx.array, ...],
+    ) -> mx.array:
+        """``self(held.pop(), latent_context, modulation)``, taking the input out of ``held``
+        as :meth:`DeterministicNABlock.forward_owned` does: the context product consumes it, so
+        it is freed before the attention half, where the block's memory peaks."""
+        hidden_states = held.pop()
         values = tuple(
             modulation[index] + self.scale_shift_table[index][None, None, None, None, :]
             for index in range(7)
         )
         scale_msa, shift_msa, _gate_msa, scale_mlp, shift_mlp, _gate_mlp, _gate_ctx = values
+        reason = self.attn.kernel_fallback(hidden_states)
+        if reason is None:
+            held.append(hidden_states)
+            del hidden_states
+            return self._kernel_forward(
+                held,
+                latent_context,
+                (scale_msa, shift_msa, scale_mlp, shift_mlp),
+            )
+        self.attn._stats.record_fallback(reason)
         hidden_states = hidden_states + self.context_proj(latent_context)
         mx.eval(hidden_states)
         normalized = self.norm1(hidden_states) * (1.0 + scale_msa) + shift_msa
@@ -710,6 +896,33 @@ class DiffusionNABlock(nn.Module):
         hidden_states = hidden_states + self.mlp(normalized)
         mx.eval(hidden_states)
         return hidden_states
+
+    def _kernel_forward(
+        self,
+        held: list[mx.array],
+        latent_context: mx.array,
+        modulation: tuple[mx.array, mx.array, mx.array, mx.array],
+    ) -> mx.array:
+        hidden_states = held.pop()
+        shape = hidden_states.shape
+        grid = (int(shape[1]), int(shape[2]), int(shape[3]))
+        dims = int(shape[-1])
+        scale_msa, shift_msa, scale_mlp, shift_mlp = (value.reshape(dims) for value in modulation)
+        flat = diffusion_fused.linear(
+            latent_context.reshape(-1, dims),
+            self.context_proj.weight,
+            self.context_proj.bias,
+            residual=hidden_states.reshape(-1, dims),
+        )
+        del hidden_states
+        mx.eval(flat)
+        # As in DeterministicNABlock: the attention owns the normalized rows.
+        owned = [diffusion_fused.norm(flat, self.norm1.weight, 1.0 + scale_msa, shift_msa)]
+        flat = self.attn.kernel_residual(owned, flat, grid=grid)
+        mx.eval(flat)
+        normalized = diffusion_fused.norm(flat, self.norm2.weight, 1.0 + scale_mlp, shift_mlp)
+        flat = self.mlp.kernel_residual(normalized, flat)
+        return flat.reshape(shape)
 
 
 class LinearPixelShuffle(nn.Module):
@@ -776,22 +989,6 @@ class TimestepEmbedder(nn.Module):
         return self.linear_2(silu(self.linear_1(embedding)))
 
 
-def _tile_intervals(
-    length: int,
-    tile_size: int,
-    stride: int,
-    min_size: int,
-) -> list[tuple[int, int]]:
-    if length <= tile_size:
-        return [(0, length)]
-    starts = list(range(0, length, stride))
-    while len(starts) > 1 and length - starts[-1] < min_size:
-        starts.pop()
-    return [(start, min(start + tile_size, length)) for start in starts[:-1]] + [
-        (starts[-1], length)
-    ]
-
-
 def _blend_axis(
     previous: mx.array,
     current: mx.array,
@@ -820,10 +1017,10 @@ def _blend_axis(
     return result
 
 
-class NativeDiffusionVideoDecoder(nn.Module):
+class DiffusionVideoDecoder(nn.Module):
     """Decode LTX latents with deterministic context and pixel diffusion."""
 
-    decoder_kind = "diffusion-na"
+    decoder_kind = VideoVAEKind.DIFFUSION
     attention_tiling_stats: AttentionTilingStats
 
     def __init__(
@@ -836,8 +1033,8 @@ class NativeDiffusionVideoDecoder(nn.Module):
     ) -> None:
         super().__init__()
         diffusion = config.diffusion_decoder
-        if config.decoder_kind != "diffusion-na" or diffusion is None:
-            raise ValueError("NativeDiffusionVideoDecoder requires diffusion VAE metadata")
+        if config.decoder_kind != VideoVAEKind.DIFFUSION or diffusion is None:
+            raise ValueError("DiffusionVideoDecoder requires diffusion VAE metadata")
         self.config = config
         self.diffusion_config = diffusion
         self.compute_dtype = compute_dtype
@@ -973,10 +1170,16 @@ class NativeDiffusionVideoDecoder(nn.Module):
         hidden_states = self.conv_in(hidden_states)
         mx.eval(hidden_states)
         for blocks, upsample in zip(self.det_stages[:-1], self.upsamples[:-1], strict=True):
+            # Each block pops its input from `held`, so a consumed input has no reference left.
+            held = [hidden_states]
+            del hidden_states
             for block in blocks:
-                hidden_states = block(hidden_states)
-            hidden_states = upsample(hidden_states)
+                held.append(block.forward_owned(held))
+            hidden_states = upsample(held.pop())
             mx.eval(hidden_states)
+        # The later stages allocate no buffer of these stages' sizes, so their cached
+        # buffers would only hold memory.
+        mx.clear_cache()
         return hidden_states
 
     def forward_stage_4(
@@ -986,10 +1189,12 @@ class NativeDiffusionVideoDecoder(nn.Module):
         drop_leading_frame: bool = True,
         crop_trailing_ghost: bool = True,
     ) -> mx.array:
+        held = [hidden_states]
+        del hidden_states
         for block in self.det_stages[-1]:
-            hidden_states = block(hidden_states)
+            held.append(block.forward_owned(held))
         hidden_states = self.upsamples[-1](
-            hidden_states,
+            held.pop(),
             drop_leading_frame=drop_leading_frame,
         )
         if crop_trailing_ghost and self.trailing_pad_latent_frames:
@@ -1004,7 +1209,18 @@ class NativeDiffusionVideoDecoder(nn.Module):
             keep_frames = work_frames - min(ghost_frames, removable_frames)
             hidden_states = hidden_states[:, :keep_frames]
         mx.eval(hidden_states)
+        # As after stages 1 to 3: stage 5 reuses none of these buffers.
+        mx.clear_cache()
         return hidden_states
+
+    def _sharpened(self, context: mx.array, sharpening: ContextSharpening | None) -> mx.array:
+        """The final-stage context, unsharp-masked when ``sharpening`` is given."""
+        if sharpening is None:
+            return context
+        sharpened = sharpening.apply(context, patch_size=self.config.patch_size)
+        # Evaluated here so the unsharpened context is released before the final stage.
+        mx.eval(sharpened)
+        return sharpened
 
     def forward_diffusion_step(
         self,
@@ -1021,9 +1237,11 @@ class NativeDiffusionVideoDecoder(nn.Module):
         hidden_states = hidden_states.transpose(0, 2, 3, 4, 1)
         hidden_states = self.conv_in_x_t(hidden_states)
         mx.eval(hidden_states)
+        held = [hidden_states]
+        del hidden_states
         for block in self.diff_blocks:
-            hidden_states = block(hidden_states, latent_context, modulation)
-        hidden_states = self.norm_out(hidden_states)
+            held.append(block.forward_owned(held, latent_context, modulation))
+        hidden_states = self.norm_out(held.pop())
         hidden_states = self.conv_out(hidden_states).transpose(0, 4, 1, 2, 3)
         output = unpatchify_spatial(hidden_states, self.config.patch_size)
         mx.eval(output)
@@ -1084,6 +1302,7 @@ class NativeDiffusionVideoDecoder(nn.Module):
         seed: int = 0,
         noise_backend: NoiseBackend = DEFAULT_NOISE_BACKEND,
         noise_stream: NormalNoiseStream | None = None,
+        context_sharpening: ContextSharpening | None = None,
     ) -> mx.array:
         del timestep, causal
         latent = self._validate_input(latent)
@@ -1107,6 +1326,7 @@ class NativeDiffusionVideoDecoder(nn.Module):
             if latent.dtype != self.compute_dtype:
                 latent = latent.astype(self.compute_dtype)
             context = self.forward_stage_4(self.forward_stages_1_to_3(latent))
+            context = self._sharpened(context, context_sharpening)
             pixel_shape = (
                 latent.shape[0],
                 self.config.out_channels,
@@ -1143,8 +1363,13 @@ class NativeDiffusionVideoDecoder(nn.Module):
         reporter: Reporter | None,
         plan_callback: Callable[[TilingPlanReceipt], None] | None,
         noise_state_callback: Callable[[NoiseStreamState], None] | None,
+        context_sharpening: ContextSharpening | None = None,
     ) -> Iterator[mx.array]:
-        """Yield bounded stage-4/stage-5 temporal groups in BCFHW layout."""
+        """Yield bounded stage-4/stage-5 temporal groups in BCFHW layout.
+
+        ``context_sharpening`` unsharp-masks each final-stage context before the stage runs,
+        in the single pass and in every tile alike.
+        """
         latent = self._validate_input(latent)
         if isinstance(seed, bool) or not isinstance(seed, int) or not 0 <= seed < 2**64:
             raise ValueError("diffusion decoder seed must be an unsigned 64-bit integer")
@@ -1189,6 +1414,7 @@ class NativeDiffusionVideoDecoder(nn.Module):
                 noise_backend=noise_backend,
                 noise_stream=noise_stream,
                 reporter=reporter,
+                context_sharpening=context_sharpening,
             )
             if noise_state_callback is not None:
                 noise_state_callback(noise_stream.state)
@@ -1259,9 +1485,9 @@ class NativeDiffusionVideoDecoder(nn.Module):
                 strict=True,
             )
         )
-        time_tiles = _tile_intervals(num_frames, tile_t, stride_t, min_sizes[0])
-        height_tiles = _tile_intervals(height, tile_h, stride_h, min_sizes[1])
-        width_tiles = _tile_intervals(width, tile_w, stride_w, min_sizes[2])
+        time_tiles = tile_intervals(num_frames, tile_t, stride_t, min_sizes[0])
+        height_tiles = tile_intervals(height, tile_h, stride_h, min_sizes[1])
+        width_tiles = tile_intervals(width, tile_w, stride_w, min_sizes[2])
         blend_frames = (tile_t - stride_t) * scale_t
         blend_height = (tile_h - stride_h) * scale_h
         blend_width = (tile_w - stride_w) * scale_w
@@ -1314,6 +1540,7 @@ class NativeDiffusionVideoDecoder(nn.Module):
                             drop_leading_frame=origin,
                             crop_trailing_ghost=trailing,
                         )
+                        context = self._sharpened(context, context_sharpening)
                         pixel_shape = (
                             latent.shape[0],
                             self.config.out_channels,
@@ -1429,7 +1656,7 @@ class DiffusionDecoderLoadReceipt:
 
     def to_dict(self) -> dict[str, object]:
         return {
-            "decoder_kind": "diffusion-na",
+            "decoder_kind": VideoVAEKind.DIFFUSION,
             "loaded_tensors": self.loaded_tensors,
             "folded_gate_tensors": self.folded_gate_tensors,
             "ignored_decoder_tensors": list(self.ignored_decoder_tensors),
@@ -1525,7 +1752,7 @@ def _gate_for_parameter(
 
 
 def load_diffusion_video_decoder_weights(
-    decoder: NativeDiffusionVideoDecoder,
+    decoder: DiffusionVideoDecoder,
     source: WeightSource,
 ) -> DiffusionDecoderLoadReceipt:
     """Bind every consumed diffusion-decoder target and report ignored baggage."""
@@ -1644,7 +1871,7 @@ __all__ = [
     "AttentionTilePlan",
     "AttentionTilingStats",
     "DiffusionDecoderLoadReceipt",
-    "NativeDiffusionVideoDecoder",
+    "DiffusionVideoDecoder",
     "NeighborhoodAttention3D",
     "TiledSwiGLU",
     "load_diffusion_video_decoder_weights",

@@ -13,8 +13,8 @@ from kinomlx.kernels import silu
 from kinomlx.reporting import NullReporter, Reporter
 
 from .blocks import (
-    NativeConv3dBlock,
-    NativeResBlockGroup,
+    Conv3dBlock,
+    ResBlockGroup,
     lookup_weight,
     patchify_spatial_bfhwc,
     pixel_norm_bfhwc,
@@ -26,7 +26,7 @@ from .ops import PerChannelStatistics
 _log = logging.getLogger(__name__)
 
 
-class NativeConv3dVideoEncoderStatistics:
+class Conv3dVideoEncoderStatistics:
     """Lightweight holder for encoder latent normalization statistics."""
 
     def __init__(
@@ -40,7 +40,7 @@ class NativeConv3dVideoEncoderStatistics:
         )
 
 
-class NativeSpaceToDepthDownsample3d(nn.Module):
+class SpaceToDepthDownsample3d(nn.Module):
     """Conv3d followed by space-to-depth in BFHWC layout."""
 
     def __init__(
@@ -69,7 +69,7 @@ class NativeSpaceToDepthDownsample3d(nn.Module):
         self.residual = residual
         self.group_size = grouped_channels // out_channels
         self.conv_out_channels = out_channels // stride_product
-        self.conv = NativeConv3dBlock(
+        self.conv = Conv3dBlock(
             in_channels,
             self.conv_out_channels,
             spatial_padding_mode=spatial_padding_mode,
@@ -125,7 +125,7 @@ class NativeSpaceToDepthDownsample3d(nn.Module):
         return x
 
 
-class NativeConv3dVideoEncoder(nn.Module):
+class Conv3dVideoEncoder(nn.Module):
     """Encode normalized BCFHW RGB video into normalized LTX latents."""
 
     def __init__(
@@ -141,18 +141,18 @@ class NativeConv3dVideoEncoder(nn.Module):
 
         patch_channels = config.in_channels * config.patch_size**2
         feature_channels = config.encoder_base_channels
-        self.conv_in = NativeConv3dBlock(patch_channels, feature_channels)
-        self.down_blocks: list[NativeResBlockGroup | NativeSpaceToDepthDownsample3d] = []
+        self.conv_in = Conv3dBlock(patch_channels, feature_channels)
+        self.down_blocks: list[ResBlockGroup | SpaceToDepthDownsample3d] = []
 
         for block_config in config.encoder_blocks:
             if block_config.name == "res_x":
-                block: NativeResBlockGroup | NativeSpaceToDepthDownsample3d = NativeResBlockGroup(
+                block: ResBlockGroup | SpaceToDepthDownsample3d = ResBlockGroup(
                     feature_channels,
                     num_blocks=block_config.num_layers or 0,
                 )
             else:
                 out_channels = feature_channels * block_config.multiplier
-                block = NativeSpaceToDepthDownsample3d(
+                block = SpaceToDepthDownsample3d(
                     feature_channels,
                     out_channels,
                     stride=compression_strides(block_config.name),
@@ -161,7 +161,7 @@ class NativeConv3dVideoEncoder(nn.Module):
                 feature_channels = out_channels
             self.down_blocks.append(block)
 
-        self.conv_out = NativeConv3dBlock(
+        self.conv_out = Conv3dBlock(
             feature_channels,
             config.latent_channels + 1,
         )
@@ -226,11 +226,11 @@ class NativeConv3dVideoEncoder(nn.Module):
                 f"{scale.height}x{scale.width}, got {height}x{width}"
             )
 
-    def _iter_convs(self) -> Iterator[tuple[str, NativeConv3dBlock]]:
+    def _iter_convs(self) -> Iterator[tuple[str, Conv3dBlock]]:
         """Yield checkpoint key prefixes and their native Conv3d blocks."""
         yield "conv_in.conv", self.conv_in
         for index, block in enumerate(self.down_blocks):
-            if isinstance(block, NativeResBlockGroup):
+            if isinstance(block, ResBlockGroup):
                 for residual_index, residual in enumerate(block.res_blocks):
                     prefix = f"down_blocks.{index}.res_blocks.{residual_index}"
                     yield f"{prefix}.conv1.conv", residual.conv1
@@ -274,8 +274,8 @@ def _require_stat(
     return lookup_weight(weights, *aliases[name])
 
 
-def load_native_vae_encoder_weights(
-    encoder: NativeConv3dVideoEncoder,
+def load_vae_encoder_weights(
+    encoder: Conv3dVideoEncoder,
     source: WeightSource,
 ) -> int:
     """Load a complete encoder from source or prepared tensors."""
@@ -323,11 +323,11 @@ def load_native_vae_encoder_weights(
     return len(assignments)
 
 
-def load_native_vae_encoder_statistics(
+def load_vae_encoder_statistics(
     source: WeightSource,
     *,
     latent_channels: int = 128,
-) -> NativeConv3dVideoEncoderStatistics:
+) -> Conv3dVideoEncoderStatistics:
     """Load only the latent normalization statistics used between stages."""
     weights = _weights_from_source(source)
     statistics = PerChannelStatistics(latent_channels=latent_channels)
@@ -341,13 +341,13 @@ def load_native_vae_encoder_statistics(
             )
         setattr(statistics, attribute, value)
     mx.eval(statistics.mean_of_means, statistics.std_of_means)
-    return NativeConv3dVideoEncoderStatistics(statistics)
+    return Conv3dVideoEncoderStatistics(statistics)
 
 
 __all__ = [
-    "NativeConv3dVideoEncoder",
-    "NativeConv3dVideoEncoderStatistics",
-    "NativeSpaceToDepthDownsample3d",
-    "load_native_vae_encoder_statistics",
-    "load_native_vae_encoder_weights",
+    "Conv3dVideoEncoder",
+    "Conv3dVideoEncoderStatistics",
+    "SpaceToDepthDownsample3d",
+    "load_vae_encoder_statistics",
+    "load_vae_encoder_weights",
 ]

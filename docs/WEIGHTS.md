@@ -1,105 +1,119 @@
 # Model files and loading
 
-KinoMLX reads model files already on your Mac. It does not download weights during
-generation or create a second, converted model-weight cache on disk. Download the
-components for the model you intend to use before starting a run.
+KinoMLX reads model files already on your Mac. It never downloads weights during a run, and it
+never writes a second, converted copy of a model to disk. Download the files for a model before
+running it.
+
+- [Get the right files](#get-the-right-files)
+- [Choose where models load from](#choose-where-models-load-from)
+- [What loading costs](#what-loading-costs)
+- [Precision and checks](#precision-and-checks)
+- [Files, caches, and saved results](#files-caches-and-saved-results)
+- [Convert a checkpoint](#convert-a-checkpoint)
 
 ## Get the right files
 
-| Model | Download and selection instructions |
+| Model | Download instructions |
 | --- | --- |
-| LTX-2.3 / LTX-2.5 | [LTX downloads](LTX2.md#ltx-model-downloads): transformer, text encoder, VAE, and upscaler requirements |
-| Krea 2 Raw / Turbo | [Krea model access](KREA2.md#model-access): complete model folder and optional decoder/adapter files |
-| FLUX.2 Klein base / distilled / KV | [Klein checkpoints](FLUX2.md#local-checkpoint-selection): choose the variant and keep its component folders |
-| GMNet | [GMNet weights](GMNET.md#model-weights): download and convert the original checkpoint once |
+| LTX-2.3 / LTX-2.5 | [LTX2 model files](ltx2/downloads.md): transformer, text encoder, VAEs, and upscaler |
+| Krea 2 Raw / Turbo | [Krea 2 model files](krea2/downloads.md): the model folder, plus optional decoder and adapters |
+| FLUX.2 Klein | [Klein model files](flux2/downloads.md): one folder per variant |
+| GMNet | [GMNet weights](gmnet/weights.md): download and convert a checkpoint once |
 
-For Hugging Face downloads, keep the original snapshot layout. A sharded model
-needs every shard named by its index, along with the required configuration and
-tokenizer files. Authentication does not grant access to a gated model by itself;
-accept or request access on its model page before downloading.
+Keep Hugging Face downloads in their original layout. A sharded model needs every shard its index
+names, plus its configuration and tokenizer files. Signing in does not grant access to a gated
+model: accept or request access on its model page first.
 
 ## Choose where models load from
 
-KinoMLX discovers downloaded snapshots in the Hugging Face cache selected by
-`HF_HOME`. You can instead pass explicit local sources:
+KinoMLX finds downloaded snapshots in the Hugging Face cache selected by `HF_HOME` or `--hf-home`.
+To load from elsewhere:
 
-- LTX uses `--weights-path` plus individual component overrides when needed.
-- Krea and Klein use `--source-path` for a model folder, or individual component paths.
-- GMNet discovers converted weights or accepts the paths described in its guide.
+- LTX2 takes `--weights-path`, plus component paths when needed.
+- Krea 2 and Klein take `--source-path` for a model folder, or component paths.
+- GMNet finds its converted weights, or takes `--weights-path`.
 
-Use `kinomlx --model MODEL --help` for that model's path options. Model guides
-include examples for cache-managed downloads and manually selected folders.
-Explicit overrides must be compatible with the selected model; a missing or
-incompatible file is not silently replaced by a different downloaded model.
+An explicit file must fit the selected model: a missing or mismatched file is never silently
+replaced by another download. Each model's downloads page has examples, and
+`kinomlx --model MODEL --dry-run` checks the result without loading weights.
 
-## What happens during loading
+## What loading costs
 
-Model components are loaded when needed and released after their part of the run:
-text encoding, denoising, then decoding. This reduces peak memory because the text
-encoder, transformer, and decoder do not all need to stay resident together.
-A large monolithic checkpoint does not require every tensor in the file to be
-resident at once; each component selects the weights it uses.
+Each model part loads when its stage needs it and is released afterward: the text encoder, then
+the denoiser, then the decoder. Because they are never all resident at once, the peak is lower. A
+large single-file checkpoint is not loaded whole either; each part reads only its own weights.
 
-KinoMLX prepares weight dtype and layout changes lazily. Some preparation is
-therefore paid on first use rather than when the file is initially inspected.
-The first denoising step can include transformer materialization and adapter
-fusion. Compare complete runs or phase timings rather than treating the initial
-loading message as the full loading cost.
+Precision and layout changes are prepared lazily, on first use. The first denoising step can
+therefore include loading the transformer and merging adapters, so the initial loading message
+understates the cost: compare complete runs or phase timings.
 
-With [LTX block streaming](LTX2.md#block-streaming-on-32-gb-systems), only a subset
-of transformer blocks stays resident. Reloading repeats reads and preparation,
-including adapter fusion where applicable. Reads can overlap computation, but a
-checkpoint that no longer fits in the filesystem cache can make storage bandwidth
-an important part of step time.
+With [LTX2 streaming](ltx2/performance.md#run-on-32-gb), only some transformer blocks stay loaded,
+and the rest are read again each step. Reads overlap computation, but once the checkpoint no
+longer fits in the file cache, the drive's speed becomes part of every step.
 
-## Precision and validation
+## Precision and checks
 
-LTX, Krea, and Klein default to BF16 transformer execution. FP16 is an explicit
-speed option with the same bytes per weight and a narrower numerical range.
-Selecting a compute dtype does not rewrite the source checkpoint. Supported FP8
-LTX sources are decoded into the requested execution dtype; choosing FP16 from a
-BF16 source cannot recover precision already absent from that source.
+LTX2 runs its transformer in FP16 by default, and Krea 2 and Klein in BF16; see
+[precision](PERFORMANCE.md#precision). Both use two bytes per weight. Choosing a dtype never
+rewrites the source file, and FP16 from a BF16 source cannot restore precision the source lacks.
+Supported FP8 LTX sources are decoded into the chosen dtype.
 
-KinoMLX checks required tensor names, shapes, and storage dtypes before using a
-component. Generation also checks denoising latents for nonfinite values.
-Adapter-modified active floating-point weights receive a first-use check by
-default; packed LTX targets rely on latent checks. See
-[adapter checks](ADAPTERS.md#first-use-weight-checks) for coverage and opt-out behavior.
+Before using a component, KinoMLX checks its tensor names, shapes, and storage dtypes. Generation
+also checks every denoising step's latents for nonfinite values, and adapter-changed weights get a
+[first-use check](ADAPTERS.md#first-use-weight-checks).
 
-If loading fails, read the named component and file in the error. Check that the
-download is complete, the selected variant is correct, and an explicit path has
-not mixed incompatible component versions. If FP16 produces nonfinite values,
-try BF16 and inspect adapter strengths and compatibility. Do not disable checks
-to make an incompatible export appear supported.
+If loading fails, read the component and file named in the error. Check that the download is
+complete, that the variant is right, and that an explicit path does not mix incompatible
+versions. If FP16 produces nonfinite values, try BF16 and check adapter strengths. Do not turn
+checks off to make an incompatible file appear to work.
 
-Source identities and metadata are recorded for reproducibility, but normal
-loading does not hash every weight payload. Successful loading is not a full-file
-integrity audit; verify download hashes separately when investigating file corruption.
+Loading records each source's identity, but it does not hash every weight, so a successful load is
+not a full integrity check. Verify download hashes separately when you suspect corruption.
 
-## Model files, caches, and saved results
+## Files, caches, and saved results
 
-| Storage | Purpose | What changing the MLX cache limit does |
+| Storage | Holds | Affected by `--mlx-cache-limit-gb`? |
 | --- | --- | --- |
-| Hugging Face cache or your model folder | Original downloaded model files | Nothing; these are disk files |
-| MLX allocator cache | Unused in-memory allocations kept for reuse | Limits retained buffers; `0` disables caching |
-| Application cache | Manual GMNet conversions and native profiling builds | Nothing; managed separately |
-| Saved conditioning and latent sidecars | Optional outputs used to restart part of a run | Nothing; keep the files needed by your restart |
-| Klein reference KV | Reference keys/values reused within one generation | Does not remove live reference tensors |
+| Hugging Face cache or your model folder | The downloaded model files | No |
+| MLX allocator cache | Freed memory kept for reuse | Yes; `0` keeps none |
+| Application cache | Converted GMNet weights and the profiling helper | No |
+| Saved latents and conditioning | Optional sidecars that a restart reads back | No |
+| Klein reference KV | Reference keys and values, within one generation | No |
 
-`--app-cache-dir`, `[settings].app_cache_dir`, or `KINO_APP_CACHE_DIR` selects the
-application cache. Its default is `~/Library/Caches/KinoMLX`; `XDG_CACHE_HOME`
-selects its `KinoMLX` subdirectory. Keep original model sources available for
-restart: saved latents or conditioning do not bundle all remaining model weights.
-For MLX allocator and wired-memory controls, see [Performance](PERFORMANCE.md).
+The application cache is `~/Library/Caches/KinoMLX` by default, or `XDG_CACHE_HOME/KinoMLX` when
+that is set; `--app-cache-dir`, `[settings].app_cache_dir`, and `KINO_APP_CACHE_DIR` move it. Keep
+the original model files for restarts: saved latents and conditioning do not include the remaining
+weights. Memory limits are in [Performance and memory](PERFORMANCE.md).
 
-## Public API memory policy
+## Convert a checkpoint
 
-Prepared resources describe model files and execution choices; they do not keep
-live model weights resident. Reuse resources or a runner when making sequential
-calls, and close generation results before starting another call.
+Runs load safetensors only. GMNet publishes PyTorch checkpoints, so it has its own converter; see
+[GMNet weights](gmnet/weights.md). For any other plain PyTorch state dict, the generic converter
+copies its tensors unchanged:
 
-Runners and public recipes apply the selected infrastructure `Settings` memory
-policy before model work. If you call component loaders directly, apply it yourself
-with `kinomlx.apply_memory_policy(resources.memory_policy)` before loading or
-allocating inputs. These controls affect the entire process; see
-[API memory policy](PERFORMANCE.md#public-api-memory-policy) for lifetime and concurrency rules.
+```bash
+kinomlx weights convert checkpoint.pth -o checkpoint.safetensors
+```
+
+Use it only when no model has its own converter: it does not transpose tensors or check them
+against any model. Non-tensor entries are dropped with a warning, and the prefix options below
+choose and rename keys.
+
+It reads the checkpoint with a restricted reader that never runs code from it, and refuses old
+stream-format checkpoints and float64 storage. A bare filename is also looked up under
+`weights-src/` in the current directory.
+
+<table>
+<thead><tr><th>Argument</th><th>Default</th><th>Value</th><th>What it does</th></tr></thead>
+<tbody>
+<tr><td><code>-o</code>, <code>--output</code></td><td><em>the input with a .safetensors suffix</em></td><td><code>PATH.safetensors</code></td><td>Where to write the converted file. Required for a source under <code>weights-src/</code>, so converted files never land there.</td></tr>
+<tr><td><code>--param-key</code></td><td><em>automatic</em></td><td><code>KEY</code></td><td>The nested mapping to extract. A single <code>state_dict</code>, <code>model</code>, <code>net</code>, <code>weights</code>, <code>params</code>, or <code>params_ema</code> mapping is found automatically; name one when there are several, or when tensors also sit at the top level.</td></tr>
+<tr><td><code>--strip-prefix</code></td><td><code>module.</code></td><td><code>PREFIX</code></td><td>Remove this prefix from key names where present; <code>''</code> keeps them.</td></tr>
+<tr><td><code>--only-prefix</code></td><td><em>every key</em></td><td><code>PREFIX</code></td><td>Keep only keys that start with this prefix, matched before <code>--strip-prefix</code> removes anything.</td></tr>
+<tr><td><code>--force</code>, <code>--no-force</code></td><td><em>off</em></td><td><em>flag</em></td><td>Replace an existing output; otherwise refuse before loading.</td></tr>
+<tr><td><code>--allow-suspicious-globals</code>, <code>--no-allow-suspicious-globals</code></td><td><em>off</em></td><td><em>flag</em></td><td>Convert a checkpoint you trust that the static scan refused; the restricted reader still refuses anything outside its allowlist.</td></tr>
+</tbody>
+</table>
+
+`kinomlx weights --help` lists the converters. They also take the memory, logging, profiling, and
+location options among the [shared arguments](CONFIG.md#shared-arguments).

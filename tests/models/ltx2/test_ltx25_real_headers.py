@@ -16,6 +16,7 @@ from kinomlx.models.ltx2.metadata import (
     inspect_video_vae,
     validate_transformer_header,
 )
+from kinomlx.models.ltx2.video_vae.kinds import VideoVAEKind
 from tests._snapshots import pinned_snapshot
 from tests.models.ltx2._source_weights import NO_LTX23_CHECKPOINT, ltx23_checkpoint
 
@@ -85,8 +86,8 @@ def test_real_ltx25_pack_matches_every_consumed_compatibility_anchor() -> None:
     assert text_config.hidden_size == 3840
     assert text_config.tokenizer_json_bytes == 32_169_626
     assert tuple(video_config.encoder_scale) == (8, 32, 32)
-    assert video_config.decoder_kind == "native-conv3d"
-    assert diffusion_video_config.decoder_kind == "diffusion-na"
+    assert video_config.decoder_kind == VideoVAEKind.CONV
+    assert diffusion_video_config.decoder_kind == VideoVAEKind.DIFFUSION
     assert diffusion_video_config.encoder_scale == video_config.encoder_scale
     assert diffusion_video_config.inferred_fields == ("vae.signal_domain",)
     assert diffusion_video_config.diffusion_decoder is not None

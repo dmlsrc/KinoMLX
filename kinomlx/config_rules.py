@@ -4,10 +4,9 @@ import copy
 import dataclasses
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
-from types import MappingProxyType
 from typing import Literal
 
-from kinomlx.config_record_state import supplied_fields
+from kinomlx._config_record_state import supplied_fields
 from kinomlx.config_values import ConfigError
 
 
@@ -126,9 +125,9 @@ def _validate_record(
         try:
             rule.run(
                 RuleInputs(
-                    MappingProxyType(inputs),
-                    MappingProxyType(presence),
-                    MappingProxyType(observations),
+                    frozendict(inputs),
+                    frozendict(presence),
+                    frozendict(observations),
                 )
             )
         except ConfigError:

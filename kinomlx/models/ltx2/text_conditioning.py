@@ -1,4 +1,4 @@
-"""Public text-conditioning station and reusable encoded-text product."""
+"""Public text-conditioning stage and reusable encoded-text product."""
 
 import hashlib
 import logging
@@ -20,7 +20,8 @@ from .text_encoder.tokenizer_derivation import (
     derive_tokenizer,
     resolve_tokenizer_source,
 )
-from .types import DistilledRequest
+from .types import LTX2Request
+from .vocabularies import LTX2ModelGeneration
 
 _CORE_PROVENANCE_FIELDS = (
     "model_generation",
@@ -41,7 +42,7 @@ ReplayIdentityPolicy = Literal["require", "observe"]
 
 
 @dataclass(frozen=True)
-class TextConditioningProvenance:
+class LTX2TextConditioningProvenance:
     """Compatibility identity required to replay encoded text safely."""
 
     model_generation: str
@@ -76,7 +77,7 @@ class TextConditioningProvenance:
         *,
         source: Path,
         require_extended: bool = False,
-    ) -> TextConditioningProvenance:
+    ) -> LTX2TextConditioningProvenance:
         values: dict[str, str] = {}
         for name in _CORE_PROVENANCE_FIELDS:
             value = metadata.get(name)
@@ -96,7 +97,7 @@ class TextConditioningProvenance:
             **extended,
         )
 
-    def is_compatible_with(self, expected: TextConditioningProvenance) -> bool:
+    def is_compatible_with(self, expected: LTX2TextConditioningProvenance) -> bool:
         """Accept exact schema-3 identity or a valid legacy LTX-2.3 identity."""
         # The v3 rename changed terminology only, not tokenization. Normalize
         # just that published spelling; every other provenance field still matches.
@@ -114,7 +115,11 @@ class TextConditioningProvenance:
             expected, tokenization_policy=expected_policy
         ):
             return True
-        legacy_generation = self.model_generation.lower() in {"2.3", "ltx-2.3"}
+        # Older sidecars recorded the label rather than the generation.
+        legacy_generation = self.model_generation.lower() in {
+            LTX2ModelGeneration.LTX23,
+            "ltx-2.3",
+        }
         extended_values = (
             self.tokenizer_source_sha256,
             self.tokenization_policy,
@@ -132,27 +137,27 @@ class TextConditioningProvenance:
 
 
 @dataclass(frozen=True)
-class EncodedTextConditioning:
+class LTX2EncodedTextConditioning:
     """Materialized text context with no live text-model ownership."""
 
     video_encoding: mx.array
     audio_encoding: mx.array
     attention_mask: mx.array
     prompt: str
-    provenance: TextConditioningProvenance
+    provenance: LTX2TextConditioningProvenance
     replay_receipt: Mapping[str, object] | None = None
 
 
-class TextConditioner(Protocol):
+class LTX2TextConditionerPort(Protocol):
     """Stateless host port for prompt encoding or sidecar replay."""
 
     def __call__(
         self,
-        request: DistilledRequest,
+        request: LTX2Request,
         resources: LTX2Resources,
         *,
         reporter: Reporter | None = None,
-    ) -> EncodedTextConditioning: ...
+    ) -> LTX2EncodedTextConditioning: ...
 
 
 def _component_identity(component: ComponentResource) -> str:
@@ -178,7 +183,7 @@ def text_conditioning_provenance(
     resources: LTX2Resources,
     *,
     tokenizer: TokenizerDerivation | None = None,
-) -> TextConditioningProvenance:
+) -> LTX2TextConditioningProvenance:
     """Resolve the checkpoint, encoder-family, and projection compatibility identity.
 
     ``tokenizer`` lets a caller that already resolved the tokenizer reuse it
@@ -186,7 +191,7 @@ def text_conditioning_provenance(
     """
     connector = resources.require(ComponentKind.CONNECTOR)
     projection_family = connector.metadata.get("family", "connector")
-    base = TextConditioningProvenance(
+    base = LTX2TextConditioningProvenance(
         model_generation=resources.capabilities.model_generation,
         text_encoder_identity=resources.capabilities.text_encoder_family,
         projection_identity=f"{projection_family}:{connector.source_fingerprint}",
@@ -206,7 +211,7 @@ def text_conditioning_provenance(
         return base
     text = resources.require(ComponentKind.TEXT_ENCODER)
     projection = resources.require(ComponentKind.TEXT_PROJECTION)
-    return TextConditioningProvenance(
+    return LTX2TextConditioningProvenance(
         model_generation=base.model_generation,
         text_encoder_identity=base.text_encoder_identity,
         projection_identity=base.projection_identity,
@@ -221,8 +226,8 @@ def text_conditioning_provenance(
     )
 
 
-class NativeTextConditioner:
-    """Native sequential Gemma/connector station with a sidecar fast path."""
+class LTX2TextConditioner:
+    """Native sequential Gemma/connector stage with a sidecar fast path."""
 
     def __init__(
         self,
@@ -235,11 +240,11 @@ class NativeTextConditioner:
 
     def __call__(
         self,
-        request: DistilledRequest,
+        request: LTX2Request,
         resources: LTX2Resources,
         *,
         reporter: Reporter | None = None,
-    ) -> EncodedTextConditioning:
+    ) -> LTX2EncodedTextConditioning:
         tokenizer = None if request.text_conditioning is not None else resolve_tokenizer(resources)
         expected = text_conditioning_provenance(resources, tokenizer=tokenizer)
         if request.text_conditioning is not None:
@@ -252,7 +257,7 @@ class NativeTextConditioner:
                 raise ValueError("prompt_unconditional requires empty saved text conditioning")
             parse_error = None
             try:
-                actual = TextConditioningProvenance.from_metadata(
+                actual = LTX2TextConditioningProvenance.from_metadata(
                     metadata,
                     source=request.text_conditioning,
                     require_extended=(
@@ -296,7 +301,7 @@ class NativeTextConditioner:
                 "identity_parse_error": parse_error,
                 "provenance_fallback": (None if actual is not None else "prepared_resources"),
             }
-            return EncodedTextConditioning(
+            return LTX2EncodedTextConditioning(
                 video_encoding=encoded.video_encoding,
                 audio_encoding=encoded.audio_encoding,
                 attention_mask=encoded.attention_mask,
@@ -309,8 +314,7 @@ class NativeTextConditioner:
         if text is None:
             family = resources.capabilities.text_encoder_family
             raise FileNotFoundError(
-                f"no local {family} text artifact was prepared; set the selected "
-                "text_encoder_path or gemma_path"
+                f"no local {family} text artifact was prepared; set text_encoder_path"
             )
         connector = resources.require(ComponentKind.CONNECTOR)
         projection = resources.require(ComponentKind.TEXT_PROJECTION)
@@ -318,7 +322,7 @@ class NativeTextConditioner:
         projection_path = projection.source_path
         encoded = encode_text(
             request.prompt,
-            gemma_path=text.source_path,
+            text_encoder_path=text.source_path,
             connector_path=connector_path,
             projection_path=projection_path,
             config_path=resources.transformer_path,
@@ -327,7 +331,7 @@ class NativeTextConditioner:
             pad_prompt_to_max=request.pad_prompt_to_max,
             reporter=reporter,
         )
-        return EncodedTextConditioning(
+        return LTX2EncodedTextConditioning(
             video_encoding=encoded.video_encoding,
             audio_encoding=encoded.audio_encoding,
             attention_mask=encoded.attention_mask,
@@ -337,11 +341,11 @@ class NativeTextConditioner:
 
 
 __all__ = [
-    "EncodedTextConditioning",
-    "NativeTextConditioner",
+    "LTX2EncodedTextConditioning",
+    "LTX2TextConditioner",
+    "LTX2TextConditionerPort",
+    "LTX2TextConditioningProvenance",
     "ReplayIdentityPolicy",
-    "TextConditioner",
-    "TextConditioningProvenance",
     "resolve_tokenizer",
     "text_conditioning_provenance",
 ]

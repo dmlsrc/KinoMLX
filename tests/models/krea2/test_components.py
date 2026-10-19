@@ -3,10 +3,12 @@
 from pathlib import Path
 from types import SimpleNamespace
 
+import mlx.core as mx
 import pytest
 
 import kinomlx.models.krea2.components as components
 from kinomlx.memory_policy import MLXMemoryPolicy
+from kinomlx.modeling.dtypes import FloatDType
 from kinomlx.models.krea2.adapters.loading import (
     Krea2AdapterPlan,
     Krea2PreparedAdapter,
@@ -17,8 +19,8 @@ from kinomlx.models.krea2.vae.loading import Krea2VAELoadReceipt
 from kinomlx.reporting import TimingReporter
 from tests._reporting import RecordingReporter
 
-from ._transformer_fixtures import tiny_transformer_config
-from ._vae_fixtures import tiny_vae_config
+from .transformer._fixtures import tiny_transformer_config
+from .vae._fixtures import tiny_vae_config
 
 
 def test_adapter_provider_defers_base_and_replacement_evaluation(tmp_path, monkeypatch):
@@ -48,7 +50,7 @@ def test_adapter_provider_defers_base_and_replacement_evaluation(tmp_path, monke
         memory_policy=MLXMemoryPolicy(),
         transformer_config=tiny_transformer_config(),
         reference_denoise=False,
-        transformer=SimpleNamespace(bindings=(), dtype_policy="bfloat16"),
+        transformer=SimpleNamespace(bindings=(), dtype_policy=FloatDType.BFLOAT16),
         variant=SimpleNamespace(value="turbo"),
         check_adapter_weights=False,
     )
@@ -92,9 +94,9 @@ def test_native_components_binds_lazy_transformer_without_retaining_it(
         memory_policy=MLXMemoryPolicy(),
         transformer_config=tiny_transformer_config(),
         reference_denoise=False,
-        transformer=SimpleNamespace(bindings=(), dtype_policy="bfloat16"),
+        transformer=SimpleNamespace(bindings=(), dtype_policy=FloatDType.BFLOAT16),
     )
-    provider = components.NativeKrea2Components(reporter=reporter)
+    provider = components.Krea2Components(reporter=reporter)
 
     lease = provider.transformer(resources)
 
@@ -102,7 +104,7 @@ def test_native_components_binds_lazy_transformer_without_retaining_it(
     assert lease.value("input") == "result"
     assert events == [
         ("construct", resources.transformer_config, False),
-        ("load", lease.value, (), "bfloat16", None),
+        ("load", lease.value, (), mx.bfloat16, None),
     ]
     lease.close()
     lease.close()
@@ -135,7 +137,7 @@ def test_transformer_provider_cleans_up_after_partial_load_failure(
         memory_policy=MLXMemoryPolicy(),
         transformer_config=tiny_transformer_config(),
         reference_denoise=False,
-        transformer=SimpleNamespace(bindings=(), dtype_policy="bfloat16"),
+        transformer=SimpleNamespace(bindings=(), dtype_policy=FloatDType.BFLOAT16),
     )
 
     with pytest.raises(ValueError, match="broken cache"):
@@ -180,17 +182,17 @@ def test_native_components_loads_and_leases_image_decoder_without_retaining_it(
     resources = SimpleNamespace(
         vae_config=tiny_vae_config(),
         vae_decoder=Krea2VAEDecoder.UPSCALE2X,
-        vae=SimpleNamespace(bindings=bindings, dtype_policy="float16"),
+        vae=SimpleNamespace(bindings=bindings, dtype_policy=FloatDType.FLOAT16),
     )
-    provider = components.NativeKrea2Components(reporter=reporter)
+    provider = components.Krea2Components(reporter=reporter)
 
     lease = provider.image_decoder(resources)
 
     assert provider.__dict__ == {"reporter": reporter}
     assert lease.value("latent") == "rgb"
     assert events[:4] == [
-        ("construct", resources.vae_config, "float16", 2),
-        ("load", lease.value, "float16", bindings, None),
+        ("construct", resources.vae_config, mx.float16, 2),
+        ("load", lease.value, mx.float16, bindings, None),
         "parameters",
         "eval",
     ]
@@ -243,16 +245,16 @@ def test_native_load_phase_accounts_for_its_evaluation_boundary(
         memory_policy=MLXMemoryPolicy(),
         transformer_config=tiny_transformer_config(),
         reference_denoise=False,
-        transformer=SimpleNamespace(bindings=(), dtype_policy="bfloat16"),
+        transformer=SimpleNamespace(bindings=(), dtype_policy=FloatDType.BFLOAT16),
         vae_config=tiny_vae_config(),
         vae_decoder=Krea2VAEDecoder.QWEN,
         vae=SimpleNamespace(
             bindings=(),
             source_path=tmp_path / "vae.safetensors",
-            dtype_policy="bfloat16",
+            dtype_policy=FloatDType.BFLOAT16,
         ),
     )
-    provider = components.NativeKrea2Components(reporter=reporter)
+    provider = components.Krea2Components(reporter=reporter)
     lease = getattr(provider, component)(resources)
     lease.close()
 
@@ -288,7 +290,7 @@ def test_image_decoder_provider_cleans_up_after_partial_load_failure(
         vae=SimpleNamespace(
             bindings=(),
             source_path=tmp_path / "vae.safetensors",
-            dtype_policy="bfloat16",
+            dtype_policy=FloatDType.BFLOAT16,
         ),
     )
 

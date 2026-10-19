@@ -13,16 +13,16 @@ from kinomlx.adapters.selection import AdapterSelection, require_adapter_schedul
 from kinomlx.config_records import derive_config
 from kinomlx.config_rules import validate_capabilities, validate_record
 from kinomlx.memory_policy import memory_managed
-from kinomlx.modeling.dtypes import resolve_float_dtype
+from kinomlx.modeling.dtypes import resolve_bound_dtype
 from kinomlx.modeling.memory import capture_decode_memory_budget
 from kinomlx.reporting import NullReporter, Reporter, reported_phase
 from kinomlx.samplers.sigmas import sigma_metadata
-from kinomlx.seed_execution import SeedModels, execute_seed_stations
+from kinomlx.seed_execution import SeedModels, execute_seed_stages
 
 from ..adapters.loading import Krea2AdapterPlan, prepare_krea2_adapters
 from ..adapters.profiles import resolve_profile_adapters
 from ..adapters.sda_profile import sda_pairing_warning
-from ..components import Krea2Components, NativeKrea2Components, SeedKrea2Components
+from ..components import Krea2Components, Krea2ComponentsProvider, Krea2SeedComponents
 from ..request_rules import admit_recipe_mode
 from ..request_sources import resolve_request_sources
 from ..resource_types import Krea2Resources
@@ -43,8 +43,8 @@ from ..settings import OPTIMIZED_DENOISE_MODE
 from ..text_conditioning import (
     Krea2PromptConditioning,
     Krea2TextConditioner,
+    Krea2TextConditionerPort,
     Krea2TextConditioning,
-    NativeKrea2TextConditioner,
     ReplayIdentityPolicy,
     load_text_conditioning,
 )
@@ -129,7 +129,7 @@ def _checkpoint(callback: Krea2Checkpoint | None) -> None:
 
 
 def _condition_text(
-    conditioner: Krea2TextConditioner,
+    conditioner: Krea2TextConditionerPort,
     prompts: tuple[str, ...],
     negative_prompts: tuple[str, ...] | None,
     resources: Krea2Resources,
@@ -194,7 +194,7 @@ def decode_krea2_latents(
     geometry: Krea2Geometry,
     prompts: tuple[str, ...],
     seeds: tuple[int, ...],
-    components: Krea2Components,
+    components: Krea2ComponentsProvider,
     reporter: Reporter,
     checkpoint: Krea2Checkpoint | None = None,
     on_image: Callable[[Krea2GeneratedImage], None] | None = None,
@@ -203,7 +203,7 @@ def decode_krea2_latents(
     dict[str, object],
     dict[str, object],
 ]:
-    """Decode one structurally fitted batch through the shared Krea VAE station."""
+    """Decode one structurally fitted batch through the shared Krea VAE stage."""
     expected_shape = (
         request.image_count,
         resources.capabilities.latent_channels,
@@ -224,7 +224,7 @@ def decode_krea2_latents(
         decoder_lease = components.image_decoder(resources)
         try:
             budget = capture_decode_memory_budget()
-            vae_dtype = resolve_float_dtype(resources.vae.dtype_policy, owner="Krea 2 VAE")
+            vae_dtype = resolve_bound_dtype(resources.vae.dtype_policy, owner="Krea 2 VAE")
             output_scale = resources.vae_decoder.output_scale
             reserved_output_bytes = (
                 (request.image_count - 1)
@@ -329,8 +329,8 @@ def generate_krea2(
     request: Krea2Request,
     resources: Krea2Resources,
     *,
-    components: Krea2Components | None = None,
-    text_conditioner: Krea2TextConditioner | None = None,
+    components: Krea2ComponentsProvider | None = None,
+    text_conditioner: Krea2TextConditionerPort | None = None,
     reporter: Reporter | None = None,
     checkpoint: Krea2Checkpoint | None = None,
     text_replay_policy: ReplayIdentityPolicy = "require",
@@ -348,8 +348,8 @@ def generate_krea2(
     admit_recipe_mode(request, "text")
     request = resolve_request_sources(request)
     models = SeedModels()
-    base = components if components is not None else NativeKrea2Components(reporter=reporter)
-    ports = SeedKrea2Components(base, models)
+    base = components if components is not None else Krea2Components(reporter=reporter)
+    ports = Krea2SeedComponents(base, models)
     jobs = []
     conditioning_rows = []
     outputs = []
@@ -364,7 +364,7 @@ def generate_krea2(
         # would reload and release the text encoder once per distinct prompt.
         rows = resolve_request_sources(derive_config(request, seeds=None, images_per_prompt=1))
         encoded = _condition_text(
-            text_conditioner or NativeKrea2TextConditioner(),
+            text_conditioner or Krea2TextConditioner(),
             rows.expanded_prompts(),
             _negative_prompts(rows, cfg_enabled=recipe.cfg_enabled),
             resources,
@@ -391,7 +391,7 @@ def generate_krea2(
                 images_per_prompt=1,
                 text_conditioning=None,
             )
-            job = _krea_stations(
+            job = _krea_stages(
                 single,
                 resources,
                 components=ports,
@@ -404,7 +404,7 @@ def generate_krea2(
             prepared = next(job)
             assert prepared is not None
             conditioning_rows.append(prepared)
-        for index, output in enumerate(execute_seed_stations(jobs, models, request.seed_mode)):
+        for index, output in enumerate(execute_seed_stages(jobs, models, request.seed_mode)):
             outputs.append(output)
             if on_image is not None:
                 on_image(index, output)
@@ -553,7 +553,7 @@ def join_conditioning(values: list[Krea2TextConditioning]) -> Krea2TextCondition
             hidden_states=mx.concatenate([row.hidden_states for row in rows]),
             attention_mask=mx.concatenate([row.attention_mask for row in rows]),
             position_ids=mx.concatenate([row.position_ids for row in rows], axis=1),
-            prompts=tuple(prompt for row in rows for prompt in row.prompts),
+            prompts=tuple(*row.prompts for row in rows),
             token_identity=rows[0].token_identity
             if len(rows) == 1
             else hashlib.sha256("\0".join(row.token_identity for row in rows).encode()).hexdigest(),
@@ -567,11 +567,11 @@ def join_conditioning(values: list[Krea2TextConditioning]) -> Krea2TextCondition
     )
 
 
-def _krea_stations(
+def _krea_stages(
     request: Krea2Request,
     resources: Krea2Resources,
     *,
-    components: Krea2Components | None = None,
+    components: Krea2ComponentsProvider | None = None,
     reporter: Reporter | None = None,
     checkpoint: Krea2Checkpoint | None = None,
     conditioning: Krea2TextConditioning,
@@ -580,14 +580,12 @@ def _krea_stations(
     """Generate one Krea still without co-resident Qwen, MMDiT, and VAE weights.
 
     The caller owns text conditioning and the adapter plan for the whole
-    request and hands this station its already-encoded row.
+    request and hands this stage its already-encoded row.
     """
     if request.source_images:
         raise ValueError("use Krea2Runner.generate or generate_krea2_edit for source images")
     sink = reporter if reporter is not None else NullReporter()
-    selected_components = (
-        components if components is not None else NativeKrea2Components(reporter=sink)
-    )
+    selected_components = components if components is not None else Krea2Components(reporter=sink)
     geometry, recipe = resolve_request_recipe(resources, request)
     turbo_resolution, sda_resolution, adapter_plan = adapters
     prompts = conditioning.positive.prompts
@@ -597,7 +595,7 @@ def _krea_stations(
     negative_prompts = None if active_negative is None else active_negative.prompts
 
     yield conditioning
-    activation_dtype = resolve_float_dtype(
+    activation_dtype = resolve_bound_dtype(
         resources.transformer.dtype_policy,
         owner="Krea 2 transformer",
     )
@@ -620,7 +618,7 @@ def _krea_stations(
                 request,
                 geometry,
                 latent_channels=resources.capabilities.latent_channels,
-                dtype_policy=activation_dtype,
+                dtype=activation_dtype,
             )
             packed = pack_latents(
                 noise.unpacked,

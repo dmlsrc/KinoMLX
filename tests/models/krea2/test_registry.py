@@ -7,7 +7,8 @@ from pathlib import Path
 import pytest
 
 from kinomlx.config import ConfigError
-from kinomlx.model_registry import config_registry, model_choices
+from kinomlx.model_catalog import model_choices
+from kinomlx.model_registry import config_registry
 from kinomlx.models.krea2.arguments import build_parser
 from kinomlx.models.krea2.config import assemble
 from kinomlx.models.krea2.settings import Krea2Settings
@@ -291,7 +292,7 @@ class Blocker:
         return None
 
 sys.meta_path.insert(0, Blocker())
-from kinomlx.cli._registry import config_registry
+from kinomlx.model_registry import config_registry
 from kinomlx.models.krea2.arguments import build_parser
 
 help_text = build_parser().format_help()

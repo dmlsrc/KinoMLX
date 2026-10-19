@@ -11,7 +11,7 @@ from kinomlx.io.safetensors import load_weights, read_metadata
 from kinomlx.kernels import group_norm, silu
 from kinomlx.reporting import NullReporter, Reporter
 
-from .ports import SpatialUpscalerPort
+from .ports import LTX2SpatialUpscalerPort
 
 
 def _strict_int(value: object, *, field: str) -> int:
@@ -259,7 +259,7 @@ class SpatialUpscaler(nn.Module):
 
 def upsample_video(
     latent: mx.array,
-    upscaler: SpatialUpscalerPort,
+    upscaler: LTX2SpatialUpscalerPort,
     *,
     reporter: Reporter | None = None,
 ) -> mx.array:

@@ -8,13 +8,13 @@ import pytest
 from kinomlx.io.safetensors import save_weights
 from kinomlx.memory_policy import MLXMemoryPolicy
 from kinomlx.modeling.layers import PretransposedLinear
-from kinomlx.models.flux2 import loading
+from kinomlx.models.flux2 import source_loading
 from kinomlx.models.flux2.catalog import Flux2Variant, profile
 from kinomlx.models.flux2.generation import generate_image
-from kinomlx.models.flux2.loading import _target
 from kinomlx.models.flux2.preparation import prepare_weight
 from kinomlx.models.flux2.sampling import SamplingRecipe, denoise, euler_step, schedule
 from kinomlx.models.flux2.shapes import transformer_shapes
+from kinomlx.models.flux2.source_loading import _target
 from kinomlx.models.flux2.transformer import Flux2Transformer, QKNorm, rotary_positions, rotate
 from tests._reporting import RecordingReporter
 
@@ -55,14 +55,14 @@ def test_source_binding_is_lazy_and_layout_selection_follows_the_component(tmp_p
     }
     source = tmp_path / "model.safetensors"
     save_weights(source, values)
-    monkeypatch.setattr(loading, "transformer_shapes", lambda: dict(keys))
+    monkeypatch.setattr(source_loading, "transformer_shapes", lambda: dict(keys))
 
     def eager(*args):
         raise AssertionError("source binding must not evaluate weights")
 
     with monkeypatch.context() as patch:
         patch.setattr(mx, "eval", eager)
-        model = loading.load_transformer((source,), dtype=mx.float16)
+        model = source_loading.load_transformer((source,), dtype=mx.float16)
     down = _target(model, "transformer_blocks.0.ff.linear_out.weight", (4, 3)).owner
     assert isinstance(down, PretransposedLinear)
     assert down.weight.shape == (4, 3)
@@ -75,14 +75,14 @@ def test_source_binding_is_lazy_and_layout_selection_follows_the_component(tmp_p
         model.x_embedder.weight, values["x_embedder.weight"].astype(mx.float16)
     ).item()
     with pytest.raises(ValueError, match="only FP16/BF16"):
-        loading.load_transformer((source,), dtype=mx.float32)
+        source_loading.load_transformer((source,), dtype=mx.float32)
     save_weights(source, {key: value.astype(mx.float16) for key, value in values.items()})
     with pytest.raises(ValueError, match="dtype F16"):
-        loading.load_transformer((source,), dtype=mx.float16)
+        source_loading.load_transformer((source,), dtype=mx.float16)
     calls = []
-    monkeypatch.setattr(loading, "load_transformer", lambda *a, **k: calls.append(a))
+    monkeypatch.setattr(source_loading, "load_transformer", lambda *a, **k: calls.append(a))
     component = _component(tmp_path)
-    loading.load_transformer_component(component, dtype=mx.float16)
+    source_loading.load_transformer_component(component, dtype=mx.float16)
     assert calls == [((component.bindings[0].source_file,),)]
 
 

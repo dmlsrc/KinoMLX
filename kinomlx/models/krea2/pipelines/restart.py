@@ -8,17 +8,18 @@ import mlx.core as mx
 
 from kinomlx.config_records import derive_config, replace_config
 from kinomlx.config_rules import validate_record
+from kinomlx.image_restart_config import ImageStage
 from kinomlx.io.safetensors import inspect_safetensors, load_weights
 from kinomlx.memory_policy import memory_managed
 from kinomlx.reporting import NullReporter, Reporter, reported_phase
 
-from ..components import Krea2Components, NativeKrea2Components
+from ..components import Krea2Components, Krea2ComponentsProvider
 from ..request_rules import admit_recipe_mode
 from ..request_sources import resolve_request_sources
 from ..resource_types import Krea2Resources
 from ..restart import Krea2Restart
 from ..sampling import Krea2Checkpoint, Krea2Geometry, resolve_geometry
-from ..text_conditioning import Krea2TextConditioner
+from ..text_conditioning import Krea2TextConditionerPort
 from ..types import Krea2Request
 from .text_to_image import Krea2GenerationOutput, decode_krea2_latents, generate_krea2
 
@@ -87,21 +88,19 @@ def restart_krea2(
     resources: Krea2Resources,
     *,
     restart: Krea2Restart,
-    components: Krea2Components | None = None,
-    text_conditioner: Krea2TextConditioner | None = None,
+    components: Krea2ComponentsProvider | None = None,
+    text_conditioner: Krea2TextConditionerPort | None = None,
     reporter: Reporter | None = None,
     checkpoint: Krea2Checkpoint | None = None,
     on_image: Callable[[int, Krea2GenerationOutput], None] | None = None,
 ) -> Krea2GenerationOutput:
-    """Resume at the selected Krea station from one saved product."""
+    """Resume at the selected Krea stage from one saved product."""
     validate_record(request, location="[generate]")
     validate_record(restart, location="[restart]")
-    admit_recipe_mode(request, "decode" if restart.phase == "decode" else "text")
+    admit_recipe_mode(request, "decode" if restart.stage == ImageStage.DECODE else "text")
     sink = reporter if reporter is not None else NullReporter()
-    selected_components = (
-        components if components is not None else NativeKrea2Components(reporter=sink)
-    )
-    if restart.phase == "denoise":
+    selected_components = components if components is not None else Krea2Components(reporter=sink)
+    if restart.stage == ImageStage.DENOISE:
         text_path = restart.text_conditioning
         assert text_path is not None
         if not text_path.is_file():
@@ -176,7 +175,7 @@ def restart_krea2(
         "vae": vae_metadata,
         "warnings": [],
     }
-    # Retain the decoded latent so this station can re-emit it, letting the
+    # Retain the decoded latent so this stage can re-emit it, letting the
     # bundle it writes be decode-restarted in turn.
     return Krea2GenerationOutput(images=images, metadata=metadata, final_latents=final_latents)
 

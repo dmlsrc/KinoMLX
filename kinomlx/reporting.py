@@ -164,7 +164,7 @@ class ScopedReporter:
 
 @contextmanager
 def reported_phase(reporter: Reporter, phase: str) -> Iterator[None]:
-    """Report one lexical station boundary without letting UX break cleanup."""
+    """Report one lexical stage boundary without letting UX break cleanup."""
     with suppress(Exception):
         reporter.phase_start(phase)
     try:

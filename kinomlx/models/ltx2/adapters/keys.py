@@ -101,7 +101,10 @@ def lora_key_categories(mlx_key: str) -> frozenset[str]:
     categories: set[str] = set()
     if "video_to_audio" in mlx_key or "audio_to_video" in mlx_key:
         categories.add("cross")
-    elif "audio_" in mlx_key:
+    elif "audio_" in mlx_key or mlx_key.endswith("_ca_audio"):
+        # The audio<->video cross-attention tables name their stream as a trailing
+        # tag with no underscore after it (scale_shift_table_a2v_ca_audio), so the
+        # "audio_" test alone reads the audio-side table as video.
         categories.add("audio")
     else:
         categories.add("video")

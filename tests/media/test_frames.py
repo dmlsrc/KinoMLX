@@ -11,8 +11,8 @@ from kinomlx.media.signals import (
     ColorPrimaries,
     ColorTransfer,
     ExrDeliverySpec,
-    ExrSampleType,
     OutputColorPlan,
+    SampleDType,
 )
 from kinomlx.models.ltx2.signals import (
     ACESCCT_WORKING_SIGNAL,
@@ -114,7 +114,7 @@ def test_synthetic_float32_hdr_transform_fans_out_one_decode_in_frame_order() ->
     exr = ExrDeliverySpec(
         primaries=ColorPrimaries.ACESCG,
         transfer=ColorTransfer.LINEAR,
-        sample_type=ExrSampleType.FLOAT16,
+        sample_type=SampleDType.FLOAT16,
         color_space_tag="ACEScg",
     )
     plan = OutputColorPlan(

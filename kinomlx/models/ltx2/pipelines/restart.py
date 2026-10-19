@@ -14,15 +14,17 @@ from kinomlx.samplers.noise import NoiseStreamState
 from kinomlx.types import VideoPixelShape
 
 from ..artifacts import distilled_stage_latents_artifact, media_conditioning_artifact
-from ..components import DistilledComponents, NativeLTX2Components
-from ..generation import GenerationOutput
+from ..components import LTX2Components, LTX2ComponentsProvider
+from ..generation import LTX2GenerationOutput
 from ..hdr_profile import resolve_hdr_recipe, validate_hdr_adapter_placement
+from ..keyframe_positions import generated_keyframe_indices
 from ..noising import GaussianNoiser
 from ..resources import LTX2Resources
-from ..restart import DistilledRestart, LatentStage
+from ..restart import LTX2Restart
+from ..restart_rules import LTX2Stage
 from ..sigmas import stage_sigmas
-from ..text_conditioning import NativeTextConditioner, TextConditioner
-from ..types import AudioLatentShape, DistilledRequest, video_latent_shape_from_pixel
+from ..text_conditioning import LTX2TextConditioner, LTX2TextConditionerPort
+from ..types import AudioLatentShape, LTX2Request, video_latent_shape_from_pixel
 from .distilled import (
     StageLatents,
     condition_sources,
@@ -45,15 +47,21 @@ _LATENT_DTYPES = frozenset({mx.bfloat16, mx.float16, mx.float32})
 def load_stage_latents(
     path: Path,
     *,
-    stage: LatentStage,
+    stage: LTX2Stage,
     geometry: VideoPixelShape,
     fps: float,
     generate_audio: bool,
     reference_aligned_audio: bool,
     reporter: Reporter,
     source_model_generation: str | None,
+    generated_keyframes: int = 0,
+    require_generated_keyframes: bool = False,
 ) -> StageLatents:
-    """Load and structurally validate one KinoMLX distilled latent sidecar."""
+    """Load and structurally validate one KinoMLX distilled latent sidecar.
+
+    With ``generated_keyframes`` slots requested, the sidecar's keyframe slot planes load
+    when present, and ``require_generated_keyframes`` refuses a sidecar without them.
+    """
 
     generation_label = (
         "unknown-generation"
@@ -105,12 +113,45 @@ def load_stage_latents(
                 generation_label=generation_label,
                 stage=stage,
             )
-        mx.eval(video, *(() if audio is None else (audio,)))
+
+        slots = tensors.get("generated_keyframes") if generated_keyframes else None
+        if generated_keyframes and slots is None and require_generated_keyframes:
+            raise ValueError(
+                f"{generation_label} {stage} restart artifact has no generated_keyframes "
+                "tensor, which stage 2 refines; regenerate stage 1 with this version"
+            )
+        if slots is not None:
+            latent_shape = video_latent_shape_from_pixel(geometry)
+            expected_slots = (
+                latent_shape.batch,
+                latent_shape.channels,
+                generated_keyframes,
+                latent_shape.height,
+                latent_shape.width,
+            )
+            if tuple(slots.shape) != expected_slots:
+                raise ValueError(
+                    f"{generation_label} {stage} generated keyframes shape "
+                    f"{tuple(slots.shape)} does not match {expected_slots}"
+                )
+            _validate_latent_values(
+                slots,
+                name="generated_keyframes",
+                source=path,
+                generation_label=generation_label,
+                stage=stage,
+            )
+        mx.eval(
+            video,
+            *(() if audio is None else (audio,)),
+            *(() if slots is None else (slots,)),
+        )
     noise_state = NoiseStreamState.from_artifact_metadata(metadata)
     return StageLatents(
         video=video,
         audio=audio,
         initial_noise_state=noise_state,
+        generated_keyframes=slots,
     )
 
 
@@ -120,7 +161,7 @@ def _validate_latent_values(
     name: str,
     source: Path,
     generation_label: str,
-    stage: LatentStage,
+    stage: LTX2Stage,
 ) -> None:
     if value.dtype not in _LATENT_DTYPES:
         raise ValueError(
@@ -134,29 +175,29 @@ def _validate_latent_values(
 
 
 def _with_restart_metadata(
-    output: GenerationOutput,
+    output: LTX2GenerationOutput,
     *,
     source_model_generation: str | None,
-) -> GenerationOutput:
+) -> LTX2GenerationOutput:
     metadata = dict(output.metadata)
     metadata["source_model_generation"] = source_model_generation
     return replace(output, metadata=metadata)
 
 
 def _decode_saved_stage(
-    request: DistilledRequest,
+    request: LTX2Request,
     resources: LTX2Resources,
     *,
-    latent_stage: LatentStage,
+    latent_stage: LTX2Stage,
     latent_path: Path,
     source_model_generation: str | None,
-    factory: DistilledComponents,
+    factory: LTX2ComponentsProvider,
     reporter: Reporter,
     artifacts: ArtifactSink,
-) -> GenerationOutput:
+) -> LTX2GenerationOutput:
     if request.frames is None:
         raise ValueError("decode restart requires a resolved source frame count")
-    scale = 2 if latent_stage == "stage-1" else 1
+    scale = 2 if latent_stage == LTX2Stage.STAGE_1 else 1
     geometry = VideoPixelShape(
         batch=1,
         frames=request.frames,
@@ -172,16 +213,18 @@ def _decode_saved_stage(
         reference_aligned_audio=request.reference_aligned_audio,
         reporter=reporter,
         source_model_generation=source_model_generation,
+        generated_keyframes=request.generated_keyframes,
     )
-    # Re-emit the one latent product this station read, so the bundle it writes
-    # can itself be decode-restarted.
+    # Re-emit the one latent product this stage read, so the bundle it writes
+    # can itself be restarted.
     artifacts.save(
         distilled_stage_latents_artifact(
-            1 if latent_stage == "stage-1" else 2,
+            1 if latent_stage == LTX2Stage.STAGE_1 else 2,
             video_latent=latents.video,
             audio_latent=latents.audio,
-            final=latent_stage != "stage-1",
+            final=latent_stage != LTX2Stage.STAGE_1,
             noise_state=latents.initial_noise_state,
+            generated_keyframes=latents.generated_keyframes,
         )
     )
     output = decode_stage_latents(
@@ -191,6 +234,10 @@ def _decode_saved_stage(
         geometry=geometry,
         components=factory,
         reporter=reporter,
+        # The saved latent embodies the parent's slots, at the indices the count selects.
+        generated_keyframe_indices=generated_keyframe_indices(
+            request.frames, request.generated_keyframes
+        ),
         execution_mode="restart-decode",
         source_latent_stage=latent_stage,
     )
@@ -201,16 +248,16 @@ def _decode_saved_stage(
 
 
 def _restart_stage_2(
-    request: DistilledRequest,
+    request: LTX2Request,
     resources: LTX2Resources,
     *,
     latent_path: Path,
     source_model_generation: str | None,
-    factory: DistilledComponents,
-    text_conditioner: TextConditioner | None,
+    factory: LTX2ComponentsProvider,
+    text_conditioner: LTX2TextConditionerPort | None,
     reporter: Reporter,
     artifacts: ArtifactSink,
-) -> GenerationOutput:
+) -> LTX2GenerationOutput:
     if request.frames is None:
         raise ValueError("stage-2 restart requires a resolved source frame count")
     if request.text_conditioning is None:
@@ -226,13 +273,15 @@ def _restart_stage_2(
     )
     stage_1_latents = load_stage_latents(
         latent_path,
-        stage="stage-1",
+        stage=LTX2Stage.STAGE_1,
         geometry=stage_1_geometry,
         fps=request.fps,
         generate_audio=request.generate_audio,
         reference_aligned_audio=request.reference_aligned_audio,
         reporter=reporter,
         source_model_generation=source_model_generation,
+        generated_keyframes=request.generated_keyframes,
+        require_generated_keyframes=True,
     )
     if stage_1_latents.initial_noise_state is None and request.noise_backend != "mlx":
         raise ValueError(
@@ -249,7 +298,7 @@ def _restart_stage_2(
         artifacts=artifacts,
     )
     text_conditioning_receipt = text.replay_receipt
-    sources = condition_sources(request)
+    sources = condition_sources(request, frames=request.frames)
 
     artifacts.save(
         distilled_stage_latents_artifact(
@@ -258,6 +307,7 @@ def _restart_stage_2(
             audio_latent=stage_1_latents.audio,
             final=False,
             noise_state=stage_1_latents.initial_noise_state,
+            generated_keyframes=stage_1_latents.generated_keyframes,
         )
     )
     with factory.spatial_upscaler(resources) as upscaler:
@@ -280,6 +330,8 @@ def _restart_stage_2(
         factory,
         sources,
         stage_2_geometry,
+        stage=2,
+        first_frame_mode=request.first_frame_mode,
         reporter=reporter,
     )
     if stage_2_conditions:
@@ -290,6 +342,7 @@ def _restart_stage_2(
                 conditions=stage_2_conditions,
                 geometry=stage_2_geometry,
                 fps=request.fps,
+                first_frame_mode=request.first_frame_mode,
             )
         )
     reference_receipt = hdr_reference_receipt(
@@ -304,11 +357,21 @@ def _restart_stage_2(
         dtype_policy=resources.dtype_policy,
         conditions=stage_2_conditions,
         initial_latents=upscaled,
+        generated_keyframe_count=request.generated_keyframes,
+    )
+    generated_indices = (
+        ()
+        if stage_2.generated_keyframe_layout is None
+        else stage_2.generated_keyframe_layout.frame_indices
     )
     initial_noise_state = upscaled.initial_noise_state
     del stage_2_conditions, upscaled
 
     sampler = resolve_distilled_sampler_plan(request, resources)
+    stage_2_schedule = stage_sigmas(request.stage_1_sigmas, request.stage_2_sigmas)[1]
+    stage_2_noise = sampler.stage_2.transition_noise(
+        transitions=len(stage_2_schedule) - 1, backend=request.noise_backend
+    )
     hdr_recipe = resolve_hdr_recipe(request, resources)
     stage_2_profile = resolve_adapter_profiles(request)[1]
     adapter_receipts: list[dict[str, object]] = []
@@ -341,12 +404,15 @@ def _restart_stage_2(
             stage_2,
             transformer.value,
             text,
-            stage_sigmas(request.stage_1_sigmas, request.stage_2_sigmas)[1],
+            stage_2_schedule,
             noiser=noiser,
             reporter=reporter,
             phase="distilled stage 2",
-            step_kind=sampler.stage_2,
+            step_kind=sampler.stage_2.step_kind,
             stage_number=2,
+            noise_provider=stage_2_noise,
+            sparse_attention=request.sparse_attention_schedules()[1],
+            transformer_dtype=resources.dtype_policy.transformer,
         )
         if legacy_noise_position:
             final_latents = replace(final_latents, initial_noise_state=None)
@@ -361,6 +427,7 @@ def _restart_stage_2(
             audio_latent=final_latents.audio,
             final=True,
             noise_state=final_latents.initial_noise_state,
+            generated_keyframes=final_latents.generated_keyframes,
         )
     )
     del text
@@ -372,11 +439,13 @@ def _restart_stage_2(
         geometry=stage_2_geometry,
         components=factory,
         reporter=reporter,
+        generated_keyframe_indices=generated_indices,
         adapter_receipts=adapter_receipts,
         text_conditioning_receipt=text_conditioning_receipt,
         execution_mode="restart-stage-2",
-        source_latent_stage="stage-1",
+        source_latent_stage=LTX2Stage.STAGE_1,
         sampler_plan=sampler,
+        ancestral_noise_states=(None, None if stage_2_noise is None else stage_2_noise.state),
         hdr_reference_receipts=(() if reference_receipt is None else (reference_receipt,)),
     )
     return _with_restart_metadata(
@@ -386,23 +455,23 @@ def _restart_stage_2(
 
 
 @memory_managed
-def restart_distilled(
-    request: DistilledRequest,
+def restart_ltx2(
+    request: LTX2Request,
     resources: LTX2Resources,
     *,
-    restart: DistilledRestart,
-    components: DistilledComponents | None = None,
-    text_conditioner: TextConditioner | None = None,
+    restart: LTX2Restart,
+    components: LTX2ComponentsProvider | None = None,
+    text_conditioner: LTX2TextConditionerPort | None = None,
     reporter: Reporter | None = None,
     artifact_sink: ArtifactSink | None = None,
-) -> GenerationOutput:
+) -> LTX2GenerationOutput:
     """Restart at stage 2 or decode one selected saved latent directly."""
     validate_record(request, location="[generate]")
     validate_record(restart, location="[restart]")
     if not restart.latents.is_file():
         raise ValueError(f"restart latent artifact does not exist: {restart.latents}")
     if (
-        restart.phase == "stage-2"
+        restart.stage == LTX2Stage.STAGE_2
         and restart.text_conditioning is not None
         and not restart.text_conditioning.is_file()
     ):
@@ -411,9 +480,9 @@ def restart_distilled(
         )
     sink = reporter if reporter is not None else NullReporter()
     artifacts = artifact_sink if artifact_sink is not None else NullArtifactSink()
-    factory = components if components is not None else NativeLTX2Components(reporter=sink)
-    validate_distilled_request(request, resources, condition_sources(request))
-    if restart.phase == "decode":
+    factory = components if components is not None else LTX2Components(reporter=sink)
+    validate_distilled_request(request, resources)
+    if restart.stage == LTX2Stage.DECODE:
         return _decode_saved_stage(
             request,
             resources,
@@ -424,14 +493,14 @@ def restart_distilled(
             reporter=sink,
             artifacts=artifacts,
         )
-    if restart.phase == "stage-2":
+    if restart.stage == LTX2Stage.STAGE_2:
         if restart.text_conditioning is None:
             raise AssertionError("validated stage-2 restart has no text conditioning")
         stage_2_request = replace(request, text_conditioning=restart.text_conditioning)
         restart_text_conditioner = (
             text_conditioner
             if text_conditioner is not None
-            else NativeTextConditioner(replay_identity_policy="observe")
+            else LTX2TextConditioner(replay_identity_policy="observe")
         )
         return _restart_stage_2(
             stage_2_request,
@@ -443,10 +512,10 @@ def restart_distilled(
             reporter=sink,
             artifacts=artifacts,
         )
-    raise AssertionError(f"validated restart has unknown phase {restart.phase!r}")
+    raise AssertionError(f"validated restart has unknown stage {restart.stage!r}")
 
 
 __all__ = [
     "load_stage_latents",
-    "restart_distilled",
+    "restart_ltx2",
 ]

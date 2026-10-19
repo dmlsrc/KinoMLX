@@ -3,6 +3,7 @@
 import argparse
 from dataclasses import dataclass
 
+from kinomlx.cli.resource_operation import Operation, refuse_resource_only_work
 from kinomlx.config import (
     ConfigError,
     coerce_dataclass_fields,
@@ -28,6 +29,7 @@ class GMNetInvocation:
 
     settings: Settings
     model_settings: GMNetSettings
+    operation: Operation
     output: GMNetOutputConfig
     request: GMNetRequest | None
     resolved_config: dict[str, object]
@@ -89,18 +91,29 @@ def assemble(
         merged.get("expand", {}),
         table="[expand]",
     )
+    operation = dataclass_from_mapping(
+        Operation,
+        merged.get("operation", {}),
+        table="[operation]",
+    )
     output = dataclass_from_mapping(
         GMNetOutputConfig,
         merged.get("output", {}),
         table="[output]",
     )
     validate_record(output, location="[output]")
+    refuse_resource_only_work(
+        dry_run=operation.dry_run,
+        requested=expand.image is not None,
+        work="an expansion",
+    )
     request = None if expand.image is None else GMNetRequest(expand.image)
 
     resolved: dict[str, object] = {
         "model": "gmnet",
         "settings": dataclass_to_mapping(settings),
         "model_settings": dataclass_to_mapping(model_settings),
+        "operation": dataclass_to_mapping(operation),
         "output": dataclass_to_mapping(output),
     }
     if request is not None or "expand" in explicit:
@@ -108,6 +121,7 @@ def assemble(
     return GMNetInvocation(
         settings=settings,
         model_settings=model_settings,
+        operation=operation,
         output=output,
         request=request,
         resolved_config=resolved,

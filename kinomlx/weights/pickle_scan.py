@@ -19,7 +19,7 @@ _STRING_OPCODES = {
 }
 _UNRESOLVED_STACK_GLOBAL = "<unresolved> STACK_GLOBAL"
 _UNRESOLVED_EXTENSION = "<unresolved> pickle-extension"
-_UNKNOWN = object()
+_UNKNOWN = sentinel("_UNKNOWN")
 _MARK = pickletools.markobject
 _STORAGE_TOKENS = frozenset(
     {

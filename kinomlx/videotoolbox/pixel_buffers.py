@@ -309,7 +309,7 @@ def flush_pool(pool: object | None) -> None:
 
 def _frame_is_fp16(frame: mx.array) -> bool:
     """Return whether an MLX frame uses float16 storage."""
-    return str(frame.dtype).split(".")[-1] == "float16"
+    return frame.dtype == mx.float16
 
 
 def _frame_buffer(frame: mx.array) -> memoryview:

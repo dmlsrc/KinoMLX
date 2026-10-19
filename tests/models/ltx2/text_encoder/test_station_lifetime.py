@@ -1,4 +1,4 @@
-"""Prompt station releases each concrete text model before its next boundary."""
+"""Prompt stage releases each concrete text model before its next boundary."""
 
 import weakref
 
@@ -69,7 +69,7 @@ def test_prompt_encoding_releases_gemma_then_connectors_before_return(
 
     output = prompt_module.encode_prompt(
         "prompt",
-        gemma_path="gemma",
+        text_encoder_path="gemma",
         connector_path="connector.safetensors",
         projection_path="projection.safetensors",
         config_path="checkpoint.safetensors",
@@ -87,7 +87,7 @@ def test_prompt_encoding_releases_gemma_then_connectors_before_return(
     ["gemma load", "gemma forward", "connector load", "connector forward"],
 )
 @pytest.mark.parametrize("model_generation", ["2.3", "2.5"])
-def test_prompt_encoding_releases_each_model_when_its_station_fails(
+def test_prompt_encoding_releases_each_model_when_its_stage_fails(
     model_generation: str,
     failure_point: str,
     monkeypatch,
@@ -150,7 +150,7 @@ def test_prompt_encoding_releases_each_model_when_its_station_fails(
     with pytest.raises(RuntimeError, match=failure_point):
         prompt_module.encode_prompt(
             "prompt",
-            gemma_path="gemma",
+            text_encoder_path="gemma",
             connector_path="connector.safetensors",
             projection_path="projection.safetensors",
             config_path="checkpoint.safetensors",

@@ -9,8 +9,9 @@ them without inheriting LTX-2's numbers.
 
 import math
 from dataclasses import dataclass, field
+from enum import StrEnum
 from pathlib import Path
-from typing import ClassVar, Literal, NamedTuple
+from typing import ClassVar, NamedTuple
 
 import mlx.core as mx
 
@@ -39,15 +40,34 @@ from kinomlx.types import (
 
 from .adapters.inputs import LTX2AdapterConfig
 from .adapters.selection import LTX2AdapterSelection, lora_profile_for_stage
+from .frame_position import FIRST, FramePositionConstraint, resolve_frame_position
 from .request_rules import (
     DISTILLED_CAPABILITIES,
     HDR_SOURCES,
     IMAGE_FRAME_BOUNDS,
     KEYFRAME_POSITIONS,
+    SPARSE_ATTENTION_STEPS,
     VAE_TILING,
     custom_temporal_tile_frames,
 )
+from .sigmas import stage_sigmas
+from .sparse_attention import (
+    DENSE,
+    LayerRangesConstraint,
+    SparseAttentionSchedule,
+    StepScheduleConstraint,
+    resolve_schedule,
+)
+from .video_vae import sharpening
 from .video_vae.tiling import SpatialTilingConfig, TemporalChunkConfig, TilingConfig
+from .vocabularies import (
+    FIRST_FRAME_MODE_CHOICES,
+    STAGE_SAMPLER_CHOICES,
+    VAE_DECODE_DTYPE_CHOICES,
+    LTX2FirstFrameMode,
+    LTX2StageSampler,
+    LTX2VideoVAEDecodeDType,
+)
 
 # ---------------------------------------------------------------------------
 # Video model constants
@@ -71,12 +91,6 @@ def resolved_frame_count_for_duration(duration: float, fps: float) -> int:
 
 # Latent channels at the video VAE bottleneck.
 VIDEO_LATENT_CHANNELS: int = 128
-
-# ``auto`` preserves the checkpoint generation's published sampler behavior.
-# Explicit modes are useful for controlled A/B diagnostics without changing
-# checkpoint selection or the literal sigma schedules.
-DISTILLED_SAMPLER_CHOICES = ("auto", "deterministic", "ancestral")
-DistilledSampler = Literal["auto", "deterministic", "ancestral"]
 
 
 @dataclass(frozen=True)
@@ -118,33 +132,70 @@ class LatentState:
 # video-to-video from an SDR reference plus a metadata-declared LogC3 adapter.
 # Unconditioned T2V HDR is refused: neither generation has a validated way to
 # anchor the HDR signal from a prompt alone.
-HDR_AUTHORING_CHOICES = ("SRGB_LINEAR", "ACESCG", "ACESCCT")
-HDRAuthoring = Literal["SRGB_LINEAR", "ACESCG", "ACESCCT"]
+class LTX2HDRAuthoring(StrEnum):
+    """The working space an HDR deliverable is authored in."""
 
-# ``auto`` keeps the precision contract recipe-aware: BF16 for ordinary SDR
-# decode and FP32 for HDR decode. Explicit values are controlled diagnostics
-# and are also useful for decode-only restarts.
-VAE_DECODE_DTYPE_CHOICES = ("auto", "bfloat16", "float16", "float32")
-VideoVAEDecodeDType = Literal["auto", "bfloat16", "float16", "float32"]
+    SRGB_LINEAR = "SRGB_LINEAR"
+    ACESCG = "ACESCG"
+    ACESCCT = "ACESCCT"
+
+
+HDR_AUTHORING_CHOICES = tuple(item.value for item in LTX2HDRAuthoring)
 
 
 @config_record
 @dataclass(frozen=True)
-class ImageConditioningConfig:
-    """One image-conditioning input for the distilled pipeline."""
+class LTX2ImageConditioningConfig:
+    """One image condition; omitted stage strengths inherit the common strength."""
 
     path: Path
-    frame_index: int = field(
-        default=0, metadata={"config_constraints": (IntegerConstraint(minimum=0),)}
+    frame_index: str = field(
+        default=FIRST, metadata={"config_constraints": (FramePositionConstraint(),)}
     )
-    strength: float = field(
-        default=0.95, metadata={"config_constraints": (NumberConstraint(0, 1),)}
+    strength: float = field(default=1.0, metadata={"config_constraints": (NumberConstraint(0, 1),)})
+    stage1_strength: float | None = field(
+        default=None, metadata={"config_constraints": (NumberConstraint(0, 1, when_supplied=True),)}
+    )
+    stage2_strength: float | None = field(
+        default=None, metadata={"config_constraints": (NumberConstraint(0, 1, when_supplied=True),)}
+    )
+
+    def strength_for_stage(self, stage: int) -> float:
+        """Resolve the strength one LTX-2 stage holds this condition at."""
+        if stage == 1:
+            return self.strength if self.stage1_strength is None else self.stage1_strength
+        if stage == 2:
+            return self.strength if self.stage2_strength is None else self.stage2_strength
+        raise ValueError(f"LTX-2 image-condition stage must be 1 or 2, got {stage}")
+
+
+type ImageStageProfile = tuple[tuple[Path, int | str, float], ...]
+
+
+def image_profile_for_stage(
+    images: tuple[LTX2ImageConditioningConfig, ...], stage: int, frames: int | None
+) -> ImageStageProfile:
+    """Project ordered image conditions onto what exactly one stage applies.
+
+    A known frame count resolves every position, so ``first`` and ``0``, or
+    ``last`` and ``16`` on a 17-frame run, are the same projected frame. Without
+    one, the spelling is all a comparison has.
+    """
+    return tuple(
+        (
+            image.path,
+            image.frame_index
+            if frames is None
+            else resolve_frame_position(image.frame_index, frames),
+            image.strength_for_stage(stage),
+        )
+        for image in images
     )
 
 
 @config_record
 @dataclass(frozen=True)
-class HDRReferenceConditioningConfig:
+class LTX2HDRReferenceConditioningConfig:
     """One SDR reference video for the explicit LTX-2.3 HDR IC-LoRA recipe."""
 
     path: Path
@@ -184,7 +235,7 @@ class TilingGridConstraint(IntegerConstraint):
 
 @config_record
 @dataclass(frozen=True)
-class VideoVAETilingConfig:
+class LTX2VideoVAETilingConfig:
     """Resolved user policy for memory-bounded video VAE decoding.
 
     ``auto`` lets the native decoder select a memory-aware plan, ``single``
@@ -194,7 +245,7 @@ class VideoVAETilingConfig:
     """
 
     mode: VAETilingMode = field(
-        default="auto",
+        default=VAETilingMode.AUTO,
         metadata={
             "config_constraints": (ChoiceConstraint(VAE_TILING_MODE_CHOICES),),
             "config_rules": (VAE_TILING,),
@@ -238,7 +289,7 @@ class VideoVAETilingConfig:
         validate_record(self, location="[generate].vae_tiling")
         if self.mode == "auto":
             return None
-        if self.mode == "single":
+        if self.mode == VAETilingMode.SINGLE:
             # A non-None empty plan bypasses decode_streaming's auto planner.
             return TilingConfig()
 
@@ -289,7 +340,7 @@ class VideoFrameCountConstraint(IntegerConstraint):
 
 @config_record
 @dataclass(frozen=True)
-class DistilledRequest:
+class LTX2Request:
     """Resolved public distilled LTX-2 generation parameters."""
 
     config_table: ClassVar[str] = "[generate]"
@@ -329,9 +380,13 @@ class DistilledRequest:
         default=DEFAULT_NOISE_BACKEND,
         metadata={"config_constraints": (ChoiceConstraint(NOISE_BACKEND_CHOICES),)},
     )
-    sampler: DistilledSampler = field(
-        default="auto",
-        metadata={"config_constraints": (ChoiceConstraint(DISTILLED_SAMPLER_CHOICES),)},
+    stage_1_sampler: LTX2StageSampler = field(
+        default=LTX2StageSampler.AUTO,
+        metadata={"config_constraints": (ChoiceConstraint(STAGE_SAMPLER_CHOICES),)},
+    )
+    stage_2_sampler: LTX2StageSampler = field(
+        default=LTX2StageSampler.AUTO,
+        metadata={"config_constraints": (ChoiceConstraint(STAGE_SAMPLER_CHOICES),)},
     )
     stage_1_sigmas: tuple[float, ...] = field(
         default=(), metadata={"config_constraints": (SigmaScheduleConstraint(),)}
@@ -339,7 +394,27 @@ class DistilledRequest:
     stage_2_sigmas: tuple[float, ...] = field(
         default=(), metadata={"config_constraints": (SigmaScheduleConstraint(),)}
     )
-    hdr: HDRAuthoring | None = field(
+    stage_1_sparse_attention: str = field(
+        default=DENSE,
+        metadata={
+            "config_constraints": (StepScheduleConstraint(),),
+            "config_rules": (SPARSE_ATTENTION_STEPS,),
+        },
+    )
+    stage_2_sparse_attention: str = field(
+        default=DENSE,
+        metadata={
+            "config_constraints": (StepScheduleConstraint(),),
+            "config_rules": (SPARSE_ATTENTION_STEPS,),
+        },
+    )
+    stage_1_dense_layers: str = field(
+        default="0", metadata={"config_constraints": (LayerRangesConstraint(),)}
+    )
+    stage_2_dense_layers: str = field(
+        default="0", metadata={"config_constraints": (LayerRangesConstraint(),)}
+    )
+    hdr: LTX2HDRAuthoring | None = field(
         default=None,
         metadata={
             "config_constraints": (ChoiceConstraint(HDR_AUTHORING_CHOICES),),
@@ -350,10 +425,14 @@ class DistilledRequest:
         default=False, metadata={"config_rules": (DISTILLED_CAPABILITIES,)}
     )
     reference_aligned_audio: bool = False
-    image: ImageConditioningConfig | None = field(
-        default=None, metadata={"config_rules": (IMAGE_FRAME_BOUNDS,)}
+    images: tuple[LTX2ImageConditioningConfig, ...] = field(
+        default=(), metadata={"config_rules": (IMAGE_FRAME_BOUNDS,)}
     )
-    hdr_reference: HDRReferenceConditioningConfig | None = None
+    first_frame_mode: LTX2FirstFrameMode = field(
+        default=LTX2FirstFrameMode.ANCHOR,
+        metadata={"config_constraints": (ChoiceConstraint(FIRST_FRAME_MODE_CHOICES),)},
+    )
+    hdr_reference: LTX2HDRReferenceConditioningConfig | None = None
     generated_keyframes: int = field(
         default=0,
         metadata={
@@ -362,13 +441,35 @@ class DistilledRequest:
         },
     )
     text_conditioning: Path | None = None
-    vae_decode_dtype: VideoVAEDecodeDType = field(
-        default="auto",
+    vae_decode_dtype: LTX2VideoVAEDecodeDType = field(
+        default=LTX2VideoVAEDecodeDType.AUTO,
         metadata={"config_constraints": (ChoiceConstraint(VAE_DECODE_DTYPE_CHOICES),)},
     )
-    vae_tiling: VideoVAETilingConfig = field(default_factory=VideoVAETilingConfig)
+    vae_cache_limit_gb: float | None = field(
+        default=None,
+        metadata={"config_constraints": (NumberConstraint(minimum=0),)},
+    )
+    vae_tiling: LTX2VideoVAETilingConfig = field(default_factory=LTX2VideoVAETilingConfig)
+    vae_sharpen: float = field(
+        default=0.0,
+        metadata={"config_constraints": (NumberConstraint(0, sharpening.MAX_AMOUNT),)},
+    )
+    vae_sharpen_radius: float = field(
+        default=sharpening.DEFAULT_RADIUS,
+        metadata={
+            "config_constraints": (
+                NumberConstraint(0, sharpening.MAX_RADIUS, exclusive_minimum=True),
+            )
+        },
+    )
     pad_prompt_to_max: bool = True
     adapters: tuple[LTX2AdapterConfig, ...] = ()
+
+    def context_sharpening(self) -> sharpening.ContextSharpening | None:
+        """The diffusion VAE's context sharpening, or None while ``vae_sharpen`` is 0."""
+        if self.vae_sharpen == 0:
+            return None
+        return sharpening.ContextSharpening(amount=self.vae_sharpen, radius=self.vae_sharpen_radius)
 
     def selected_seeds(self) -> tuple[int, ...]:
         """Ordered seeds for each prompt."""
@@ -398,6 +499,59 @@ class DistilledRequest:
         selections = self.resolved_adapters()
         return lora_profile_for_stage(selections, 1), lora_profile_for_stage(selections, 2)
 
+    @property
+    def image_stage1_profile(self) -> ImageStageProfile:
+        """The effective first-stage image profile, in author order."""
+        return image_profile_for_stage(self.images, 1, self.frames)
+
+    @property
+    def image_stage_profiles(self) -> tuple[ImageStageProfile, ImageStageProfile]:
+        """Both completed-stage image profiles used by decode restart policy."""
+        return (
+            image_profile_for_stage(self.images, 1, self.frames),
+            image_profile_for_stage(self.images, 2, self.frames),
+        )
+
+    def stage_samplers(self) -> tuple[LTX2StageSampler, LTX2StageSampler]:
+        """Both stages' requested samplers, ``auto`` included."""
+        return (self.stage_1_sampler, self.stage_2_sampler)
+
+    def sparse_attention_schedules(
+        self,
+    ) -> tuple[SparseAttentionSchedule, SparseAttentionSchedule]:
+        """Both stages' sparse attention, resolved against their step counts."""
+        first, second = stage_sigmas(self.stage_1_sigmas, self.stage_2_sigmas)
+        return (
+            resolve_schedule(
+                self.stage_1_sparse_attention,
+                self.stage_1_dense_layers,
+                steps=len(first) - 1,
+                label="stage_1_sparse_attention",
+                stage=1,
+            ),
+            resolve_schedule(
+                self.stage_2_sparse_attention,
+                self.stage_2_dense_layers,
+                steps=len(second) - 1,
+                label="stage_2_sparse_attention",
+                stage=2,
+            ),
+        )
+
+    @property
+    def sparse_attention_stage1_profile(self) -> SparseAttentionSchedule | None:
+        """The effective stage-1 sparse attention, which a stage-2 restart keeps."""
+        schedule = self.sparse_attention_schedules()[0]
+        return schedule if schedule.active else None
+
+    @property
+    def sparse_attention_stage_profiles(
+        self,
+    ) -> tuple[SparseAttentionSchedule | None, SparseAttentionSchedule | None]:
+        """Both completed stages' effective sparse attention, which a decode keeps."""
+        first, second = self.sparse_attention_schedules()
+        return (first if first.active else None, second if second.active else None)
+
     def validate_for_generation(self) -> None:
         """Validate fields that may be omitted while printing a template."""
         validate_record(self, location="[generate]")
@@ -409,8 +563,9 @@ class DistilledRequest:
             raise ValueError("prompt or text_conditioning is required")
         if self.text_conditioning is not None and not self.text_conditioning.is_file():
             raise ValueError(f"text conditioning does not exist: {self.text_conditioning}")
-        if self.image is not None and not self.image.path.is_file():
-            raise ValueError(f"image does not exist: {self.image.path}")
+        for image in self.images:
+            if not image.path.is_file():
+                raise ValueError(f"image does not exist: {image.path}")
         if self.hdr_reference is not None and not self.hdr_reference.path.is_file():
             raise ValueError(f"HDR reference video does not exist: {self.hdr_reference.path}")
         for selection in self.resolved_adapters():

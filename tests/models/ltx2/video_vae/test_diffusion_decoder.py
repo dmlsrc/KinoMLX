@@ -11,19 +11,22 @@ from kinomlx.models.ltx2.video_vae.config import (
     VideoVAEConfig,
 )
 from kinomlx.models.ltx2.video_vae.diffusion_decoder import (
-    NativeDiffusionVideoDecoder,
+    DiffusionVideoDecoder,
     NeighborhoodAttention3D,
     load_diffusion_video_decoder_weights,
     patchify_spatial,
     plan_attention_tiles,
     unpatchify_spatial,
 )
+from kinomlx.models.ltx2.video_vae.kinds import VideoVAEKind
+from kinomlx.models.ltx2.video_vae.sharpening import ContextSharpening
 from kinomlx.models.ltx2.video_vae.tiling import (
     SpatialTilingConfig,
     TemporalChunkConfig,
     TilingConfig,
     decode_streaming,
 )
+from kinomlx.models.ltx2.vocabularies import DiffusionAttentionBackend, DiffusionKernelFallback
 
 
 def _res() -> VideoVAEBlock:
@@ -62,7 +65,7 @@ def _mini_config() -> VideoVAEConfig:
         latent_channels=8,
         patch_size=2,
         timestep_conditioning=True,
-        decoder_kind="diffusion-na",
+        decoder_kind=VideoVAEKind.DIFFUSION,
         diffusion_decoder=diffusion,
         latent_log_var="constant",
         latent_log_var_value=-1.0,
@@ -126,7 +129,7 @@ def _nested_mapping() -> dict[str, object]:
 def test_nested_metadata_selects_the_diffusion_graph() -> None:
     config = VideoVAEConfig.from_mapping(_nested_mapping())
 
-    assert config.decoder_kind == "diffusion-na"
+    assert config.decoder_kind == VideoVAEKind.DIFFUSION
     assert config.decoder_blocks == ()
     assert tuple(config.encoder_scale) == (8, 16, 16)
     assert config.decoder_scale == config.encoder_scale
@@ -226,7 +229,7 @@ def test_bounded_attention_matches_brute_inward_windows() -> None:
 
 def test_full_decoder_is_seeded_and_single_covering_tile_is_exact() -> None:
     mx.random.seed(19)
-    decoder = NativeDiffusionVideoDecoder(
+    decoder = DiffusionVideoDecoder(
         _mini_config(),
         compute_dtype=mx.float32,
         attention_score_budget=500_000,
@@ -257,7 +260,7 @@ def test_full_decoder_is_seeded_and_single_covering_tile_is_exact() -> None:
 
 def test_short_and_narrow_latent_is_padded_internally_then_cropped() -> None:
     mx.random.seed(21)
-    decoder = NativeDiffusionVideoDecoder(
+    decoder = DiffusionVideoDecoder(
         _mini_config(),
         compute_dtype=mx.float32,
         attention_score_budget=500_000,
@@ -290,7 +293,7 @@ def test_short_and_narrow_latent_is_padded_internally_then_cropped() -> None:
 
 def test_actual_temporal_and_spatial_split_is_bounded_and_complete() -> None:
     mx.random.seed(23)
-    decoder = NativeDiffusionVideoDecoder(
+    decoder = DiffusionVideoDecoder(
         _mini_config(),
         compute_dtype=mx.float32,
         attention_score_budget=500_000,
@@ -316,8 +319,67 @@ def test_actual_temporal_and_spatial_split_is_bounded_and_complete() -> None:
     assert mx.all(mx.isfinite(output)).item()
     assert len(chunks) == 2
     assert plans[-1].total_tiles == 18
-    assert plans[-1].to_dict()["decoder_kind"] == "diffusion-na"
+    assert plans[-1].to_dict()["decoder_kind"] == VideoVAEKind.DIFFUSION
     assert plans[-1].attention_tiling["max_score_elements"] <= 500_000
+    assert plans[-1].attention_tiling["backend"] == DiffusionAttentionBackend.MASKED_SDPA
+    assert plans[-1].attention_tiling["fallback_reason"] == DiffusionKernelFallback.DTYPE
+
+
+def test_context_sharpening_reaches_the_single_pass_and_every_tile(monkeypatch) -> None:
+    mx.random.seed(29)
+    decoder = DiffusionVideoDecoder(
+        _mini_config(),
+        compute_dtype=mx.float32,
+        attention_score_budget=500_000,
+    )
+    latent = mx.random.normal((1, 8, 2, 3, 3))
+    sharpening = ContextSharpening(amount=2.0, radius=1.0)
+    plain = decoder(latent, seed=42)
+    sharpened = decoder(latent, seed=42, context_sharpening=sharpening)
+    untiled = tuple(
+        decode_streaming(latent, decoder, TilingConfig(), seed=42, context_sharpening=sharpening)
+    )
+    one_tile = tuple(
+        decode_streaming(
+            latent,
+            decoder,
+            TilingConfig(SpatialTilingConfig(64, 32), TemporalChunkConfig(32, 8)),
+            seed=42,
+            context_sharpening=sharpening,
+        )
+    )
+    mx.eval(plain, sharpened, *untiled, *one_tile)
+
+    assert mx.all(mx.isfinite(sharpened)).item()
+    assert not mx.array_equal(sharpened, plain).item()
+    assert len(untiled) == 1
+    assert mx.array_equal(sharpened, untiled[0]).item()
+    assert len(one_tile) == 1
+    assert mx.array_equal(sharpened, one_tile[0]).item()
+
+    contexts = []
+    apply = ContextSharpening.apply
+
+    def recording(self, context, *, patch_size):
+        contexts.append((tuple(context.shape), patch_size))
+        return apply(self, context, patch_size=patch_size)
+
+    monkeypatch.setattr(ContextSharpening, "apply", recording)
+    plans = []
+    chunks = tuple(
+        decode_streaming(
+            mx.random.normal((1, 8, 3, 5, 5)),
+            decoder,
+            TilingConfig(SpatialTilingConfig(64, 32), TemporalChunkConfig(16, 8)),
+            seed=7,
+            plan_callback=plans.append,
+            context_sharpening=sharpening,
+        )
+    )
+    mx.eval(*chunks)
+
+    assert len(contexts) == plans[-1].total_tiles == 18
+    assert {patch_size for _shape, patch_size in contexts} == {2}
 
 
 def _checkpoint_key(parameter_key: str) -> str:
@@ -332,7 +394,7 @@ def _checkpoint_key(parameter_key: str) -> str:
 
 def test_loader_requires_every_target_folds_gates_and_receipts_baggage() -> None:
     mx.random.seed(29)
-    source = NativeDiffusionVideoDecoder(_mini_config(), compute_dtype=mx.float32)
+    source = DiffusionVideoDecoder(_mini_config(), compute_dtype=mx.float32)
     weights = {
         f"decoder.{_checkpoint_key(key)}": value
         for key, value in tree_flatten(source.parameters())
@@ -344,7 +406,7 @@ def test_loader_requires_every_target_folds_gates_and_receipts_baggage() -> None
     weights["decoder.det_stages.0.0.gate_msa"] = gate
     weights["decoder.type_emb"] = mx.zeros((8,))
 
-    target = NativeDiffusionVideoDecoder(_mini_config(), compute_dtype=mx.float32)
+    target = DiffusionVideoDecoder(_mini_config(), compute_dtype=mx.float32)
     receipt = load_diffusion_video_decoder_weights(target, weights)
     expected_weight = source.det_stages[0][0].attn.proj.weight * gate[:, None]
     expected_bias = source.det_stages[0][0].attn.proj.bias * gate
@@ -363,7 +425,7 @@ def test_loader_requires_every_target_folds_gates_and_receipts_baggage() -> None
 
 def test_fp16_loader_casts_bf16_parameters_and_streaming_decode_stays_finite() -> None:
     mx.random.seed(42)
-    source = NativeDiffusionVideoDecoder(_mini_config(), compute_dtype=mx.bfloat16)
+    source = DiffusionVideoDecoder(_mini_config(), compute_dtype=mx.bfloat16)
     source.set_dtype(mx.bfloat16)
     weights = {
         f"decoder.{_checkpoint_key(key)}": value
@@ -372,11 +434,16 @@ def test_fp16_loader_casts_bf16_parameters_and_streaming_decode_stays_finite() -
     }
     weights["per_channel_statistics.mean-of-means"] = mx.zeros((8,), dtype=mx.bfloat16)
     weights["per_channel_statistics.std-of-means"] = mx.ones((8,), dtype=mx.bfloat16)
-    target = NativeDiffusionVideoDecoder(_mini_config(), compute_dtype=mx.float16)
+    target = DiffusionVideoDecoder(_mini_config(), compute_dtype=mx.float16)
     load_diffusion_video_decoder_weights(target, weights)
     assert all(value.dtype == mx.float16 for _, value in tree_flatten(target.parameters()))
     latent = mx.zeros((1, 8, 2, 1, 1), dtype=mx.bfloat16)
-    chunks = tuple(decode_streaming(latent, target, TilingConfig(), seed=42))
+    plans = []
+    chunks = tuple(
+        decode_streaming(latent, target, TilingConfig(), seed=42, plan_callback=plans.append)
+    )
     assert sum(chunk.shape[2] for chunk in chunks) == 9
+    # The mini graph's 8-wide heads keep the masked path at FP16.
+    assert plans[-1].attention_tiling["fallback_reason"] == DiffusionKernelFallback.HEAD_DIM
     assert all(chunk.dtype == mx.float16 for chunk in chunks)
     assert all(mx.all(mx.isfinite(chunk)).item() for chunk in chunks)

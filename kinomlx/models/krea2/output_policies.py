@@ -1,14 +1,14 @@
 """Krea output availability shared by field declarations and restart preparation."""
 
 from dataclasses import dataclass
-from types import MappingProxyType
 
-from kinomlx.config.stations import OutputPolicy
+from kinomlx.config.stages import OutputPolicy, produced_at_stages
+from kinomlx.image_restart_config import IMAGE_CONSUMES, IMAGE_PRODUCES, IMAGE_STAGES
 
 
 @dataclass(frozen=True)
 class KreaOutputPolicy(OutputPolicy):
-    """One artifact's station and recipe eligibility."""
+    """One artifact's stage and recipe eligibility."""
 
     recipe_modes: frozenset[str]
 
@@ -25,12 +25,12 @@ class KreaOutputPolicy(OutputPolicy):
         value: bool | None,
         *,
         save_all: bool,
-        station: str,
+        stage: str,
         field: str,
         recipe_mode: str,
         explicitly_supplied: bool,
     ) -> bool:
-        selected = super().selected(value, save_all=save_all, station=station, field=field)
+        selected = super().selected(value, save_all=save_all, stage=stage, field=field)
         if recipe_mode not in self.recipe_modes:
             if explicitly_supplied and value is True:
                 raise ValueError(
@@ -40,19 +40,17 @@ class KreaOutputPolicy(OutputPolicy):
         return selected
 
 
-# A restart station re-emits what it consumed and still holds, so a bundle it
-# writes can itself be restarted: decode re-emits the final latent it decoded,
-# and denoise re-emits the saved text it read back.
-OUTPUT_POLICIES = MappingProxyType(
+_PRODUCED_AT = produced_at_stages(IMAGE_STAGES, IMAGE_PRODUCES, IMAGE_CONSUMES)
+OUTPUT_POLICIES = frozendict(
     {
         "save_initial_noise": KreaOutputPolicy(
-            frozenset({"generate", "denoise"}), frozenset({"text", "edit"})
+            _PRODUCED_AT["initial_noise"], frozenset({"text", "edit"})
         ),
         "save_final_latents": KreaOutputPolicy(
-            frozenset({"generate", "denoise", "decode"}), frozenset({"text", "edit"})
+            _PRODUCED_AT["final_latents"], frozenset({"text", "edit"})
         ),
         "save_text_conditioning": KreaOutputPolicy(
-            frozenset({"generate", "denoise"}), frozenset({"text"})
+            _PRODUCED_AT["text_conditioning"], frozenset({"text"})
         ),
     }
 )

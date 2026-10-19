@@ -21,7 +21,7 @@ from kinomlx.models.ltx2.signals import (
 
 from ._contracts import (
     ContractResources,
-    DistilledRequest,
+    LTX2Request,
     RecordingComponents,
     assert_balanced,
     run_distilled_contract,
@@ -50,7 +50,7 @@ def test_signal_types_keep_model_domain_and_delivery_encoding_separate() -> None
 def test_current_sdr_sink_accepts_ltx23_sdr() -> None:
     components = RecordingComponents()
     output = run_distilled_contract(
-        DistilledRequest(frame_count=2),
+        LTX2Request(frame_count=2),
         ContractResources(),
         components=components,
     )
@@ -72,7 +72,7 @@ def test_current_sdr_sink_accepts_ltx23_sdr() -> None:
 def test_current_sdr_sink_rejects_hdr_source_before_consuming_a_frame(source) -> None:
     components = RecordingComponents()
     output = run_distilled_contract(
-        DistilledRequest(frame_count=2),
+        LTX2Request(frame_count=2),
         ContractResources(),
         components=components,
     )
@@ -88,7 +88,7 @@ def test_current_sdr_sink_rejects_hdr_source_before_consuming_a_frame(source) ->
 def test_current_sdr_sink_rejects_hlg_delivery_before_consuming_a_frame() -> None:
     components = RecordingComponents()
     output = run_distilled_contract(
-        DistilledRequest(frame_count=2),
+        LTX2Request(frame_count=2),
         ContractResources(),
         components=components,
     )

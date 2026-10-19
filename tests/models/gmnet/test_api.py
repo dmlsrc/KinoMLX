@@ -7,7 +7,7 @@ import pytest
 
 from kinomlx.components import ComponentLease
 from kinomlx.models.gmnet.catalog import GMNetVariant, variant_spec
-from kinomlx.models.gmnet.pipeline import expand_gmnet
+from kinomlx.models.gmnet.pipelines import expand_gmnet
 from kinomlx.models.gmnet.resources import GMNetResources
 from kinomlx.models.gmnet.runner import GMNetRunner
 from kinomlx.models.gmnet.types import GMNetRequest
@@ -47,7 +47,7 @@ def test_public_recipe_uses_injected_components_and_bounded_ownership(
     source = tmp_path / "source.png"
     source.write_bytes(b"fixture")
     monkeypatch.setattr(
-        "kinomlx.models.gmnet.pipeline.load_image",
+        "kinomlx.models.gmnet.pipelines.sdr_to_hdr.load_image",
         lambda _path: mx.full((4, 6, 3), 0.5, dtype=mx.float32),
     )
     components = _Components()
@@ -78,7 +78,7 @@ def test_runner_hosts_the_same_public_recipe(tmp_path, monkeypatch) -> None:
     source = tmp_path / "source.png"
     source.write_bytes(b"fixture")
     monkeypatch.setattr(
-        "kinomlx.models.gmnet.pipeline.load_image",
+        "kinomlx.models.gmnet.pipelines.sdr_to_hdr.load_image",
         lambda _path: mx.full((4, 4, 3), 0.25, dtype=mx.float32),
     )
     runner = GMNetRunner(resources=_resources(tmp_path), components=_Components())

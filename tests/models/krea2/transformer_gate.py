@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any
 
 import mlx.core as mx
-from _transformer_fixtures import (
+from transformer._fixtures import (
     BLOCK_NORMALIZED_RMSE_LIMIT,
     BOUNDARY_NORMALIZED_RMSE_LIMITS,
     RAW_REVISION,
@@ -40,8 +40,8 @@ _BLOCKED = (
     "transformers",
 )
 _REVISION = re.compile(r"[0-9a-f]{40,64}")
-_STATIONS = ("requested", "shape-padding-control")
-_STATION_GEOMETRY = {
+_STAGES = ("requested", "shape-padding-control")
+_STAGE_GEOMETRY = {
     "requested": {
         "combined_sequence_length": 656,
         "padding_tokens": 112,
@@ -139,18 +139,18 @@ def _require_metric(label: str, metric: dict[str, Any], limit: float) -> None:
         raise AssertionError(f"{label} normalized RMSE {normalized_rmse} exceeds {limit}")
 
 
-def _run_station(
+def _run_stage(
     mx: Any,
     model: Any,
     fixture_dir: Path,
-    station: str,
+    stage: str,
 ) -> dict[str, object]:
     inputs = mx.load(
-        str(fixture_dir / f"transformer-input-{station}.safetensors"),
+        str(fixture_dir / f"transformer-input-{stage}.safetensors"),
         format="safetensors",
     )
     references = mx.load(
-        str(fixture_dir / f"official-transformer-boundaries-{station}.safetensors"),
+        str(fixture_dir / f"official-transformer-boundaries-{stage}.safetensors"),
         format="safetensors",
     )
     combined_length = int(inputs["combined_attention_mask"].shape[1])
@@ -177,7 +177,7 @@ def _run_station(
             if name.startswith("block_")
             else BOUNDARY_NORMALIZED_RMSE_LIMITS[name]
         )
-        _require_metric(f"{station}:{name}", metric, limit)
+        _require_metric(f"{stage}:{name}", metric, limit)
         comparisons[name] = metric
 
     started = time.perf_counter()
@@ -202,8 +202,8 @@ def _run_station(
         "padding_tokens": output.padding_tokens,
         "padded_sequence_length": output.padded_sequence_length,
     }
-    if geometry != _STATION_GEOMETRY[station]:
-        raise AssertionError(f"{station} resolved unexpected sequence geometry: {geometry}")
+    if geometry != _STAGE_GEOMETRY[stage]:
+        raise AssertionError(f"{stage} resolved unexpected sequence geometry: {geometry}")
     inputs.clear()
     references.clear()
     return {
@@ -454,7 +454,7 @@ def run_transformer(
     ]
 
     import kinomlx
-    from kinomlx.models.krea2.components import NativeKrea2Components
+    from kinomlx.models.krea2.components import Krea2Components
     from kinomlx.models.krea2.resources import prepare_resources
     from kinomlx.models.krea2.settings import Krea2Settings
     from kinomlx.models.krea2.transformer import KREA2_TRANSFORMER_CONSUMED_TENSORS
@@ -500,7 +500,7 @@ def run_transformer(
 
     events = RecordingReporter()
     timing = TimingReporter(events)
-    components = NativeKrea2Components(reporter=timing)
+    components = Krea2Components(reporter=timing)
     reset_peak = getattr(mx, "reset_peak_memory", None)
     peak_reset = False
     if reset_peak is not None:
@@ -515,9 +515,9 @@ def run_transformer(
     turbo_load_elapsed = time.perf_counter() - turbo_load_started
     memory_turbo_loaded, turbo_loaded_available = _memory_snapshot(mx)
     try:
-        stations = {
-            station: _run_station(mx, turbo_lease.value, transformer_fixture_dir, station)
-            for station in _STATIONS
+        stages = {
+            stage: _run_stage(mx, turbo_lease.value, transformer_fixture_dir, stage)
+            for stage in _STAGES
         }
         trajectory = _run_trajectory(
             mx,
@@ -540,7 +540,7 @@ def run_transformer(
     try:
         # Binding intentionally leaves weights lazy. This Raw-only residency
         # probe materializes them explicitly; Turbo was evaluated by the
-        # numerical stations above. Binding time is not evaluation time.
+        # numerical stages above. Binding time is not evaluation time.
         raw_materialization_started = time.perf_counter()
         mx.eval(raw_lease.value.parameters())
         raw_materialization_elapsed = time.perf_counter() - raw_materialization_started
@@ -611,7 +611,7 @@ def run_transformer(
                 "source": str(raw.transformer.source_path),
             },
         },
-        "stations": stations,
+        "stages": stages,
         "trajectory": trajectory,
         "runtime": {
             "python_version": platform.python_version(),

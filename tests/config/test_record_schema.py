@@ -72,8 +72,9 @@ def fixture_schema():
         model="fixture",
         title="Fixture configuration",
         introduction=("Synthetic record contribution.",),
-        restart_stations=(),
-        no_restart_reason="The synthetic record contribution has no saved station.",
+        stages=("compose",),
+        restart_stages=(),
+        no_restart_reason="The synthetic record contribution has no saved stage.",
         root_fields=(
             ConfigFieldSpec(
                 "model",
